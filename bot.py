@@ -82,6 +82,7 @@ async def query_truenorth(prompt):
         "Authorization": "Bearer " + _tn_access_token,
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
+        "X-Accel-Buffering": "no",
     }
     body = {
         "query": prompt,
@@ -93,7 +94,7 @@ async def query_truenorth(prompt):
     }
     result = ""
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=120.0)) as client:
             async with client.stream("POST", TN_ENDPOINT, headers=headers, json=body) as resp:
                 async for line in resp.aiter_lines():
                     if line.startswith("data: "):
@@ -102,14 +103,21 @@ async def query_truenorth(prompt):
                             break
                         try:
                             obj = json.loads(data)
-                            delta = obj.get("choices", [{}])[0].get("delta", {})
-                            content = delta.get("content", "")
-                            if isinstance(content, list):
-                                for block in content:
-                                    if block.get("type") == "text":
-                                        result += block.get("text", "")
-                            elif isinstance(content, str):
-                                result += content
+                            # Try common response fields
+                            text_chunk = (
+                                obj.get("content") or
+                                obj.get("text") or
+                                obj.get("message") or
+                                obj.get("delta", {}).get("content") or
+                                obj.get("choices", [{}])[0].get("delta", {}).get("content") or
+                                obj.get("choices", [{}])[0].get("text") or
+                                ""
+                            )
+                            result += text_chunk
+                            if text_chunk:
+                                print(f"[TN SSE] got text chunk: {text_chunk[:80]}")
+                            else:
+                                print(f"[TN SSE] unrecognised shape: {list(obj.keys())}")
                         except Exception:
                             pass
     except Exception as e:
