@@ -1,4 +1,4 @@
-import os, json, asyncio, httpx, pytz
+import os, json, asyncio, httpx, pytz, re
 from datetime import datetime
 from dotenv import load_dotenv
 import discord
@@ -40,9 +40,24 @@ chat_history = {}
 _tn_access_token = os.getenv("TN_TOKEN", "")
 
 
+def clean_tn_response(text):
+    """Strip TrueNorth XML/metadata tags from response text."""
+    # Replace <Token .../> tags with just the symbol
+    text = re.sub(r'<Token[^>]*tokenSymbol="([^"]*)"[^>]*/>', r'$\1', text)
+    # Remove <Anchor .../> tags
+    text = re.sub(r'<Anchor[^>]*/>', '', text)
+    # Remove <sp p="...">...</sp> and variants
+    text = re.sub(r'<sp[^>]*>[^<]*</sp>', '', text)
+    text = re.sub(r'<sp[^>]*/>', '', text)
+    # Remove any remaining XML-like self-closing tags with uppercase letter start
+    text = re.sub(r'<[A-Z][^>]*/>', '', text)
+    # Clean up extra blank lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
 async def refresh_tn_token():
-    """Call Privy /sessions to exchange refresh token for a new access token.
-    Returns True on success, False on failure."""
+    """Call Privy /sessions to exchange refresh token for a new access token."""
     global _tn_access_token
     if not TN_REFRESH_TOKEN:
         print("[TokenRefresh] TN_REFRESH_TOKEN not set -- skipping refresh")
@@ -57,21 +72,21 @@ async def refresh_tn_token():
                 },
                 json={"refresh_token": TN_REFRESH_TOKEN},
             )
-        if resp.status_code == 200:
-            data = resp.json()
-            new_token = (
-                data.get("token")
-                or data.get("access_token")
-                or data.get("identity_token", "")
-            )
-            if new_token:
-                _tn_access_token = new_token
-                print("[TokenRefresh] Token refreshed at " + datetime.now(IST).isoformat())
-                return True
+            if resp.status_code == 200:
+                data = resp.json()
+                new_token = (
+                    data.get("token")
+                    or data.get("access_token")
+                    or data.get("identity_token", "")
+                )
+                if new_token:
+                    _tn_access_token = new_token
+                    print("[TokenRefresh] Token refreshed at " + datetime.now(IST).isoformat())
+                    return True
+                else:
+                    print("[TokenRefresh] Refresh response missing token. Keys: " + str(list(data.keys())))
             else:
-                print("[TokenRefresh] Refresh response missing token. Keys: " + str(list(data.keys())))
-        else:
-            print("[TokenRefresh] Refresh failed HTTP " + str(resp.status_code) + ": " + resp.text[:200])
+                print("[TokenRefresh] Refresh failed HTTP " + str(resp.status_code) + ": " + resp.text[:200])
     except Exception as e:
         print("[TokenRefresh] Exception: " + str(e))
     return False
@@ -103,7 +118,6 @@ async def query_truenorth(prompt):
                             break
                         try:
                             obj = json.loads(data)
-                            # TrueNorth format: {"event_type":"llm_output","data":{"content":"...","streaming":true}}
                             event_type = obj.get("event_type", "")
                             if event_type == "llm_output":
                                 text_chunk = obj.get("data", {}).get("content", "")
@@ -113,7 +127,8 @@ async def query_truenorth(prompt):
                             pass
     except Exception as e:
         result = "[TrueNorth error: " + str(e) + "]"
-    return result.strip() or "[No response from TrueNorth]"
+    cleaned = clean_tn_response(result)
+    return cleaned or "[No response from TrueNorth]"
 
 
 def query_claude(messages, system=""):
@@ -177,8 +192,8 @@ async def send_session_brief(session_key, brief_type):
     channel = bot.get_channel(CH[session["channel"]])
     if not channel:
         return
-    label = "U0001f4cb PRE-SESSION BRIEF" if brief_type == "pre" else "U0001f4ca POST-SESSION DEBRIEF"
-    emoji = {"asia": "U0001f30f", "london": "U0001f1ecU0001f1e7", "us": "U0001f1faU0001f1f8"}[session_key]
+    emoji = {"asia": "\U0001f30f", "london": "\U0001f1ec\U0001f1e7", "us": "\U0001f1fa\U0001f1f8"}[session_key]
+    label = "\U0001f4cb PRE-SESSION BRIEF" if brief_type == "pre" else "\U0001f4ca POST-SESSION DEBRIEF"
     await channel.send(emoji + " **" + label + " -- " + session_key.upper() + " SESSION**\n*Querying TrueNorth...*")
     prompt = pre_session_prompt(session_key) if brief_type == "pre" else post_session_prompt(session_key)
     tn = await query_truenorth(prompt)
@@ -188,7 +203,7 @@ async def send_session_brief(session_key, brief_type):
         await asyncio.sleep(2)
         trades_ch = bot.get_channel(CH["trades"])
         if trades_ch:
-            await trades_ch.send(emoji + " **" + session_key.upper() + " SESSION SETUPS**\n*Fetching from TrueNorth...*")
+            await trades_ch.send(emoji + " **" + session_key.upper() + " SESSION SETUPS\n*Fetching from TrueNorth...*")
             tr = await query_truenorth(trades_prompt())
             for chunk in [tr[i:i+1900] for i in range(0, len(tr), 1900)]:
                 await trades_ch.send(chunk)
@@ -198,7 +213,7 @@ async def send_regime_update(trigger="scheduled"):
     channel = bot.get_channel(CH["regime"])
     if not channel:
         return
-    await channel.send("U0001f310 **REGIME & MACRO UPDATE**\n*Querying TrueNorth...*")
+    await channel.send("\U0001f310 **REGIME & MACRO UPDATE**\n*Querying TrueNorth...*")
     resp = await query_truenorth(regime_update_prompt())
     for chunk in [resp[i:i+1900] for i in range(0, len(resp), 1900)]:
         await channel.send(chunk)
@@ -220,7 +235,6 @@ def schedule_sessions():
     for i, (h, m) in enumerate([(5, 15), (13, 15), (18, 15)]):
         scheduler.add_job(send_regime_update, "cron", hour=h, minute=m,
                           args=["scheduled"], id="regime_" + str(i), replace_existing=True)
-    # Refresh TrueNorth token every 12 hours
     scheduler.add_job(refresh_tn_token, "interval", hours=12,
                       id="tn_token_refresh", replace_existing=True)
 
@@ -228,20 +242,19 @@ def schedule_sessions():
 @bot.event
 async def on_ready():
     print("DCT TrueNorth Bot online as " + str(bot.user))
-    # Refresh token on startup before any API calls
     await refresh_tn_token()
     schedule_sessions()
     scheduler.start()
     ch = bot.get_channel(CH["claude"])
     if ch:
         await ch.send(
-            "U0001f916 **DCT TrueNorth Bot is online!**\n"
+            "\U0001f916 **DCT TrueNorth Bot is online!**\n"
             "Connected to TrueNorth + Claude.\n\n"
             "**Channels:**\n"
-            "• `#claude-integration` -- Chat with me. Finance = TrueNorth. General = Claude.\n"
-            "• Session channels -- Auto briefs 15min before/after each session\n"
-            "• `#regime-outlook` -- Macro updates before every session\n"
-            "• `#trades` -- 3 setups per session\n\n"
+            "\u2022 `#claude-integration` -- Chat with me. Finance = TrueNorth. General = Claude.\n"
+            "\u2022 Session channels -- Auto briefs 15min before/after each session\n"
+            "\u2022 `#regime-outlook` -- Macro updates before every session\n"
+            "\u2022 `#trades` -- 3 setups per session\n\n"
             "Type `!brief asia/london/us` or `!regime` or `!trades` to trigger manually."
         )
 
@@ -249,6 +262,10 @@ async def on_ready():
 @bot.event
 async def on_message(message):
     if message.author.bot:
+        return
+    # Commands are handled exclusively -- skip chat handler for command messages
+    if message.content.startswith(bot.command_prefix):
+        await bot.process_commands(message)
         return
     cid = message.channel.id
     if cid == CH["claude"]:
@@ -273,7 +290,7 @@ async def on_message(message):
                     [{"role": "user", "content": "User asked: " + user_msg + "\n\nTrueNorth data:\n" + tn_data}],
                     system=system,
                 )
-                await message.reply("U0001f4e1 *via TrueNorth + Claude*\n\n" + reply)
+                await message.reply("\U0001f4e1 *via TrueNorth + Claude*\n\n" + reply)
             else:
                 chat_history[cid].append({"role": "user", "content": user_msg})
                 if len(chat_history[cid]) > 20:
@@ -305,7 +322,6 @@ async def on_message(message):
                 await message.reply(chunks[0])
                 for c in chunks[1:]:
                     await message.channel.send(c)
-    await bot.process_commands(message)
 
 
 @bot.command(name="brief")
@@ -325,7 +341,7 @@ async def manual_regime(ctx):
 async def manual_trades(ctx):
     ch = bot.get_channel(CH["trades"])
     if ch:
-        await ch.send("U0001f50d **MANUAL TRADE SCAN**\n*Querying TrueNorth...*")
+        await ch.send("\U0001f50d **MANUAL TRADE SCAN**\n*Querying TrueNorth...*")
         resp = await query_truenorth(trades_prompt())
         for chunk in [resp[i:i+1900] for i in range(0, len(resp), 1900)]:
             await ch.send(chunk)
@@ -338,7 +354,7 @@ async def winrate(ctx):
         await ctx.send("No trades logged yet. Log with: `result: $BTC LONG WIN`")
         return
     wins = sum(1 for t in trade_log if "win" in t.get("note", "").lower())
-    await ctx.send("U0001f4ca Win Rate: **" + str(round(wins / total * 100, 1)) + "%** | " + str(wins) + "/" + str(total))
+    await ctx.send("\U0001f4ca Win Rate: **" + str(round(wins / total * 100, 1)) + "%** | " + str(wins) + "/" + str(total))
 
 
 @bot.command(name="refreshtoken")
