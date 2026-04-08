@@ -448,9 +448,7 @@ async def manual_refresh_token(ctx):
         await ctx.send("✅ TrueNorth token refreshed successfully.")
     else:
         await ctx.send("❌ Token refresh failed — check logs for details.")
+
+
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
-```
-**Step 4:** Scroll to the top of the editor, change the commit message to:
-```
-Add Discord embed formatting for all bot posts
