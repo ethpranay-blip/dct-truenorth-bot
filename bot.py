@@ -182,25 +182,25 @@ def parse_trade_data(block_text):
         "coin": "???", "direction": "LONG",
         "entry": None, "sl": None, "tp1": None, "tp2": None, "rr": None,
     }
-    coin_m = re.search(r'\\$([A-Z]{2,10})', block_text)
+    coin_m = re.search(r'\$([A-Z]{2,10})', block_text)
     if coin_m:
         data["coin"] = coin_m.group(1)
-    dir_m = re.search(r'\\b(LONG|SHORT)\\b', block_text, re.IGNORECASE)
+    dir_m = re.search(r'\b(LONG|SHORT)\b', block_text, re.IGNORECASE)
     if dir_m:
         data["direction"] = dir_m.group(1).upper()
-    entry_m = re.search(r'[Ee]ntry[:\\s]+\\$?([\\d,\\.]+)', block_text)
+    entry_m = re.search(r'[Ee]ntry[:\s]+\$?([\d,\\.]+)', block_text)
     if entry_m:
         data["entry"] = entry_m.group(1)
-    sl_m = re.search(r'(?:SL|Stop[- ]?Loss)[:\\s]+\\$?([\\d,\\.]+)', block_text, re.IGNORECASE)
+    sl_m = re.search(r'(?:SL|Stop[- ]?Loss)[:\s]+\$?([\d,\\.]+)', block_text, re.IGNORECASE)
     if sl_m:
         data["sl"] = sl_m.group(1)
-    tp1_m = re.search(r'(?:TP1?|Target\\s*1?)[:\\s]+\\$?([\\d,\\.]+)', block_text, re.IGNORECASE)
+    tp1_m = re.search(r'(?:TP1?|Target\s*1?)[:\s]+\$?([\d,\\.]+)', block_text, re.IGNORECASE)
     if tp1_m:
         data["tp1"] = tp1_m.group(1)
-    tp2_m = re.search(r'(?:TP2|Target\\s*2)[:\\s]+\\$?([\\d,\\.]+)', block_text, re.IGNORECASE)
+    tp2_m = re.search(r'(?:TP2|Target\s*2)[:\s]+\$?([\d,\\.]+)', block_text, re.IGNORECASE)
     if tp2_m:
         data["tp2"] = tp2_m.group(1)
-    rr_m = re.search(r'(?:R[:\\s/]R|Risk[:/]Reward)[:\\s]+([\\d\\.]+:[\\d\\.]+|[\\d\\.]+x)', block_text, re.IGNORECASE)
+    rr_m = re.search(r'(?:R[:\s/]R|Risk[:/]Reward)[:\s]+([\d\\.]+:[\d\\.]+|[\d\\.]+x)', block_text, re.IGNORECASE)
     if rr_m:
         data["rr"] = rr_m.group(1)
     return data
