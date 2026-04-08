@@ -111,31 +111,201 @@ def build_session_embed(session_key, brief_type, tn_text):
     for title, body in sections[:8]:
         embed.add_field(name=f"▸ {title}", value=truncate(bold_numbers(body), 1024), inline=False)
     return embed
-def build_trades_embed(session_key, tn_text):
-    if session_key:
-        flag_emoji, label = SESSION_FLAGS[session_key]
-        title = flag_emoji + " " + label + "  \u00b7  TRADE SETUPS"
-        color = COLORS[session_key]
-    else:
-        title = "\U0001f3af  TRADE SCAN  \u00b7  LIVE SETUPS"
-        color = COLORS["trades"]
-    embed = discord.Embed(title=title, color=color, timestamp=datetime.now(IST))
-    embed.set_footer(text="DCT TrueNorth Bot  \u00b7  Min 1:2 R:R  \u00b7  Size responsibly")
-    EMBED_LIMIT = 5500
-    used = len(title) + 60
-    sections = parse_sections(tn_text)
-    for sec_title, body in sections[:5]:
-        field_name = "\u25b8 " + sec_title
-        max_val = min(600, EMBED_LIMIT - used - len(field_name) - 10)
-        if max_val < 50:
-            break
-        field_val = truncate(bold_numbers(body), max_val)
-        embed.add_field(name=field_name, value=field_val, inline=False)
-        used += len(field_name) + len(field_val)
-    btc_match = re.search(r"BTC.{0,20}bias.{0,80}", tn_text, re.IGNORECASE)
-    if btc_match and used + 60 < EMBED_LIMIT:
-        embed.add_field(name="\u20bf  BTC Directional Bias", value=bold_numbers(btc_match.group(0).strip()), inline=False)
-    return embed
+# ── Conviction / rank helpers ──────────────────────────────────────────
+RANK_EMOJI = {1: "\U0001f947", 2: "\U0001f948", 3: "\U0001f949"}
+CONVICTION_MAP = {
+    "highest": ("Highest Conviction", "\U0001f7e2"),
+    "high":    ("High Conviction",    "\U0001f7e2"),
+    "medium":  ("Medium Conviction",  "\U0001f7e1"),
+    "low":     ("Low Conviction",     "\U0001f534"),
+}
+COLOR_LONG  = 0x00FF88
+COLOR_SHORT = 0xFF4444
+COLOR_RISK  = 0xFFAA00
+
+def _parse_trades_from_tn(raw):
+    """Parse TrueNorth markdown into a list of trade dicts and optional risk flag."""
+    trades = []
+    risk_flag = None
+
+    # Pull out session risk flag if present
+    risk_match = re.search(
+        r"(?:session\s+risk\s+flag|\u26a0\ufe0f\s*risk)[:\s]*(.+?)(?:\n---|$)",
+        raw, re.IGNORECASE | re.DOTALL,
+    )
+    if risk_match:
+        risk_flag = risk_match.group(1).strip()
+
+    # Split into per-trade blocks on --- dividers or $TICKER headers
+    blocks = re.split(r"\n-{3,}\n|\n(?=\$[A-Z]+ *\|)", raw)
+
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+
+        # Header: $TICKER | DIRECTION | conviction
+        header = re.match(
+            r"\$([A-Z]+)\s*\|\s*(LONG|SHORT)\s*\|\s*(?:\U0001f7e2|\U0001f7e1|\U0001f534)?\s*(.*)",
+            block, re.IGNORECASE,
+        )
+        if not header:
+            # Try alternate: **$TICKER** - LONG - Highest Conviction
+            header = re.match(
+                r"\*{0,2}\$([A-Z]+)\*{0,2}[\s\-\u2014|]+(?:\*{0,2})(LONG|SHORT)(?:\*{0,2})[\s\-\u2014|]+(?:\U0001f7e2|\U0001f7e1|\U0001f534)?\s*(.*)",
+                block, re.IGNORECASE,
+            )
+        if not header:
+            # Try: just $TICKER followed by LONG/SHORT on same line
+            header = re.match(
+                r".*\$([A-Z]+).*\b(LONG|SHORT)\b.*",
+                block.split("\n")[0], re.IGNORECASE,
+            )
+        if not header:
+            continue
+
+        ticker    = header.group(1).upper()
+        direction = header.group(2).upper()
+        conv_raw  = header.group(3).strip().lower() if header.lastindex >= 3 else ""
+
+        # Normalize conviction label
+        conv_label, conv_dot = "Conviction", "\U0001f7e1"
+        for key, (label, dot) in CONVICTION_MAP.items():
+            if key in conv_raw:
+                conv_label, conv_dot = label, dot
+                break
+
+        # Extract table values: Entry, Stop Loss, Take Profit, R:R
+        entry = stop = tp = rr = "\u2014"
+
+        # Try markdown table rows:  | Key | Value |
+        for row in re.finditer(r"\|\s*(.+?)\s*\|\s*(.+?)\s*\|", block):
+            key = row.group(1).strip().lower()
+            val = row.group(2).strip()
+            if key.startswith("-") or key == "level" or key == "parameter":
+                continue
+            if "entry" in key:
+                entry = val
+            elif "stop" in key or key == "sl":
+                stop = val
+            elif "take" in key or "target" in key or key == "tp" or "tp1" in key:
+                tp = val
+            elif "r:r" in key or "r/r" in key or ("risk" in key and "reward" in key):
+                rr = val
+
+        # Fallback: try Key: Value patterns (non-table format)
+        if entry == "\u2014":
+            m = re.search(r"[Ee]ntry[:\s]+\$?([\d,\.]+)", block)
+            if m:
+                entry = "$" + m.group(1)
+        if stop == "\u2014":
+            m = re.search(r"(?:SL|Stop[- ]?Loss)[:\s]+\$?([\d,\.]+)", block, re.IGNORECASE)
+            if m:
+                stop = "$" + m.group(1)
+        if tp == "\u2014":
+            m = re.search(r"(?:TP1?|Take[- ]?Profit|Target\s*1?)[:\s]+\$?([\d,\.]+)", block, re.IGNORECASE)
+            if m:
+                tp = "$" + m.group(1)
+        if rr == "\u2014":
+            m = re.search(r"(?:R[:\s/]R|Risk[:/]Reward)[:\s]+(\d+\.?\d*:\d+\.?\d*|\d+\.?\d*x)", block, re.IGNORECASE)
+            if m:
+                rr = m.group(1)
+
+        # Bullet context lines
+        context_lines = re.findall(r"^[-\u2022*]\s+(.+)", block, re.MULTILINE)
+
+        trades.append({
+            "ticker":      ticker,
+            "direction":   direction,
+            "conviction":  conv_label,
+            "conv_dot":    conv_dot,
+            "entry":       entry,
+            "stop_loss":   stop,
+            "take_profit": tp,
+            "rr":          rr,
+            "context":     context_lines,
+        })
+
+    return trades, risk_flag
+
+
+def build_trades_embeds(session_key, tn_text):
+    """Build list of discord.Embed objects from TrueNorth trade response."""
+    trades, risk_flag = _parse_trades_from_tn(tn_text)
+
+    # Fallback: if parsing finds no trades, wrap raw text in code block
+    if not trades:
+        if session_key:
+            flag_emoji, label = SESSION_FLAGS[session_key]
+            title = flag_emoji + " " + label + " \u00b7 TRADE SETUPS"
+            color = COLORS[session_key]
+        else:
+            title = "\U0001f3af TRADE SCAN \u00b7 LIVE SETUPS"
+            color = COLORS["trades"]
+        fallback = discord.Embed(
+            title=title,
+            description="```\n" + tn_text[:3900] + "\n```",
+            color=color,
+            timestamp=datetime.now(IST),
+        )
+        fallback.set_footer(text="DCT TrueNorth Bot \u00b7 Min 1:2 R:R \u00b7 Size responsibly")
+        return [fallback]
+
+    embeds = []
+
+    # Per-trade embeds
+    for idx, t in enumerate(trades, start=1):
+        rank_emoji = RANK_EMOJI.get(idx, "#" + str(idx))
+        color = COLOR_LONG if t["direction"] == "LONG" else COLOR_SHORT
+
+        title = (
+            str(rank_emoji) + " $" + t["ticker"] + " | " + t["direction"] + " | "
+            + t["conv_dot"] + " " + t["conviction"]
+        )
+
+        desc = "\n".join(t["context"]) if t["context"] else ""
+
+        embed = discord.Embed(title=title, description=desc, color=color, timestamp=datetime.now(IST))
+        embed.add_field(name="Entry",       value=t["entry"],       inline=True)
+        embed.add_field(name="Stop Loss",   value=t["stop_loss"],   inline=True)
+        embed.add_field(name="Take Profit", value=t["take_profit"], inline=True)
+        embed.add_field(name="R:R",         value=t["rr"],          inline=True)
+        embed.set_footer(text="DCT TrueNorth Bot \u00b7 Min 1:2 R:R \u00b7 Size responsibly")
+        embeds.append(embed)
+
+    # Session summary table (monospace code block)
+    header_line = "Token   | Dir   | Entry   | SL      | TP      | R:R"
+    sep_line    = "-" * len(header_line)
+    rows = [header_line, sep_line]
+    for t in trades:
+        row = "$" + t["ticker"].ljust(6) + " | " + t["direction"].ljust(5) + " | "
+        row += t["entry"].ljust(7) + " | " + t["stop_loss"].ljust(7) + " | "
+        row += t["take_profit"].ljust(7) + " | " + t["rr"]
+        rows.append(row)
+    table_str = "\n".join(rows)
+
+    summary = discord.Embed(
+        title="\U0001f4ca Session Summary",
+        description="```\n" + table_str + "\n```",
+        color=0x2F3136,
+        timestamp=datetime.now(IST),
+    )
+    summary.set_footer(text="DCT TrueNorth Bot \u00b7 Powered by TrueNorth AI")
+    embeds.append(summary)
+
+    # Risk flag embed (if present)
+    if risk_flag:
+        risk_embed = discord.Embed(
+            title="\u26a0\ufe0f Session Risk Flag",
+            description=risk_flag,
+            color=COLOR_RISK,
+            timestamp=datetime.now(IST),
+        )
+        risk_embed.set_footer(text="DCT TrueNorth Bot")
+        embeds.append(risk_embed)
+
+    return embeds
+
 def build_regime_embed(tn_text):
     embed = discord.Embed(
         title="🌐  REGIME & MACRO UPDATE",
@@ -408,8 +578,9 @@ async def send_session_brief(session_key, brief_type):
         if trades_ch:
             await trades_ch.send(f"{flag_emoji} **{label} SESSION SETUPS** — *fetching from TrueNorth...*")
             tr = await query_truenorth(trades_prompt())
-            embed_tr = build_trades_embed(session_key, tr)
-            await trades_ch.send(embed=embed_tr)
+            trade_embeds = build_trades_embeds(session_key, tr)
+            for te in trade_embeds:
+                await trades_ch.send(embed=te)
             if PIL_AVAILABLE:
                 raw_blocks = [b for b in re.split(r"\$[A-Z]", tr) if b.strip()]
                 for t_idx, block in enumerate(raw_blocks[:6], 1):
@@ -529,8 +700,9 @@ async def on_message(message):
         else:
             async with message.channel.typing():
                 resp = await query_truenorth(message.content.strip())
-                embed = build_trades_embed(None, resp)
-                await message.reply(embed=embed)
+                trade_embeds = build_trades_embeds(None, resp)
+                for te in trade_embeds:
+                    await message.reply(embed=te)
 # ── COMMANDS ──────────────────────────────────
 @bot.command(name="brief")
 async def manual_brief(ctx, session: str = "all"):
@@ -552,8 +724,9 @@ async def manual_trades(ctx):
         await ch.send("\U0001f3af **MANUAL TRADE SCAN** \u2014 *querying TrueNorth...*")
         resp = await query_truenorth(trades_prompt())
         print(f"[trades] Got TrueNorth response, length={len(resp)}")
-        embed = build_trades_embed(None, resp)
-        await ch.send(embed=embed)
+        trade_embeds = build_trades_embeds(None, resp)
+        for te in trade_embeds:
+            await ch.send(embed=te)
         print("[trades] Embed sent successfully")
         if PIL_AVAILABLE:
             raw_blocks = [b for b in re.split(r"\$[A-Z]", resp) if b.strip()]
