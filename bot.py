@@ -96,6 +96,7 @@ async def query_truenorth(prompt):
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=120.0)) as client:
             async with client.stream("POST", TN_ENDPOINT, headers=headers, json=body) as resp:
+                print(f"[TN HTTP] status={resp.status_code}")
                 async for line in resp.aiter_lines():
                     if line.startswith("data: "):
                         data = line[6:]
@@ -118,8 +119,8 @@ async def query_truenorth(prompt):
                                 print(f"[TN SSE] got text chunk: {text_chunk[:80]}")
                             else:
                                 print(f"[TN SSE] unrecognised shape: {list(obj.keys())}")
-                        except Exception:
-                            pass
+                        except Exception as ex:
+                            print(f"[TN SSE] JSON parse error: {ex} | raw: {data[:120]}")
     except Exception as e:
         result = "[TrueNorth error: " + str(e) + "]"
     return result.strip() or "[No response from TrueNorth]"
