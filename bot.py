@@ -5,9 +5,7 @@ import discord
 from discord.ext import commands
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import anthropic
-
 load_dotenv()
-
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
 TN_REFRESH_TOKEN = os.getenv("TN_REFRESH_TOKEN")
@@ -15,49 +13,161 @@ TN_ENDPOINT = "https://api.adventai.io/api/discovery-agents/sse/v2/streams"
 TN_THREAD_ID = "78536e88-e440-43dd-a61d-584640f8792b"
 PRIVY_APP_ID = "cm6afcumv0688a6x3r78jkx7v"
 PRIVY_REFRESH_URL = "https://auth.privy.io/api/v1/sessions"
-
 CH = {
     "claude": int(os.getenv("CH_CLAUDE_INTEGRATION")),
-    "asia":   int(os.getenv("CH_ASIA_SESSION")),
+    "asia": int(os.getenv("CH_ASIA_SESSION")),
     "london": int(os.getenv("CH_LONDON_SESSION")),
-    "us":     int(os.getenv("CH_US_SESSION")),
+    "us": int(os.getenv("CH_US_SESSION")),
     "regime": int(os.getenv("CH_REGIME_OUTLOOK")),
     "trades": int(os.getenv("CH_TRADES")),
 }
-
 IST = pytz.timezone("Asia/Kolkata")
-
 SESSIONS = {
-    "asia":   {"open": (5, 30),  "close": (14, 30), "channel": "asia"},
+    "asia": {"open": (5, 30), "close": (14, 30), "channel": "asia"},
     "london": {"open": (13, 30), "close": (22, 30), "channel": "london"},
-    "us":     {"open": (18, 30), "close": (3, 30),  "channel": "us"},
+    "us": {"open": (18, 30), "close": (3, 30), "channel": "us"},
 }
-
+COLORS = {
+    "asia":   0xF4A623,
+    "london": 0x4A90D9,
+    "us":     0xE74C3C,
+    "regime": 0x9B59B6,
+    "trades": 0x2ECC71,
+    "claude": 0x1ABC9C,
+}
+SESSION_FLAGS = {
+    "asia":   ("\\U0001f30f", "ASIA"),
+    "london": ("\\U0001f1ec\\U0001f1e7", "LONDON"),
+    "us":     ("\\U0001f1fa\\U0001f1f8", "US"),
+}
 trade_log = []
 chat_history = {}
-
-# In-memory token store -- refreshed on startup and every 12 hours
 _tn_access_token = os.getenv("TN_TOKEN", "")
-
-
+# ── HELPERS ──────────────────────────────────
 def clean_tn_response(text):
-    """Strip TrueNorth XML/metadata tags from response text."""
-    # Replace <Token .../> tags with just the symbol
-    text = re.sub(r'<Token[^>]*tokenSymbol="([^"]*)"[^>]*/>', r'$\1', text)
-    # Remove <Anchor .../> tags
+    text = re.sub(r'<Token[^>]*tokenSymbol="([^"]*)"[^>]*/>', r'$\\1', text)
     text = re.sub(r'<Anchor[^>]*/>', '', text)
-    # Remove <sp p="...">...</sp> and variants
     text = re.sub(r'<sp[^>]*>[^<]*</sp>', '', text)
     text = re.sub(r'<sp[^>]*/>', '', text)
-    # Remove any remaining XML-like self-closing tags with uppercase letter start
     text = re.sub(r'<[A-Z][^>]*/>', '', text)
-    # Clean up extra blank lines
-    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r'\\n{3,}', '\\n\\n', text)
     return text.strip()
-
-
+def bold_numbers(text):
+    text = re.sub(r'(\\$[\\d,\\.]+)', r'**\\1**', text)
+    text = re.sub(r'([+-]?\\d+\\.?\\d*%)', r'**\\1**', text)
+    return text
+def truncate(text, limit=1024):
+    return text[:limit - 3] + "..." if len(text) > limit else text
+def now_ist():
+    return datetime.now(IST).strftime("%b %d, %Y · %H:%M IST")
+def parse_sections(text):
+    text = text.replace("\\r\\n", "\\n").strip()
+    pattern = re.compile(
+        r'^(?:\\*{1,2})?(?:\\d+\\.\\s+|#{1,3}\\s*|[-–—]\\s*)([A-Z][^\\n]{2,60})(?:\\*{1,2})?\\s*$',
+        re.MULTILINE
+    )
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return [("Overview", text)]
+    sections = []
+    for i, m in enumerate(matches):
+        title = m.group(1).strip().rstrip(":")
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        body = text[start:end].strip()
+        if body:
+            sections.append((title, body))
+    return sections if sections else [("Overview", text)]
+# ── EMBED BUILDERS ────────────────────────────
+def build_session_embed(session_key, brief_type, tn_text):
+    flag_emoji, label = SESSION_FLAGS[session_key]
+    type_label = "PRE-SESSION BRIEF" if brief_type == "pre" else "POST-SESSION DEBRIEF"
+    type_icon = "📋" if brief_type == "pre" else "📊"
+    embed = discord.Embed(
+        title=f"{type_icon}  {flag_emoji} {label}  ·  {type_label}",
+        color=COLORS[session_key],
+        timestamp=datetime.now(IST),
+    )
+    embed.set_footer(text="DCT TrueNorth Bot  ·  Powered by TrueNorth AI")
+    sections = parse_sections(tn_text)
+    for title, body in sections[:8]:
+        embed.add_field(name=f"▸ {title}", value=truncate(bold_numbers(body), 1024), inline=False)
+    return embed
+def build_trades_embed(session_key, tn_text):
+    if session_key:
+        flag_emoji, label = SESSION_FLAGS[session_key]
+        title = f"🎯  {flag_emoji} {label}  ·  SESSION TRADE SETUPS"
+        color = COLORS[session_key]
+    else:
+        title = "🎯  TRADE SCAN  ·  LIVE SETUPS"
+        color = COLORS["trades"]
+    embed = discord.Embed(title=title, color=color, timestamp=datetime.now(IST))
+    embed.set_footer(text="DCT TrueNorth Bot  ·  Min 1:2 R:R  ·  Size responsibly")
+    trade_pattern = re.compile(
+        r'Trade\\s*[#—–-]?\\s*\\d+|Setup\\s*\\d+|\\$[A-Z]{2,10}\\s*[|·]\\s*(LONG|SHORT)',
+        re.IGNORECASE
+    )
+    splits = list(trade_pattern.finditer(tn_text))
+    if splits and len(splits) >= 2:
+        for i, m in enumerate(splits):
+            end = splits[i + 1].start() if i + 1 < len(splits) else len(tn_text)
+            block = tn_text[m.start():end].strip()
+            lines = block.split("\\n", 1)
+            trade_title = lines[0].strip().lstrip("*#- ")
+            trade_body = lines[1].strip() if len(lines) > 1 else ""
+            direction_icon = "🟢" if "LONG" in block.upper() else "🔴"
+            embed.add_field(
+                name=f"{direction_icon}  {trade_title}",
+                value=truncate(bold_numbers(trade_body), 1024),
+                inline=False
+            )
+    else:
+        sections = parse_sections(tn_text)
+        for title, body in sections[:8]:
+            embed.add_field(name=f"▸ {title}", value=truncate(bold_numbers(body), 1024), inline=False)
+    btc_match = re.search(r'(BTC[^\\n]{0,20}bias[^\\n]{0,120})', tn_text, re.IGNORECASE)
+    if btc_match:
+        embed.add_field(name="₿  BTC Directional Bias", value=bold_numbers(btc_match.group(1).strip()), inline=False)
+    return embed
+def build_regime_embed(tn_text):
+    embed = discord.Embed(
+        title="🌐  REGIME & MACRO UPDATE",
+        color=COLORS["regime"],
+        timestamp=datetime.now(IST),
+    )
+    embed.set_footer(text="DCT TrueNorth Bot  ·  Powered by TrueNorth AI")
+    regime_match = re.search(
+        r'(RISK[- ]ON|RISK[- ]OFF|NEUTRAL|FRAGILE|BEARISH|BULLISH)[^\\n]{0,80}',
+        tn_text, re.IGNORECASE
+    )
+    if regime_match:
+        regime_str = regime_match.group(0).strip()
+        if any(x in regime_str.upper() for x in ["RISK-ON", "RISK ON", "BULLISH"]):
+            badge = "🟢"
+        elif any(x in regime_str.upper() for x in ["RISK-OFF", "RISK OFF", "BEARISH"]):
+            badge = "🔴"
+        else:
+            badge = "🟡"
+        embed.description = f"{badge}  **{regime_str}**"
+    sections = parse_sections(tn_text)
+    for title, body in sections[:8]:
+        embed.add_field(name=f"▸ {title}", value=truncate(bold_numbers(body), 1024), inline=False)
+    return embed
+def build_claude_embed(user_msg, claude_reply):
+    embed = discord.Embed(
+        title="📡  TrueNorth + Claude",
+        description=f"*Query: {truncate(user_msg, 200)}*",
+        color=COLORS["claude"],
+        timestamp=datetime.now(IST),
+    )
+    embed.set_footer(text="DCT TrueNorth Bot  ·  Finance queries use TrueNorth data")
+    reply = bold_numbers(claude_reply)
+    chunks = [reply[i:i+1024] for i in range(0, len(reply), 1024)]
+    for idx, chunk in enumerate(chunks[:4]):
+        embed.add_field(name="Analysis" if idx == 0 else "\\u200b", value=chunk, inline=False)
+    return embed
+# ── TOKEN REFRESH ─────────────────────────────
 async def refresh_tn_token():
-    """Call Privy /sessions to exchange refresh token for a new access token."""
     global _tn_access_token
     if not TN_REFRESH_TOKEN:
         print("[TokenRefresh] TN_REFRESH_TOKEN not set -- skipping refresh")
@@ -66,32 +176,23 @@ async def refresh_tn_token():
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 PRIVY_REFRESH_URL,
-                headers={
-                    "privy-app-id": PRIVY_APP_ID,
-                    "Content-Type": "application/json",
-                },
+                headers={"privy-app-id": PRIVY_APP_ID, "Content-Type": "application/json"},
                 json={"refresh_token": TN_REFRESH_TOKEN},
             )
             if resp.status_code == 200:
                 data = resp.json()
-                new_token = (
-                    data.get("token")
-                    or data.get("access_token")
-                    or data.get("identity_token", "")
-                )
+                new_token = data.get("token") or data.get("access_token") or data.get("identity_token", "")
                 if new_token:
                     _tn_access_token = new_token
                     print("[TokenRefresh] Token refreshed at " + datetime.now(IST).isoformat())
                     return True
-                else:
-                    print("[TokenRefresh] Refresh response missing token. Keys: " + str(list(data.keys())))
+                print("[TokenRefresh] Refresh response missing token. Keys: " + str(list(data.keys())))
             else:
-                print("[TokenRefresh] Refresh failed HTTP " + str(resp.status_code) + ": " + resp.text[:200])
+                print("[TokenRefresh] Refresh failed HTTP " + str(resp.status_code))
     except Exception as e:
         print("[TokenRefresh] Exception: " + str(e))
     return False
-
-
+# ── TRUENORTH & CLAUDE ────────────────────────
 async def query_truenorth(prompt):
     headers = {
         "Authorization": "Bearer " + _tn_access_token,
@@ -118,19 +219,16 @@ async def query_truenorth(prompt):
                             break
                         try:
                             obj = json.loads(data)
-                            event_type = obj.get("event_type", "")
-                            if event_type == "llm_output":
-                                text_chunk = obj.get("data", {}).get("content", "")
-                                if text_chunk:
-                                    result += text_chunk
+                            if obj.get("event_type") == "llm_output":
+                                chunk = obj.get("data", {}).get("content", "")
+                                if chunk:
+                                    result += chunk
                         except Exception:
                             pass
     except Exception as e:
         result = "[TrueNorth error: " + str(e) + "]"
     cleaned = clean_tn_response(result)
     return cleaned or "[No response from TrueNorth]"
-
-
 def query_claude(messages, system=""):
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     kwargs = {"model": "claude-haiku-4-5", "max_tokens": 1024, "messages": messages}
@@ -138,8 +236,7 @@ def query_claude(messages, system=""):
         kwargs["system"] = system
     resp = client.messages.create(**kwargs)
     return resp.content[0].text
-
-
+# ── PROMPTS ───────────────────────────────────
 def pre_session_prompt(session):
     return (
         "Run a full pre-" + session.upper() + " session brief. Include: "
@@ -148,8 +245,6 @@ def pre_session_prompt(session):
         "3) Top macro events or news to watch "
         "4) 3 high-conviction tokens to trade with direction and bias. Keep it sharp and actionable."
     )
-
-
 def post_session_prompt(session):
     return (
         "Run a full post-" + session.upper() + " session debrief. Include: "
@@ -158,8 +253,6 @@ def post_session_prompt(session):
         "3) Any macro surprises or narrative shifts "
         "4) What to carry into the next session. Be concise and data-driven."
     )
-
-
 def regime_update_prompt():
     return (
         "Give me a regime and macro update. Include: "
@@ -169,8 +262,6 @@ def regime_update_prompt():
         "4) DXY, rates, bonds context "
         "5) One-line global outlook. Keep it under 400 words."
     )
-
-
 def trades_prompt():
     return (
         "Give me 3 high-conviction trade setups RIGHT NOW. "
@@ -179,46 +270,39 @@ def trades_prompt():
         "and a 2-sentence reason backed by TrueNorth data. "
         "Also include $BTC directional bias. Format cleanly."
     )
-
-
+# ── BOT SETUP ─────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 scheduler = AsyncIOScheduler(timezone=IST)
-
-
 async def send_session_brief(session_key, brief_type):
     session = SESSIONS[session_key]
     channel = bot.get_channel(CH[session["channel"]])
     if not channel:
         return
-    emoji = {"asia": "\U0001f30f", "london": "\U0001f1ec\U0001f1e7", "us": "\U0001f1fa\U0001f1f8"}[session_key]
-    label = "\U0001f4cb PRE-SESSION BRIEF" if brief_type == "pre" else "\U0001f4ca POST-SESSION DEBRIEF"
-    await channel.send(emoji + " **" + label + " -- " + session_key.upper() + " SESSION**\n*Querying TrueNorth...*")
+    flag_emoji, label = SESSION_FLAGS[session_key]
+    type_label = "PRE-SESSION BRIEF" if brief_type == "pre" else "POST-SESSION DEBRIEF"
+    await channel.send(f"{flag_emoji} **{label} · {type_label}** — *querying TrueNorth...*")
     prompt = pre_session_prompt(session_key) if brief_type == "pre" else post_session_prompt(session_key)
     tn = await query_truenorth(prompt)
-    for chunk in [tn[i:i+1900] for i in range(0, len(tn), 1900)]:
-        await channel.send(chunk)
+    embed = build_session_embed(session_key, brief_type, tn)
+    await channel.send(embed=embed)
     if brief_type == "pre":
         await asyncio.sleep(2)
         trades_ch = bot.get_channel(CH["trades"])
         if trades_ch:
-            await trades_ch.send(emoji + " **" + session_key.upper() + " SESSION SETUPS\n*Fetching from TrueNorth...*")
+            await trades_ch.send(f"{flag_emoji} **{label} SESSION SETUPS** — *fetching from TrueNorth...*")
             tr = await query_truenorth(trades_prompt())
-            for chunk in [tr[i:i+1900] for i in range(0, len(tr), 1900)]:
-                await trades_ch.send(chunk)
-
-
+            embed_tr = build_trades_embed(session_key, tr)
+            await trades_ch.send(embed=embed_tr)
 async def send_regime_update(trigger="scheduled"):
     channel = bot.get_channel(CH["regime"])
     if not channel:
         return
-    await channel.send("\U0001f310 **REGIME & MACRO UPDATE**\n*Querying TrueNorth...*")
+    await channel.send("🌐 **REGIME & MACRO UPDATE** — *querying TrueNorth...*")
     resp = await query_truenorth(regime_update_prompt())
-    for chunk in [resp[i:i+1900] for i in range(0, len(resp), 1900)]:
-        await channel.send(chunk)
-
-
+    embed = build_regime_embed(resp)
+    await channel.send(embed=embed)
 def schedule_sessions():
     offsets = {
         "asia":   {"pre": (5, 15),  "post": (14, 45)},
@@ -237,8 +321,7 @@ def schedule_sessions():
                           args=["scheduled"], id="regime_" + str(i), replace_existing=True)
     scheduler.add_job(refresh_tn_token, "interval", hours=12,
                       id="tn_token_refresh", replace_existing=True)
-
-
+# ── EVENTS ────────────────────────────────────
 @bot.event
 async def on_ready():
     print("DCT TrueNorth Bot online as " + str(bot.user))
@@ -247,23 +330,23 @@ async def on_ready():
     scheduler.start()
     ch = bot.get_channel(CH["claude"])
     if ch:
-        await ch.send(
-            "\U0001f916 **DCT TrueNorth Bot is online!**\n"
-            "Connected to TrueNorth + Claude.\n\n"
-            "**Channels:**\n"
-            "\u2022 `#claude-integration` -- Chat with me. Finance = TrueNorth. General = Claude.\n"
-            "\u2022 Session channels -- Auto briefs 15min before/after each session\n"
-            "\u2022 `#regime-outlook` -- Macro updates before every session\n"
-            "\u2022 `#trades` -- 3 setups per session\n\n"
-            "Type `!brief asia/london/us` or `!regime` or `!trades` to trigger manually."
+        embed = discord.Embed(
+            title="🤖  DCT TrueNorth Bot is online!",
+            description="Connected to **TrueNorth AI** + **Claude**.",
+            color=COLORS["claude"],
+            timestamp=datetime.now(IST),
         )
-
-
+        embed.add_field(name="💬  #claude-integration", value="Chat here. Finance → TrueNorth. General → Claude.", inline=False)
+        embed.add_field(name="📋  Session Channels", value="Auto briefs **15 min before/after** each session.", inline=False)
+        embed.add_field(name="🌐  #regime-outlook", value="Macro & regime updates before every session.", inline=False)
+        embed.add_field(name="🎯  #trades", value="3 high-conviction setups per session.", inline=False)
+        embed.add_field(name="⌨️  Manual Commands", value="`!brief asia/london/us` · `!regime` · `!trades` · `!refreshtoken`", inline=False)
+        embed.set_footer(text="DCT TrueNorth Bot  ·  Powered by TrueNorth AI")
+        await ch.send(embed=embed)
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
-    # Commands are handled exclusively -- skip chat handler for command messages
     if message.content.startswith(bot.command_prefix):
         await bot.process_commands(message)
         return
@@ -287,10 +370,11 @@ async def on_message(message):
                     "Synthesize into a clear actionable response. Use $SYMBOL format."
                 )
                 reply = query_claude(
-                    [{"role": "user", "content": "User asked: " + user_msg + "\n\nTrueNorth data:\n" + tn_data}],
+                    [{"role": "user", "content": "User asked: " + user_msg + "\\n\\nTrueNorth data:\\n" + tn_data}],
                     system=system,
                 )
-                await message.reply("\U0001f4e1 *via TrueNorth + Claude*\n\n" + reply)
+                embed = build_claude_embed(user_msg, reply)
+                await message.reply(embed=embed)
             else:
                 chat_history[cid].append({"role": "user", "content": user_msg})
                 if len(chat_history[cid]) > 20:
@@ -304,49 +388,42 @@ async def on_message(message):
     elif cid in [CH["asia"], CH["london"], CH["us"], CH["regime"]]:
         async with message.channel.typing():
             resp = await query_truenorth(message.content.strip())
-            chunks = [resp[i:i+1900] for i in range(0, len(resp), 1900)]
-            await message.reply(chunks[0])
-            for c in chunks[1:]:
-                await message.channel.send(c)
+            if cid == CH["regime"]:
+                embed = build_regime_embed(resp)
+            else:
+                key = {CH["asia"]: "asia", CH["london"]: "london", CH["us"]: "us"}[cid]
+                embed = build_session_embed(key, "pre", resp)
+            await message.reply(embed=embed)
     elif cid == CH["trades"]:
         if message.content.lower().startswith("result:"):
             trade_log.append({"timestamp": datetime.now(IST).isoformat(), "note": message.content})
             wins = sum(1 for t in trade_log if "win" in t.get("note", "").lower())
             total = len(trade_log)
             wr = round(wins / total * 100, 1) if total > 0 else 0
-            await message.reply("Logged. Win rate: **" + str(wr) + "%** (" + str(wins) + "/" + str(total) + ")")
+            await message.reply(f"Logged. Win rate: **{wr}%** ({wins}/{total})")
         else:
             async with message.channel.typing():
                 resp = await query_truenorth(message.content.strip())
-                chunks = [resp[i:i+1900] for i in range(0, len(resp), 1900)]
-                await message.reply(chunks[0])
-                for c in chunks[1:]:
-                    await message.channel.send(c)
-
-
+                embed = build_trades_embed(None, resp)
+                await message.reply(embed=embed)
+# ── COMMANDS ──────────────────────────────────
 @bot.command(name="brief")
 async def manual_brief(ctx, session: str = "all"):
     sessions = ["asia", "london", "us"] if session == "all" else [session.lower()]
     for s in sessions:
         if s in SESSIONS:
             await send_session_brief(s, "pre")
-
-
 @bot.command(name="regime")
 async def manual_regime(ctx):
     await send_regime_update("manual")
-
-
 @bot.command(name="trades")
 async def manual_trades(ctx):
     ch = bot.get_channel(CH["trades"])
     if ch:
-        await ch.send("\U0001f50d **MANUAL TRADE SCAN**\n*Querying TrueNorth...*")
+        await ch.send("🎯 **MANUAL TRADE SCAN** — *querying TrueNorth...*")
         resp = await query_truenorth(trades_prompt())
-        for chunk in [resp[i:i+1900] for i in range(0, len(resp), 1900)]:
-            await ch.send(chunk)
-
-
+        embed = build_trades_embed(None, resp)
+        await ch.send(embed=embed)
 @bot.command(name="winrate")
 async def winrate(ctx):
     total = len(trade_log)
@@ -354,19 +431,26 @@ async def winrate(ctx):
         await ctx.send("No trades logged yet. Log with: `result: $BTC LONG WIN`")
         return
     wins = sum(1 for t in trade_log if "win" in t.get("note", "").lower())
-    await ctx.send("\U0001f4ca Win Rate: **" + str(round(wins / total * 100, 1)) + "%** | " + str(wins) + "/" + str(total))
-
-
+    embed = discord.Embed(
+        title="📈  Win Rate Tracker",
+        color=COLORS["trades"],
+        timestamp=datetime.now(IST),
+    )
+    embed.add_field(name="Win Rate", value=f"**{round(wins / total * 100, 1)}%**", inline=True)
+    embed.add_field(name="Record",   value=f"**{wins}W / {total - wins}L**", inline=True)
+    embed.add_field(name="Total",    value=f"**{total} trades**", inline=True)
+    await ctx.send(embed=embed)
 @bot.command(name="refreshtoken")
 async def manual_refresh_token(ctx):
-    """Manually trigger a TrueNorth token refresh."""
     await ctx.send("Refreshing TrueNorth token...")
     success = await refresh_tn_token()
     if success:
-        await ctx.send("TrueNorth token refreshed successfully.")
+        await ctx.send("✅ TrueNorth token refreshed successfully.")
     else:
-        await ctx.send("Token refresh failed -- check logs for details.")
-
-
+        await ctx.send("❌ Token refresh failed — check logs for details.")
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
+```
+**Step 4:** Scroll to the top of the editor, change the commit message to:
+```
+Add Discord embed formatting for all bot posts
