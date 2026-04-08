@@ -1,10 +1,16 @@
 import os, json, asyncio, httpx, pytz, re
 from datetime import datetime
+from io import BytesIO
 from dotenv import load_dotenv
 import discord
 from discord.ext import commands
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import anthropic
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -179,6 +185,114 @@ def build_claude_embed(user_msg, claude_reply):
         embed.add_field(name="Analysis" if idx == 0 else "\\u200b", value=chunk, inline=False)
     return embed
 # ── TOKEN REFRESH ─────────────────────────────
+
+# -- TRADE CARD GENERATOR -----------------------------------------------
+def parse_trade_data(block_text):
+    """Extract coin, direction, entry, SL, TP from a trade block."""
+    data = {
+        "coin": "???", "direction": "LONG",
+        "entry": None, "sl": None, "tp1": None, "tp2": None, "rr": None,
+    }
+    coin_m = re.search(r'\\$([A-Z]{2,10})', block_text)
+    if coin_m:
+        data["coin"] = coin_m.group(1)
+    dir_m = re.search(r'\\b(LONG|SHORT)\\b', block_text, re.IGNORECASE)
+    if dir_m:
+        data["direction"] = dir_m.group(1).upper()
+    entry_m = re.search(r'[Ee]ntry[:\\s]+\\$?([\\d,\\.]+)', block_text)
+    if entry_m:
+        data["entry"] = entry_m.group(1)
+    sl_m = re.search(r'(?:SL|Stop[- ]?Loss)[:\\s]+\\$?([\\d,\\.]+)', block_text, re.IGNORECASE)
+    if sl_m:
+        data["sl"] = sl_m.group(1)
+    tp1_m = re.search(r'(?:TP1?|Target\\s*1?)[:\\s]+\\$?([\\d,\\.]+)', block_text, re.IGNORECASE)
+    if tp1_m:
+        data["tp1"] = tp1_m.group(1)
+    tp2_m = re.search(r'(?:TP2|Target\\s*2)[:\\s]+\\$?([\\d,\\.]+)', block_text, re.IGNORECASE)
+    if tp2_m:
+        data["tp2"] = tp2_m.group(1)
+    rr_m = re.search(r'(?:R[:\\s/]R|Risk[:/]Reward)[:\\s]+([\\d\\.]+:[\\d\\.]+|[\\d\\.]+x)', block_text, re.IGNORECASE)
+    if rr_m:
+        data["rr"] = rr_m.group(1)
+    return data
+
+
+def generate_trade_card(trade_data, trade_num=1):
+    """Generate a styled trade card PNG image using Pillow."""
+    if not PIL_AVAILABLE:
+        return None
+    W, H = 600, 320
+    is_long = trade_data["direction"] == "LONG"
+    img = Image.new("RGB", (W, H), (18, 22, 32))
+    draw = ImageDraw.Draw(img)
+    accent = (46, 204, 113) if is_long else (231, 76, 60)
+    draw.rectangle([0, 0, 6, H], fill=accent)
+    draw.rectangle([0, 0, W, 60], fill=(26, 30, 44))
+    coin = trade_data.get("coin", "???")
+    direction = trade_data["direction"]
+    try:
+        font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        font_path_reg = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        fnt_big = ImageFont.truetype(font_path, 36)
+        fnt_med = ImageFont.truetype(font_path, 18)
+        fnt_small = ImageFont.truetype(font_path_reg, 14)
+        fnt_tiny = ImageFont.truetype(font_path_reg, 12)
+    except Exception:
+        fnt_big = fnt_med = fnt_small = fnt_tiny = ImageFont.load_default()
+    coin_label = "$" + coin
+    draw.text((20, 10), coin_label, font=fnt_big, fill=(255, 255, 255))
+    try:
+        coin_w = draw.textlength(coin_label, font=fnt_big)
+    except Exception:
+        coin_w = len(coin_label) * 22
+    badge_x = int(20 + coin_w + 14)
+    badge_color = (39, 174, 96) if is_long else (192, 57, 43)
+    draw.rounded_rectangle([badge_x, 16, badge_x + 80, 46], radius=8, fill=badge_color)
+    draw.text((badge_x + 10, 20), direction, font=fnt_med, fill=(255, 255, 255))
+    trade_label = "Trade #" + str(trade_num)
+    draw.text((W - 110, 20), trade_label, font=fnt_small, fill=(140, 150, 170))
+    draw.rectangle([16, 62, W - 16, 64], fill=(40, 50, 70))
+    rows = []
+    if trade_data.get("entry"):
+        rows.append(("Entry", "$" + trade_data["entry"]))
+    if trade_data.get("sl"):
+        rows.append(("Stop Loss", "$" + trade_data["sl"]))
+    if trade_data.get("tp1"):
+        rows.append(("TP1", "$" + trade_data["tp1"]))
+    if trade_data.get("tp2"):
+        rows.append(("TP2", "$" + trade_data["tp2"]))
+    if trade_data.get("rr"):
+        rows.append(("R:R", trade_data["rr"]))
+    col_w = W // 2
+    row_h = 46
+    start_y = 74
+    for idx, (label, value) in enumerate(rows[:4]):
+        col = idx % 2
+        row = idx // 2
+        x = 20 + col * col_w
+        y = start_y + row * row_h
+        draw.text((x, y), label, font=fnt_small, fill=(120, 130, 150))
+        if "TP" in label:
+            val_color = (46, 204, 113)
+        elif "Stop" in label:
+            val_color = (231, 76, 60)
+        else:
+            val_color = (220, 230, 255)
+        draw.text((x, y + 18), value, font=fnt_med, fill=val_color)
+    if len(rows) > 4:
+        x = 20
+        y = start_y + 2 * row_h + 8
+        draw.text((x, y), rows[4][0], font=fnt_small, fill=(120, 130, 150))
+        draw.text((x, y + 18), rows[4][1], font=fnt_med, fill=(220, 230, 255))
+    draw.rectangle([0, H - 36, W, H], fill=(26, 30, 44))
+    footer_txt = "DCT TrueNorth Bot  ·  Size responsibly  ·  Min 1:2 R:R"
+    draw.text((20, H - 26), footer_txt, font=fnt_tiny, fill=(80, 90, 110))
+    arrow = "^" if is_long else "v"
+    draw.text((W - 30, H - 26), arrow, font=fnt_med, fill=accent)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
 async def refresh_tn_token():
     global _tn_access_token
     if not TN_REFRESH_TOKEN:
@@ -307,6 +421,16 @@ async def send_session_brief(session_key, brief_type):
             tr = await query_truenorth(trades_prompt())
             embed_tr = build_trades_embed(session_key, tr)
             await trades_ch.send(embed=embed_tr)
+            if PIL_AVAILABLE:
+                raw_blocks = [b for b in re.split(r"\$[A-Z]", tr) if b.strip()]
+                for t_idx, block in enumerate(raw_blocks[:6], 1):
+                    full_block = "$" + block
+                    td = parse_trade_data(full_block)
+                    if td.get("entry") or td.get("sl"):
+                        buf = generate_trade_card(td, t_idx)
+                        if buf:
+                            fname = "trade_" + td["coin"] + "_" + str(t_idx) + ".png"
+                            await trades_ch.send(file=discord.File(buf, filename=fname))
 async def send_regime_update(trigger="scheduled"):
     channel = bot.get_channel(CH["regime"])
     if not channel:
@@ -436,6 +560,16 @@ async def manual_trades(ctx):
         resp = await query_truenorth(trades_prompt())
         embed = build_trades_embed(None, resp)
         await ch.send(embed=embed)
+        if PIL_AVAILABLE:
+            raw_blocks = [b for b in re.split(r"\$[A-Z]", resp) if b.strip()]
+            for t_idx, block in enumerate(raw_blocks[:6], 1):
+                full_block = "$" + block
+                td = parse_trade_data(full_block)
+                if td.get("entry") or td.get("sl"):
+                    buf = generate_trade_card(td, t_idx)
+                    if buf:
+                        fname = "trade_" + td["coin"] + "_" + str(t_idx) + ".png"
+                        await ch.send(file=discord.File(buf, filename=fname))
 @bot.command(name="winrate")
 async def winrate(ctx):
     total = len(trade_log)
