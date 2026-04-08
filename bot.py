@@ -114,38 +114,46 @@ def build_session_embed(session_key, brief_type, tn_text):
 def build_trades_embed(session_key, tn_text):
     if session_key:
         flag_emoji, label = SESSION_FLAGS[session_key]
-        title = f"🎯  {flag_emoji} {label}  ·  SESSION TRADE SETUPS"
+        title = "\U0001f3af  " + flag_emoji + " " + label + "  \xb7  SESSION TRADE SETUPS"
         color = COLORS[session_key]
     else:
-        title = "🎯  TRADE SCAN  ·  LIVE SETUPS"
+        title = "\U0001f3af  TRADE SCAN  \xb7  LIVE SETUPS"
         color = COLORS["trades"]
     embed = discord.Embed(title=title, color=color, timestamp=datetime.now(IST))
-    embed.set_footer(text="DCT TrueNorth Bot  ·  Min 1:2 R:R  ·  Size responsibly")
+    embed.set_footer(text="DCT TrueNorth Bot  \xb7  Min 1:2 R:R  \xb7  Size responsibly")
+    EMBED_LIMIT = 5800
+    used = len(title) + len("DCT TrueNorth Bot  \xb7  Min 1:2 R:R  \xb7  Size responsibly")
     trade_pattern = re.compile(
-        r'Trade\\s*[#—–-]?\\s*\\d+|Setup\\s*\\d+|\\$[A-Z]{2,10}\\s*[|·]\\s*(LONG|SHORT)',
+        r'Trade\s*[#\u2014\u2013-]?\s*\d+|Setup\s*\d+|\$[A-Z]{2,10}\s*[|\xb7]\s*(LONG|SHORT)',
         re.IGNORECASE
     )
     splits = list(trade_pattern.finditer(tn_text))
     if splits and len(splits) >= 2:
-        for i, m in enumerate(splits):
+        for i, m in enumerate(splits[:6]):
             end = splits[i + 1].start() if i + 1 < len(splits) else len(tn_text)
             block = tn_text[m.start():end].strip()
-            lines = block.split("\\n", 1)
-            trade_title = lines[0].strip().lstrip("*#- ")
-            trade_body = lines[1].strip() if len(lines) > 1 else ""
-            direction_icon = "🟢" if "LONG" in block.upper() else "🔴"
-            embed.add_field(
-                name=f"{direction_icon}  {trade_title}",
-                value=truncate(bold_numbers(trade_body), 1024),
-                inline=False
-            )
+            block_lines = block.split("\n", 1)
+            trade_title = block_lines[0].strip().lstrip("*#- ")
+            trade_body = block_lines[1].strip() if len(block_lines) > 1 else ""
+            direction_icon = "\U0001f7e2" if "LONG" in block.upper() else "\U0001f534"
+            field_name = direction_icon + "  " + trade_title
+            field_val = truncate(bold_numbers(trade_body), min(400, EMBED_LIMIT - used - len(field_name) - 20))
+            if used + len(field_name) + len(field_val) > EMBED_LIMIT:
+                break
+            embed.add_field(name=field_name, value=field_val if field_val else "See full analysis above.", inline=False)
+            used += len(field_name) + len(field_val)
     else:
         sections = parse_sections(tn_text)
-        for title, body in sections[:8]:
-            embed.add_field(name=f"▸ {title}", value=truncate(bold_numbers(body), 1024), inline=False)
-    btc_match = re.search(r'(BTC[^\\n]{0,20}bias[^\\n]{0,120})', tn_text, re.IGNORECASE)
-    if btc_match:
-        embed.add_field(name="₿  BTC Directional Bias", value=bold_numbers(btc_match.group(1).strip()), inline=False)
+        for sec_title, body in sections[:4]:
+            field_name = "\u25b8 " + sec_title
+            field_val = truncate(bold_numbers(body), min(512, EMBED_LIMIT - used - len(field_name) - 20))
+            if used + len(field_name) + len(field_val) > EMBED_LIMIT:
+                break
+            embed.add_field(name=field_name, value=field_val, inline=False)
+            used += len(field_name) + len(field_val)
+    btc_match = re.search(r'(BTC[^\n]{0,20}bias[^\n]{0,80})', tn_text, re.IGNORECASE)
+    if btc_match and used + 60 < EMBED_LIMIT:
+        embed.add_field(name="\u20bf  BTC Directional Bias", value=bold_numbers(btc_match.group(1).strip()), inline=False)
     return embed
 def build_regime_embed(tn_text):
     embed = discord.Embed(
