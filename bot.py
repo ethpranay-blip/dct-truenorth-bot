@@ -90,7 +90,6 @@ async def query_truenorth(prompt):
         "allow_additional_tools": True,
         "thread_id": TN_THREAD_ID,
         "timezone": "Asia/Kolkata",
-        "thinking": False,
     }
     result = ""
     try:
