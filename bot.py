@@ -97,8 +97,8 @@ async def query_truenorth(prompt):
             async with client.stream("POST", TN_ENDPOINT, headers=headers, json=body) as resp:
                 print(f"[TN HTTP] status={resp.status_code}")
                 async for line in resp.aiter_lines():
-                    if line.startswith("data: "):
-                        data = line[6:]
+                    if line.startswith("data:"):
+                        data = line[5:].lstrip()
                         if data == "[DONE]":
                             break
                         try:
