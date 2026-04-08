@@ -63,7 +63,7 @@ def now_ist():
 def parse_sections(text):
     text = text.replace("\\r\\n", "\\n").strip()
     pattern = re.compile(
-        r'^(?:\\*{1,2})?(?:\\d+\\.\\s+|#{1,3}\\s*|[-–—]\\s*)([A-Z][^\\n]{2,60})(?:\\*{1,2})?\\s*$',
+        r'^(?:\\*{1,2})?(?:\\d+\\.\\s+|#{1,3}\\s*|[-]\\s*)([A-Z][^\\n]{2,60})(?:\\*{1,2})?\\s*$',
         re.MULTILINE
     )
     matches = list(pattern.finditer(text))
