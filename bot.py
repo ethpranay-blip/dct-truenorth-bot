@@ -555,13 +555,20 @@ async def manual_regime(ctx):
 @bot.command(name="trades")
 async def manual_trades(ctx):
     ch = bot.get_channel(CH["trades"])
-    if ch:
-        await ch.send("🎯 **MANUAL TRADE SCAN** — *querying TrueNorth...*")
+    if not ch:
+        print(f"[ERROR] manual_trades: channel CH['trades']={CH['trades']} not found")
+        await ctx.send("❌ Trades channel not found.")
+        return
+    try:
+        await ch.send("\U0001f3af **MANUAL TRADE SCAN** \u2014 *querying TrueNorth...*")
         resp = await query_truenorth(trades_prompt())
+        print(f"[trades] Got TrueNorth response, length={len(resp)}")
         embed = build_trades_embed(None, resp)
         await ch.send(embed=embed)
+        print("[trades] Embed sent successfully")
         if PIL_AVAILABLE:
-            raw_blocks = [b for b in re.split(r"\$[A-Z]", resp) if b.strip()]
+            raw_blocks = [b for b in re.split(r"\\$[A-Z]", resp) if b.strip()]
+            print(f"[trades] Found {len(raw_blocks)} trade blocks for cards")
             for t_idx, block in enumerate(raw_blocks[:6], 1):
                 full_block = "$" + block
                 td = parse_trade_data(full_block)
@@ -570,6 +577,11 @@ async def manual_trades(ctx):
                     if buf:
                         fname = "trade_" + td["coin"] + "_" + str(t_idx) + ".png"
                         await ch.send(file=discord.File(buf, filename=fname))
+                        print(f"[trades] Card sent for {td['coin']}")
+    except Exception as e:
+        print(f"[ERROR] manual_trades: {e!r}")
+        import traceback; traceback.print_exc()
+        await ctx.send(f"\u274c Error in trades: {e}")
 @bot.command(name="winrate")
 async def winrate(ctx):
     total = len(trade_log)
