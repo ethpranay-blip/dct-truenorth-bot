@@ -61,22 +61,34 @@ def truncate(text, limit=1024):
 def now_ist():
     return datetime.now(IST).strftime("%b %d, %Y · %H:%M IST")
 def parse_sections(text):
-    text = text.replace("\\r\\n", "\\n").strip()
-    pattern = re.compile(
-        r'^(?:\\*{1,2})?(?:\\d+\\.\\s+|#{1,3}\\s*|[-]\\s*)([A-Z][^\\n]{2,60})(?:\\*{1,2})?\\s*$',
-        re.MULTILINE
-    )
-    matches = list(pattern.finditer(text))
-    if not matches:
-        return [("Overview", text)]
+    """Split TrueNorth text into (title, body) tuples based on numbered headings."""
+    text = text.replace("\r\n", "\n").strip()
     sections = []
-    for i, m in enumerate(matches):
-        title = m.group(1).strip().rstrip(":")
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        body = text[start:end].strip()
-        if body:
-            sections.append((title, body))
+    current_title = "Overview"
+    current_body = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        # Detect numbered section headers: "1. Something" or "## Something"
+        is_header = False
+        if stripped and len(stripped) < 80:
+            if stripped[0].isdigit() and len(stripped) > 2 and stripped[1] in ".)" and stripped[2] == " ":
+                is_header = True
+                header_text = stripped[3:].strip().rstrip(":").strip("*")
+            elif stripped.startswith("#"):
+                header_text = stripped.lstrip("#").strip().rstrip(":").strip("*")
+                if header_text and header_text[0].isupper():
+                    is_header = True
+        if is_header:
+            body = "\n".join(current_body).strip()
+            if body:
+                sections.append((current_title, body))
+            current_title = header_text
+            current_body = []
+        else:
+            current_body.append(line)
+    body = "\n".join(current_body).strip()
+    if body:
+        sections.append((current_title, body))
     return sections if sections else [("Overview", text)]
 # ── EMBED BUILDERS ────────────────────────────
 def build_session_embed(session_key, brief_type, tn_text):
