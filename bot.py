@@ -97,31 +97,20 @@ async def query_truenorth(prompt):
             async with client.stream("POST", TN_ENDPOINT, headers=headers, json=body) as resp:
                 print(f"[TN HTTP] status={resp.status_code}")
                 async for line in resp.aiter_lines():
-                    if line:
-                        print(f"[TN RAW] {repr(line[:200])}")
                     if line.startswith("data: "):
                         data = line[6:]
                         if data == "[DONE]":
                             break
                         try:
                             obj = json.loads(data)
-                            # Try common response fields
-                            text_chunk = (
-                                obj.get("content") or
-                                obj.get("text") or
-                                obj.get("message") or
-                                obj.get("delta", {}).get("content") or
-                                obj.get("choices", [{}])[0].get("delta", {}).get("content") or
-                                obj.get("choices", [{}])[0].get("text") or
-                                ""
-                            )
-                            result += text_chunk
-                            if text_chunk:
-                                print(f"[TN SSE] got text chunk: {text_chunk[:80]}")
-                            else:
-                                print(f"[TN SSE] unrecognised shape: {list(obj.keys())}")
-                        except Exception as ex:
-                            print(f"[TN SSE] JSON parse error: {ex} | raw: {data[:120]}")
+                            # TrueNorth format: {"event_type":"llm_output","data":{"content":"...","streaming":true}}
+                            event_type = obj.get("event_type", "")
+                            if event_type == "llm_output":
+                                text_chunk = obj.get("data", {}).get("content", "")
+                                if text_chunk:
+                                    result += text_chunk
+                        except Exception:
+                            pass
     except Exception as e:
         result = "[TrueNorth error: " + str(e) + "]"
     return result.strip() or "[No response from TrueNorth]"
