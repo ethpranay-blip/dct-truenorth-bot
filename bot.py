@@ -224,8 +224,8 @@ def parse_trades_from_text(text: str) -> list[dict]:
 def extract_risk_flag(text: str) -> str | None:
     """Pull out a risk flag section if present."""
     patterns = [
-        r'(?:\u26a0\ufe0f?\s*)?[Ss]ession\s+[Rr]isk\s+[Ff]lag[:\s]*(.*?)(?:\n-{3,}|\Z)',
-        r'(?:\u26a0\ufe0f?\s*)?[Rr]isk\s+[Ff]lag[:\s]*(.*?)(?:\n-{3,}|\Z)',
+        r'(?:⚠️?\s*)?[Ss]ession\s+[Rr]isk\s+[Ff]lag[:\s]*(.*?)(?:\n-{3,}|\Z)',
+        r'(?:⚠️?\s*)?[Rr]isk\s+[Ff]lag[:\s]*(.*?)(?:\n-{3,}|\Z)',
     ]
     for pat in patterns:
         m = re.search(pat, text, re.DOTALL)
@@ -236,12 +236,12 @@ def extract_risk_flag(text: str) -> str | None:
 # --- Embed builders ---
 def build_trade_embeds(trades: list[dict]) -> list[discord.Embed]:
     """Build trade embeds."""
-    rank_emoji = ["U0001f947", "U0001f948", "U0001f949"]
+    rank_emoji = ["🥇", "🥈", "🥉"]
     embeds = []
     for i, t in enumerate(trades[:3]):
         color = COLOR_LONG if t["direction"] == "LONG" else COLOR_SHORT
-        emoji = rank_emoji[i] if i < 3 else "U0001f4ca"
-        direction_dot = "U0001f7e2" if t["direction"] == "LONG" else "U0001f534"
+        emoji = rank_emoji[i] if i < 3 else "📊"
+        direction_dot = "🟢" if t["direction"] == "LONG" else "🔴"
         e = discord.Embed(
             title=f"{direction_dot} ${t['ticker']} {t['direction']}",
             color=color,
@@ -269,16 +269,16 @@ def build_brief_embed(text: str, session: str, phase: str) -> discord.Embed:
     labels = {"asia": "Asia", "london": "London", "us": "US"}
     color = colors.get(session, COLOR_INFO)
     label = labels.get(session, session.title())
-    title = f"U0001f4ca {label} Session -- {phase}"
+    title = f"📊 {label} Session -- {phase}"
     brief_text = text
     trade_start = re.search(r'\$[A-Z]+\s*\|?\s*(?:LONG|SHORT)', text, re.IGNORECASE)
     if trade_start:
         brief_text = text[:trade_start.start()].strip()
-    risk_start = re.search(r'(?:\u26a0\ufe0f?\s*)?[Ss]ession\s+[Rr]isk\s+[Ff]lag', brief_text)
+    risk_start = re.search(r'(?:⚠️?\s*)?[Ss]ession\s+[Rr]isk\s+[Ff]lag', brief_text)
     if risk_start:
         brief_text = brief_text[:risk_start.start()].strip()
     if len(brief_text) > 4000:
-        brief_text = brief_text[:3990] + "\u2026"
+        brief_text = brief_text[:3990] + "…"
     e = discord.Embed(title=title, description=brief_text, color=color)
     e.set_footer(text=FOOTER)
     e.timestamp = datetime.now(IST)
@@ -297,9 +297,9 @@ def build_risk_embed(risk_text: str) -> discord.Embed:
 def build_regime_embed(text: str) -> discord.Embed:
     """Build the daily regime outlook embed."""
     if len(text) > 4000:
-        text = text[:3990] + "\u2026"
+        text = text[:3990] + "…"
     e = discord.Embed(
-        title="U0001f310 Daily Regime Outlook",
+        title="🌐 Daily Regime Outlook",
         description=text,
         color=COLOR_REGIME,
     )
@@ -343,7 +343,7 @@ async def run_session_brief(session: str, phase: str):
     if not result:
         print(f"[SCHED] No response from TrueNorth for {label} {phase}")
         e = discord.Embed(
-            title=f"U0001f4ca {label} Session -- {phase}",
+            title=f"📊 {label} Session -- {phase}",
             description="⚠️ TrueNorth did not return data. Token may need refresh.\nUse !refreshtoken to check.",
             color=COLOR_RISK,
         )
@@ -355,7 +355,7 @@ async def run_session_brief(session: str, phase: str):
     trades = parse_trades_from_text(result)
     if trades and trades_channel:
         header = discord.Embed(
-            title=f"U0001f4c8 {label} {phase} -- Trade Setups",
+            title=f"📈 {label} {phase} -- Trade Setups",
             description=f"3 high-conviction setups from the {label} {phase.lower()} brief.",
             color=colors_map(session),
         )
@@ -397,7 +397,7 @@ async def run_regime_update():
     result = await query_truenorth(prompt)
     if not result:
         e = discord.Embed(
-            title="U0001f310 Daily Regime Outlook",
+            title="🌐 Daily Regime Outlook",
             description="⚠️ TrueNorth did not return data. Token may need refresh.",
             color=COLOR_RISK,
         )
@@ -455,20 +455,20 @@ async def on_ready():
     print(f"[SCHED] {len(SCHEDULE)} session briefs + regime + token refresh scheduled")
     ch = bot.get_channel(CH["claude"])
     if ch:
-        e = discord.Embed(title="U0001f916 DCT TrueNorth Bot is online!", color=COLOR_INFO)
+        e = discord.Embed(title="🤖 DCT TrueNorth Bot is online!", color=COLOR_INFO)
         e.description = "Connected to TrueNorth AI + Claude."
         e.add_field(
-            name="U0001f4ac #claude-integration",
+            name="💬 #claude-integration",
             value="Chat here. Finance -> TrueNorth. General -> Claude.",
             inline=False,
         )
         e.add_field(
-            name="U0001f4cb Session Channels",
+            name="📋 Session Channels",
             value="Auto briefs 15 min before/after each session open & close.",
             inline=False,
         )
-        e.add_field(name="U0001f310 #regime-outlook", value="Daily macro & regime update at 5:00 AM IST.", inline=False)
-        e.add_field(name="U0001f3af #trades", value="3 high-conviction setups per session brief.", inline=False)
+        e.add_field(name="🌐 #regime-outlook", value="Daily macro & regime update at 5:00 AM IST.", inline=False)
+        e.add_field(name="🎯 #trades", value="3 high-conviction setups per session brief.", inline=False)
         e.add_field(
             name="⌨️ Manual Commands",
             value="!brief asia/london/us · !regime · !trades · !refreshtoken",
@@ -544,7 +544,7 @@ async def manual_trades(ctx: commands.Context):
     result = await query_truenorth(prompt)
     if not result:
         e = discord.Embed(
-            title="U0001f4ca Trade Setups",
+            title="📊 Trade Setups",
             description="⚠️ No response from TrueNorth. Token may need refresh.\nUse !refreshtoken to check.",
             color=COLOR_RISK,
         )
@@ -558,7 +558,7 @@ async def manual_trades(ctx: commands.Context):
             await ctx.send(embed=e)
     else:
         e = discord.Embed(
-            title="U0001f4ca Trade Setups",
+            title="📊 Trade Setups",
             description=f"```\n{result[:3900]}\n```",
             color=COLOR_US,
         )
@@ -578,7 +578,7 @@ async def manual_regime(ctx: commands.Context):
 async def winrate(ctx: commands.Context):
     """Show win rate stats (placeholder)."""
     e = discord.Embed(
-        title="U0001f4ca Win Rate Tracker",
+        title="📊 Win Rate Tracker",
         description="Trade tracking coming soon. Historical win rates will be calculated from closed positions.",
         color=COLOR_INFO,
     )
@@ -588,7 +588,7 @@ async def winrate(ctx: commands.Context):
 @bot.command(name="refreshtoken")
 async def manual_refresh(ctx: commands.Context):
     """Manually refresh TrueNorth token."""
-    await ctx.send("U0001f504 Attempting token refresh...")
+    await ctx.send("🔄 Attempting token refresh...")
     await refresh_tn_token()
     test = await query_truenorth("ping")
     if test:
