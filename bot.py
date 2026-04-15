@@ -15,8 +15,11 @@ Channels:
 import os
 import re
 import json
+import uuid
+import time
 import asyncio
 import traceback
+from collections import defaultdict
 from datetime import datetime
 
 import discord
@@ -48,6 +51,40 @@ CH = {
     "trades":  int(os.environ["CH_TRADES"]),
 }
 
+# --- Sonnet middleman config ---
+SONNET_MODEL = "claude-sonnet-4-6"
+RATE_LIMIT_MAX = 3
+RATE_LIMIT_WINDOW = 3600
+KNOWN_COMMANDS = ("!brief", "!trades", "!regime", "!winrate", "!refreshtoken")
+
+SONNET_SYSTEM = """You are a research assistant for crypto traders in the Corgi Calls Discord. You have access to TrueNorth AI, a multi-agent trading intelligence platform covering crypto, equities, Polymarket, derivatives, on-chain, smart money flow, options, liquidation risk, and meme discovery.
+
+Use the query_truenorth tool to pull real-time market intelligence. For non-trivial questions, call it multiple times in parallel with different angles (technicals, derivatives/funding, on-chain, sentiment, smart money) to build a full picture before answering.
+
+Tone: direct, trader-native. Use perps, HTF, R:R, OI, CMP, funding, liquidations, aping. Specific numbers over hedged language. No marketing speak. If TrueNorth returns nothing useful, say so — never invent data. Keep answers under 1800 chars for Discord."""
+
+SONNET_TOOLS = [
+    {
+        "name": "query_truenorth",
+        "description": "Ask TrueNorth AI a trading or market question. TrueNorth runs 50+ internal tools in parallel (technical analysis, derivatives flow, on-chain data, Polymarket, Hyperliquid smart money, options, liquidation risk, meme discovery, token unlocks, performance scanning, events). Returns a detailed natural-language answer. Call this multiple times with different angles for complex questions — e.g. one query for TA, another for derivatives, another for sentiment — then synthesize.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The question in natural language. Be specific: name the ticker(s), timeframe, and what kind of analysis you want (technicals, funding, liquidations, smart money positioning, etc.)."
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": False
+        },
+        "cache_control": {"type": "ephemeral"}
+    }
+]
+
+tn_thread_map: dict[int, str] = {}
+user_sonnet_calls: dict[int, list[float]] = defaultdict(list)
+
 # --- Embed colors ---
 COLOR_LONG   = 0x00FF88
 COLOR_SHORT  = 0xFF4444
@@ -71,7 +108,7 @@ scheduler = AsyncIOScheduler(timezone=IST)
 token_store = {"access": TN_TOKEN, "refresh": TN_REFRESH}
 
 # --- TrueNorth SSE query ---
-async def query_truenorth(prompt: str, timeout_read: float = 180.0) -> str:
+async def query_truenorth(prompt: str, thread_id: str | None = None, timeout_read: float = 180.0) -> str:
     """Send prompt to TrueNorth SSE endpoint, return assembled text."""
     headers = {
         "Authorization": f"Bearer {token_store['access']}",
@@ -82,7 +119,7 @@ async def query_truenorth(prompt: str, timeout_read: float = 180.0) -> str:
     }
     body = {
         "query": prompt,
-        "thread_id": TN_THREAD,
+        "thread_id": thread_id or TN_THREAD,
     }
     result_chunks = []
     try:
@@ -167,6 +204,116 @@ async def refresh_tn_token():
                 print(f"[TokenRefresh] status={resp.status_code} body={resp.text[:200]}")
     except Exception as e:
         print(f"[TokenRefresh] {e}")
+
+# --- Chat routing helpers ---
+def check_rate_limit(user_id: int) -> bool:
+    now = time.time()
+    calls = user_sonnet_calls[user_id]
+    calls[:] = [t for t in calls if now - t < RATE_LIMIT_WINDOW]
+    if len(calls) >= RATE_LIMIT_MAX:
+        return False
+    calls.append(now)
+    return True
+
+def rate_limit_retry_min(user_id: int) -> int:
+    calls = user_sonnet_calls[user_id]
+    if not calls:
+        return 0
+    return max(1, int((RATE_LIMIT_WINDOW - (time.time() - calls[0])) / 60))
+
+def get_tn_thread(conv_id: int) -> str:
+    tid = tn_thread_map.get(conv_id)
+    if not tid:
+        tid = str(uuid.uuid4())
+        tn_thread_map[conv_id] = tid
+    return tid
+
+async def get_or_create_conv_thread(message: discord.Message, content: str) -> discord.abc.Messageable:
+    if isinstance(message.channel, discord.Thread):
+        return message.channel
+    name = content.strip().splitlines()[0][:80] if content.strip() else "chat"
+    return await message.create_thread(name=name or "chat", auto_archive_duration=60)
+
+async def send_long(channel, text: str):
+    text = text.strip() or "(empty response)"
+    for i in range(0, len(text), 1900):
+        await channel.send(text[i:i+1900])
+
+async def handle_direct_tn(message: discord.Message, content: str):
+    conv = await get_or_create_conv_thread(message, content)
+    tn_id = get_tn_thread(conv.id)
+    async with conv.typing():
+        result = await query_truenorth(content, tn_id)
+        if not result:
+            await conv.send("⚠️ no response from truenorth. try again or run `!refreshtoken`.")
+            return
+        await send_long(conv, result)
+
+async def run_sonnet_loop(query: str, tn_thread_id: str, max_iter: int = 5) -> str:
+    messages = [{"role": "user", "content": query}]
+    for _ in range(max_iter):
+        response = await asyncio.to_thread(
+            claude_client.messages.create,
+            model=SONNET_MODEL,
+            max_tokens=2048,
+            system=[{"type": "text", "text": SONNET_SYSTEM, "cache_control": {"type": "ephemeral"}}],
+            tools=SONNET_TOOLS,
+            messages=messages,
+        )
+        if response.stop_reason == "end_turn":
+            return "".join(b.text for b in response.content if b.type == "text")
+        messages.append({"role": "assistant", "content": response.content})
+        tool_ids: list[str] = []
+        tool_coros = []
+        tool_results: list[dict] = []
+        for block in response.content:
+            if block.type == "tool_use":
+                if block.name == "query_truenorth":
+                    tool_ids.append(block.id)
+                    tool_coros.append(query_truenorth(block.input["query"], tn_thread_id))
+                else:
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": f"unknown tool: {block.name}",
+                        "is_error": True,
+                    })
+        if tool_coros:
+            results = await asyncio.gather(*tool_coros, return_exceptions=True)
+            for tid, r in zip(tool_ids, results):
+                content = r if isinstance(r, str) and r else "no data"
+                if isinstance(r, Exception):
+                    content = f"tool error: {type(r).__name__}: {r}"
+                tool_results.append({"type": "tool_result", "tool_use_id": tid, "content": content})
+        messages.append({"role": "user", "content": tool_results})
+    return "(sonnet exceeded tool-call iteration limit)"
+
+async def handle_sonnet(message: discord.Message, query: str):
+    if not check_rate_limit(message.author.id):
+        wait_min = rate_limit_retry_min(message.author.id)
+        await message.reply(
+            f"⏱️ rate limit: {RATE_LIMIT_MAX} claude calls/hour. try again in ~{wait_min}m, or drop the `!` to query truenorth directly.",
+            mention_author=False,
+        )
+        return
+    conv = await get_or_create_conv_thread(message, query)
+    tn_id = get_tn_thread(conv.id)
+    async with conv.typing():
+        try:
+            text = await run_sonnet_loop(query, tn_id)
+        except anthropic.BadRequestError as e:
+            print(f"[SONNET 400] {e}")
+            await conv.send(f"⚠️ claude rejected the request: {e.message[:300]}")
+            return
+        except anthropic.RateLimitError:
+            await conv.send("⚠️ anthropic rate limit hit. try again in a minute.")
+            return
+        except Exception as e:
+            print(f"[SONNET ERROR] {type(e).__name__}: {e}")
+            traceback.print_exc()
+            await conv.send(f"⚠️ claude error: {type(e).__name__}")
+            return
+        await send_long(conv, text)
 
 # --- Response parsers ---
 def parse_trades_from_text(text: str) -> list[dict]:
@@ -459,7 +606,11 @@ async def on_ready():
         e.description = "Connected to TrueNorth AI + Claude."
         e.add_field(
             name="💬 #claude-integration",
-            value="Chat here. Finance -> TrueNorth. General -> Claude.",
+            value=(
+                "Default: ask anything → streams direct from TrueNorth in a thread.\n"
+                "Prefix `!` (e.g. `!btc vs eth 7d`) → Claude Sonnet pulls multiple TN angles and synthesizes (3/hr/user).\n"
+                "Stay in the thread for follow-ups (context preserved)."
+            ),
             inline=False,
         )
         e.add_field(
@@ -477,39 +628,33 @@ async def on_ready():
         e.set_footer(text=FOOTER)
         await ch.send(embed=e)
 
-FINANCE_KEYWORDS = {
-    "$", "btc", "eth", "sol", "bitcoin", "ethereum", "solana",
-    "market", "price", "trade", "long", "short", "chart",
-    "bullish", "bearish", "support", "resistance", "volume",
-    "liquidation", "funding", "oi", "open interest", "perp",
-    "futures", "options", "puts", "calls", "vix", "spx",
-    "nasdaq", "s&p", "fed", "cpi", "fomc", "yields",
-    "dxy", "gold", "oil", "macro", "regime",
-}
-
 @bot.event
 async def on_message(message: discord.Message):
     if message.author == bot.user:
         return
     await bot.process_commands(message)
-    if message.channel.id != CH["claude"]:
+
+    in_claude = message.channel.id == CH["claude"]
+    in_claude_thread = (
+        isinstance(message.channel, discord.Thread)
+        and message.channel.parent_id == CH["claude"]
+    )
+    if not (in_claude or in_claude_thread):
         return
-    if message.content.startswith("!"):
+
+    content = message.content.strip()
+    if not content:
         return
-    content_lower = message.content.lower()
-    is_finance = any(kw in content_lower for kw in FINANCE_KEYWORDS)
-    async with message.channel.typing():
-        if is_finance:
-            result = await query_truenorth(message.content)
-            if result:
-                for i in range(0, len(result), 1900):
-                    await message.reply(result[i:i+1900], mention_author=False)
-            else:
-                fallback = ask_claude(message.content)
-                await message.reply(fallback, mention_author=False)
-        else:
-            result = ask_claude(message.content)
-            await message.reply(result, mention_author=False)
+    if any(content.lower().startswith(c) for c in KNOWN_COMMANDS):
+        return
+
+    if content.startswith("!"):
+        free = content[1:].strip()
+        if not free:
+            return
+        await handle_sonnet(message, free)
+    else:
+        await handle_direct_tn(message, content)
 
 # --- Manual commands ---
 @bot.command(name="brief")
