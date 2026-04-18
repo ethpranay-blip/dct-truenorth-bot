@@ -2,5 +2,6 @@
 __pycache__/
 *.pyc
 thread_cache.json
+token_cache.json
 .pytest_cache/
 .venv/

@@ -43,6 +43,7 @@ PRIVY_APP_ID     = os.environ.get("PRIVY_APP_ID", "cm6afcumv0688a6x3r78jkx7v")
 TN_ENDPOINT      = "https://api.adventai.io/api/discovery-agents/sse/v2/streams"
 TN_THREAD_ENV    = os.environ.get("TN_THREAD_ID", "").strip()
 THREAD_CACHE_PATH = os.environ.get("TN_THREAD_CACHE", "thread_cache.json")
+TOKEN_CACHE_PATH  = os.environ.get("TN_TOKEN_CACHE", "token_cache.json")
 PRIVY_SESSION_URL = "https://auth.privy.io/api/v1/sessions"
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -109,15 +110,55 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 scheduler = AsyncIOScheduler(timezone=IST)
 
-# Mutable token holder (so refresh can update it)
-token_store = {"access": TN_TOKEN, "refresh": TN_REFRESH}
+# --- Token cache (survives in-container restarts; helps because Privy refresh
+# tokens are single-use — each refresh rotates them, so env-only storage loses
+# the rotated token if the process restarts).
+def _load_token_cache() -> dict:
+    try:
+        with open(TOKEN_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def _save_token_cache(access: str, refresh: str) -> None:
+    try:
+        with open(TOKEN_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "access": access,
+                    "refresh": refresh,
+                    "updated_at": datetime.now(IST).isoformat(),
+                },
+                f,
+            )
+    except OSError as e:
+        print(f"[Token] cache write failed: {e}")
+
+
+_cached_tokens = _load_token_cache()
+# Mutable token holder: prefer cached values (they are newer than env after any prior refresh)
+token_store = {
+    "access": _cached_tokens.get("access") or TN_TOKEN,
+    "refresh": _cached_tokens.get("refresh") or TN_REFRESH,
+}
+if _cached_tokens:
+    print(f"[BOOT] Loaded tokens from {TOKEN_CACHE_PATH} (updated_at={_cached_tokens.get('updated_at')})")
 
 # --- Observability state ---
+# A single mutable dict avoids any ambiguity about `global` declarations in
+# functions that mutate these values (and any reader gets the current value
+# automatically via dict lookup).
 BOT_STARTED_AT: datetime = datetime.now(IST)
-last_tn_success_at: datetime | None = None
-last_tn_error: str | None = None
-last_tn_error_at: datetime | None = None
-last_alert_at: float = 0.0
+tn_state: dict = {
+    "last_success_at": None,   # datetime | None
+    "last_error_at": None,     # datetime | None
+    "last_error": None,        # str | None
+    "last_alert_at": 0.0,      # time.time() float
+}
 ALERT_COOLDOWN_SEC = 3600
 
 # SSE / HTTP error markers that indicate auth vs thread-access failures.
@@ -271,7 +312,6 @@ async def query_truenorth(
     timeout_read: float = 180.0,
 ) -> str:
     """Send prompt to TrueNorth; auto-refresh token and rotate thread on recoverable errors."""
-    global last_tn_success_at, last_tn_error, last_tn_error_at
     caller_pinned_thread = thread_id is not None
     tid = thread_id or ensure_thread_id()
 
@@ -308,24 +348,23 @@ async def query_truenorth(
                 print(f"[TN ERROR retry] {type(e).__name__}: {e}")
 
     if text:
-        last_tn_success_at = datetime.now(IST)
-        print(f"[TN RESULT] {len(text)} chars")
+        tn_state["last_success_at"] = datetime.now(IST)
+        print(f"[TN RESULT] {len(text)} chars (last_success_at updated)")
         return text
 
     reason = err or (f"{type(exc).__name__}: {exc}" if exc else f"http status={status}")
-    last_tn_error = reason
-    last_tn_error_at = datetime.now(IST)
+    tn_state["last_error"] = reason
+    tn_state["last_error_at"] = datetime.now(IST)
     await alert_tn_failure(reason)
     return ""
 
 
 async def alert_tn_failure(reason: str) -> None:
     """Post a rate-limited alert embed to #claude-integration on unrecovered TN failure."""
-    global last_alert_at
     now = time.time()
-    if now - last_alert_at < ALERT_COOLDOWN_SEC:
+    if now - tn_state["last_alert_at"] < ALERT_COOLDOWN_SEC:
         return
-    last_alert_at = now
+    tn_state["last_alert_at"] = now
     try:
         channel = bot.get_channel(CH["claude"])
         if not channel:
@@ -363,40 +402,76 @@ def ask_claude(prompt: str) -> str:
         return "Something went wrong with Claude. Try again."
 
 # --- Token refresh ---
+def _mask(tok: str) -> str:
+    """Return a truncated token for log safety (first 8 + last 4 chars)."""
+    if not tok:
+        return "<empty>"
+    if len(tok) < 16:
+        return f"{tok[:4]}…"
+    return f"{tok[:8]}…{tok[-4:]} (len={len(tok)})"
+
+
 async def refresh_tn_token() -> bool:
-    """Refresh TN access token via Privy. Returns True on success, False otherwise."""
-    if not token_store["refresh"]:
+    """Refresh TN access token via Privy. Returns True on success, False otherwise.
+
+    Logs the HTTP status, response keys, and (truncated) body on every path so
+    the next failure is fully diagnosable in Railway logs.
+    """
+    rt = token_store["refresh"]
+    if not rt:
         print("[TokenRefresh] TN_REFRESH_TOKEN not set -- skipping")
         return False
+    print(f"[TokenRefresh] POST {PRIVY_SESSION_URL} refresh={_mask(rt)} app_id={PRIVY_APP_ID}")
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 PRIVY_SESSION_URL,
-                json={"refresh_token": token_store["refresh"]},
+                json={"refresh_token": rt},
                 headers={
                     "privy-app-id": PRIVY_APP_ID,
                     "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "privy-client": "react-auth:2.0.0",
                 },
             )
-            if resp.status_code == 200:
+            status = resp.status_code
+            body_preview = resp.text[:500]
+            print(f"[TokenRefresh] status={status} body={body_preview}")
+            if status != 200:
+                return False
+            try:
                 data = resp.json()
-                new_access = (
-                    data.get("token")
-                    or data.get("access_token")
-                    or data.get("identity_token")
-                )
-                new_refresh = data.get("refresh_token")
-                if new_access:
-                    token_store["access"] = new_access
-                if new_refresh:
-                    token_store["refresh"] = new_refresh
-                exp = decode_jwt_exp(token_store["access"])
-                print(f"[TokenRefresh] ok; new exp={exp}")
-                return bool(new_access)
-            print(f"[TokenRefresh] status={resp.status_code} body={resp.text[:200]}")
-            return False
+            except Exception as e:
+                print(f"[TokenRefresh] JSON parse failed: {e}")
+                return False
+            if not isinstance(data, dict):
+                print(f"[TokenRefresh] unexpected response type: {type(data).__name__}")
+                return False
+            print(f"[TokenRefresh] response keys: {sorted(data.keys())}")
+            new_access = (
+                data.get("token")
+                or data.get("access_token")
+                or data.get("identity_token")
+                or data.get("privy_access_token")
+            )
+            new_refresh = (
+                data.get("refresh_token")
+                or data.get("privy_refresh_token")
+            )
+            if not new_access:
+                print("[TokenRefresh] 200 OK but no access-token field found in response")
+                return False
+            token_store["access"] = new_access
+            if new_refresh:
+                token_store["refresh"] = new_refresh
+                print(f"[TokenRefresh] refresh token rotated: {_mask(new_refresh)}")
+            _save_token_cache(token_store["access"], token_store["refresh"])
+            exp = decode_jwt_exp(token_store["access"])
+            print(f"[TokenRefresh] ok; access exp={exp}")
+            return True
     except Exception as e:
         print(f"[TokenRefresh] {type(e).__name__}: {e}")
+        traceback.print_exc()
         return False
 
 # --- Chat routing helpers ---
@@ -510,8 +585,38 @@ async def handle_sonnet(message: discord.Message, query: str):
         await send_long(conv, text)
 
 # --- Response parsers ---
+_TICKER_HEADER_RE = re.compile(r'\$[A-Z]{1,10}\s*\|\s*(LONG|SHORT)\b', re.IGNORECASE)
+_TOKEN_TAG_RE = re.compile(r'<\s*Token\b[^>]*/?>', re.IGNORECASE)
+_TOKEN_SYMBOL_ATTR_RE = re.compile(r'tokenSymbol\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+
+
+def strip_token_tags(text: str) -> str:
+    """Replace <Token ... tokenSymbol="X" ... /> with $X; drop tags with no symbol."""
+    def _sub(m: re.Match) -> str:
+        sym = _TOKEN_SYMBOL_ATTR_RE.search(m.group(0))
+        return f"${sym.group(1).upper()}" if sym else ""
+    text = _TOKEN_TAG_RE.sub(_sub, text)
+    # Drop any stray closing </Token>
+    text = re.sub(r'</\s*Token\s*>', '', text, flags=re.IGNORECASE)
+    return text
+
+
+def _clean_price(s: str) -> str:
+    """Strip leading $ and surrounding whitespace so the display layer can re-add $ once."""
+    if not s:
+        return ""
+    return s.strip().lstrip("$").strip()
+
+
+def _fmt_price(s: str) -> str:
+    """Display-ready price with exactly one leading $."""
+    cleaned = _clean_price(s)
+    return f"${cleaned}" if cleaned else ""
+
+
 def parse_trades_from_text(text: str) -> list[dict]:
     """Extract structured trades from TrueNorth markdown response."""
+    text = strip_token_tags(text)
     trades = []
     blocks = re.split(r'\n-{3,}\n|\n(?=\$[A-Z])', text)
     for block in blocks:
@@ -529,33 +634,38 @@ def parse_trades_from_text(text: str) -> list[dict]:
             "notes": [],
         }
         for line in block.split("\n"):
-            low = line.lower().strip()
             cells = [c.strip() for c in line.split("|") if c.strip()]
             if len(cells) >= 2:
                 label = cells[0].lower()
                 val = cells[1]
                 if "entry" in label and "stop" not in label:
-                    trade["entry"] = val
+                    trade["entry"] = _clean_price(val)
                 elif "stop" in label or "sl" == label:
-                    trade["sl"] = val
+                    trade["sl"] = _clean_price(val)
                 elif "take profit" in label or "tp" == label or "target" in label:
-                    trade["tp"] = val
+                    trade["tp"] = _clean_price(val)
                 elif "r:r" in label or "r/r" in label or ("risk" in label and "reward" in label):
-                    trade["rr"] = val
+                    trade["rr"] = val.strip()
             stripped = line.strip()
             if stripped and (stripped[0] in "•*-") and len(stripped) > 2:
                 note = stripped.lstrip("•*- ").strip()
-                if note and "entry" not in note.lower()[:6]:
-                    trade["notes"].append(note)
+                if not note:
+                    continue
+                # Skip the ticker header itself (e.g. "$AAVE | LONG | ⚡ High Conviction").
+                if _TICKER_HEADER_RE.search(note):
+                    continue
+                if "entry" in note.lower()[:6]:
+                    continue
+                trade["notes"].append(note)
         if not trade["entry"]:
             m = re.search(r'[Ee]ntry[:\s]*\$?([\d,.]+)', block)
-            if m: trade["entry"] = f"${m.group(1)}"
+            if m: trade["entry"] = m.group(1)
         if not trade["sl"]:
             m = re.search(r'[Ss]top\s*[Ll]oss[:\s]*\$?([\d,.]+)', block)
-            if m: trade["sl"] = f"${m.group(1)}"
+            if m: trade["sl"] = m.group(1)
         if not trade["tp"]:
             m = re.search(r'[Tt]ake\s*[Pp]rofit[:\s]*\$?([\d,.]+)', block)
-            if m: trade["tp"] = f"${m.group(1)}"
+            if m: trade["tp"] = m.group(1)
         if not trade["rr"]:
             m = re.search(r'[Rr][:/][Rr][:\s]*([\d.]+[:\s]*[\d.]*)', block)
             if m: trade["rr"] = m.group(1).strip()
@@ -590,11 +700,11 @@ def build_trade_embeds(trades: list[dict]) -> list[discord.Embed]:
         if t["conviction"] and t["conviction"] != "--":
             e.description = f"**{t['conviction']}**"
         if t["entry"]:
-            e.add_field(name="Entry Price", value=f"${t['entry']}", inline=True)
+            e.add_field(name="Entry Price", value=_fmt_price(t["entry"]), inline=True)
         if t["sl"]:
-            e.add_field(name="Stop/Loss", value=f"${t['sl']}", inline=True)
+            e.add_field(name="Stop/Loss", value=_fmt_price(t["sl"]), inline=True)
         if t["tp"]:
-            e.add_field(name="Take Profit", value=f"${t['tp']}", inline=True)
+            e.add_field(name="Take Profit", value=_fmt_price(t["tp"]), inline=True)
         if t["rr"]:
             e.add_field(name="R:R", value=f"{t['rr']}", inline=True)
         if t["notes"]:
@@ -934,27 +1044,85 @@ async def winrate(ctx: commands.Context):
     e.set_footer(text=FOOTER)
     await ctx.send(embed=e)
 
+async def _privy_refresh_verbose() -> tuple[bool, int, str, list[str]]:
+    """Run refresh once and return (ok, status, body_preview, response_keys) for Discord display."""
+    rt = token_store["refresh"]
+    if not rt:
+        return False, 0, "TN_REFRESH_TOKEN not set", []
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                PRIVY_SESSION_URL,
+                json={"refresh_token": rt},
+                headers={
+                    "privy-app-id": PRIVY_APP_ID,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "privy-client": "react-auth:2.0.0",
+                },
+            )
+    except Exception as e:
+        return False, 0, f"{type(e).__name__}: {e}", []
+    status = resp.status_code
+    body = resp.text[:400]
+    keys: list[str] = []
+    if status == 200:
+        try:
+            data = resp.json()
+            if isinstance(data, dict):
+                keys = sorted(data.keys())
+                new_access = (
+                    data.get("token")
+                    or data.get("access_token")
+                    or data.get("identity_token")
+                    or data.get("privy_access_token")
+                )
+                new_refresh = data.get("refresh_token") or data.get("privy_refresh_token")
+                if new_access:
+                    token_store["access"] = new_access
+                    if new_refresh:
+                        token_store["refresh"] = new_refresh
+                    _save_token_cache(token_store["access"], token_store["refresh"])
+                    return True, status, body, keys
+        except Exception as e:
+            body = f"(json decode failed: {type(e).__name__}: {e}) {body}"
+    return False, status, body, keys
+
+
 @bot.command(name="refreshtoken")
 async def manual_refresh(ctx: commands.Context):
-    """Manually refresh TrueNorth token."""
+    """Manually refresh TrueNorth token and report the Privy response verbatim."""
     await ctx.send("🔄 Attempting token refresh...")
-    ok = await refresh_tn_token()
-    if not ok:
-        await ctx.send(
-            "⚠️ Privy refresh did not return a new token. "
-            "Check TN_REFRESH_TOKEN in Railway — it may have been revoked."
-        )
+    ok, status, body, keys = await _privy_refresh_verbose()
+
+    diag = discord.Embed(
+        title=("✅ Privy refresh OK" if ok else "⚠️ Privy refresh FAILED"),
+        color=(COLOR_LONG if ok else COLOR_RISK),
+    )
+    diag.add_field(name="HTTP status", value=str(status) if status else "no response", inline=True)
+    diag.add_field(name="Refresh token", value=_mask(token_store["refresh"]), inline=True)
+    if keys:
+        diag.add_field(name="Response keys", value=f"`{', '.join(keys)}`", inline=False)
+    if body:
+        diag.add_field(name="Body (first 400 chars)", value=f"```\n{body}\n```", inline=False)
+    exp = decode_jwt_exp(token_store.get("access", ""))
+    diag.add_field(
+        name="Access token exp",
+        value=(exp.strftime("%Y-%m-%d %H:%M %Z") if exp else "unknown"),
+        inline=False,
+    )
+    diag.set_footer(text=FOOTER)
+    await ctx.send(embed=diag)
+
     test = await query_truenorth("ping")
     if test:
-        exp = decode_jwt_exp(token_store.get("access", ""))
-        exp_str = exp.strftime("%Y-%m-%d %H:%M %Z") if exp else "unknown"
-        await ctx.send(f"✅ Token is valid -- TrueNorth responded. Access token exp: `{exp_str}`.")
+        await ctx.send("✅ TrueNorth responded on ping -- token is valid.")
     else:
         await ctx.send(
             "❌ TrueNorth did not respond even after refresh.\n"
-            "Either TN_REFRESH_TOKEN is stale (re-copy `privy:refresh_token` from "
-            "localStorage at app.true-north.xyz) or the thread is inaccessible. "
-            "Run `!health` for diagnostics."
+            "If Privy status was 401/400, `TN_REFRESH_TOKEN` is likely stale. "
+            "Copy `privy:refresh_token` from localStorage at app.true-north.xyz "
+            "into Railway env and redeploy. Run `!health` for more."
         )
 
 
@@ -1000,10 +1168,10 @@ async def manual_health(ctx: commands.Context):
     e.add_field(name="Thread ID", value=f"`{_tn_thread_current or 'unset'}`", inline=True)
     e.add_field(name="Refresh token", value=("set" if token_store["refresh"] else "NOT SET"), inline=True)
     e.add_field(name="Access token exp", value=exp_str, inline=False)
-    e.add_field(name="Last TN success", value=_format_delta(last_tn_success_at), inline=True)
-    e.add_field(name="Last TN error", value=_format_delta(last_tn_error_at), inline=True)
-    if last_tn_error:
-        err_preview = last_tn_error[:400]
+    e.add_field(name="Last TN success", value=_format_delta(tn_state["last_success_at"]), inline=True)
+    e.add_field(name="Last TN error", value=_format_delta(tn_state["last_error_at"]), inline=True)
+    if tn_state["last_error"]:
+        err_preview = str(tn_state["last_error"])[:400]
         e.add_field(name="Error detail", value=f"```\n{err_preview}\n```", inline=False)
     e.set_footer(text=FOOTER)
     e.timestamp = now

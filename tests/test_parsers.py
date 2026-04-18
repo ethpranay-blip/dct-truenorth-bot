@@ -82,11 +82,15 @@ def test_parse_trades_directions():
 
 
 def test_parse_trades_table_values():
+    """Prices are stored without a leading $; _fmt_price adds it exactly once at display."""
     trades = bot.parse_trades_from_text(SAMPLE_BRIEF)
     btc = next(t for t in trades if t["ticker"] == "BTC")
-    assert btc["entry"] == "$67,200"
-    assert btc["sl"] == "$66,300"
-    assert btc["tp"] == "$69,800"
+    assert btc["entry"] == "67,200"
+    assert btc["sl"] == "66,300"
+    assert btc["tp"] == "69,800"
+    assert bot._fmt_price(btc["entry"]) == "$67,200"
+    assert bot._fmt_price(btc["sl"]) == "$66,300"
+    assert bot._fmt_price(btc["tp"]) == "$69,800"
     assert "2.9" in btc["rr"]
     assert "High Conviction" in btc["conviction"]
 
@@ -113,9 +117,10 @@ def test_parse_trades_pipe_header_only():
     t = trades[0]
     assert t["ticker"] == "WIF"
     assert t["direction"] == "LONG"
-    assert t["entry"] == "$2.80"
-    assert t["sl"] == "$2.55"
-    assert t["tp"] == "$3.45"
+    assert t["entry"] == "2.80"
+    assert t["sl"] == "2.55"
+    assert t["tp"] == "3.45"
+    assert bot._fmt_price(t["entry"]) == "$2.80"
     assert "2.3" in t["rr"]
 
 
@@ -157,3 +162,79 @@ def test_decode_jwt_exp_malformed_returns_none():
     assert bot.decode_jwt_exp("not-a-jwt") is None
     assert bot.decode_jwt_exp("") is None
     assert bot.decode_jwt_exp("a.b") is None
+
+
+# --- Regression tests for live bugs ---
+
+def test_prices_are_not_double_dollar_prefixed():
+    """Regression: Trade prices must render with exactly one leading $."""
+    trades = bot.parse_trades_from_text(SAMPLE_BRIEF)
+    for t in trades:
+        for field in ("entry", "sl", "tp"):
+            v = t[field]
+            assert v, f"{t['ticker']} {field} empty"
+            assert not v.startswith("$"), (
+                f"{t['ticker']} {field} still has leading $ in parsed value: {v!r} — "
+                "embed layer would double it to $$."
+            )
+
+    # _fmt_price is the display helper; it must produce exactly one $.
+    assert bot._fmt_price("$110.50") == "$110.50"
+    assert bot._fmt_price("110.50") == "$110.50"
+    assert bot._fmt_price("  $$110.50  ") == "$110.50"
+    assert bot._fmt_price("") == ""
+
+
+SAMPLE_WITH_TOKEN_TAGS = """
+$AAVE | LONG | ⚡ High Conviction
+| Entry | $110.50 |
+| Stop Loss | $105.00 |
+| Take Profit | $125.00 |
+| R:R | 2.6:1 |
+
+- <Token tokenAddress="aave" tokenSymbol="AAVE" exchangeId="binance_futures" /> reclaimed its 50D MA
+- Relative strength vs <Token tokenAddress="eth" tokenSymbol="ETH" exchangeId="binance_futures" />
+- $AAVE | LONG | ⚡ High Conviction
+- OI building without excessive funding
+"""
+
+
+def test_token_xml_tags_replaced_in_notes():
+    trades = bot.parse_trades_from_text(SAMPLE_WITH_TOKEN_TAGS)
+    assert len(trades) == 1
+    notes = trades[0]["notes"]
+    joined = " | ".join(notes)
+    assert "<Token" not in joined, f"stray Token XML in notes: {joined!r}"
+    assert "tokenSymbol" not in joined
+    # Symbols should be preserved in $TICKER form
+    assert "$AAVE" in joined
+    assert "$ETH" in joined
+
+
+def test_ticker_header_line_not_captured_as_note():
+    trades = bot.parse_trades_from_text(SAMPLE_WITH_TOKEN_TAGS)
+    for n in trades[0]["notes"]:
+        assert not re.match(r'^\s*\$[A-Z]+\s*\|\s*(LONG|SHORT)', n), (
+            f"ticker header leaked into notes: {n!r}"
+        )
+
+
+def test_strip_token_tags_standalone():
+    text = 'buy <Token tokenAddress="x" tokenSymbol="btc" /> now'
+    assert bot.strip_token_tags(text) == "buy $BTC now"
+    # Missing tokenSymbol → tag removed entirely
+    text2 = 'mystery <Token tokenAddress="foo" /> asset'
+    assert bot.strip_token_tags(text2) == "mystery  asset"
+    # Closing tags dropped
+    assert bot.strip_token_tags("<Token/></Token>") == ""
+
+
+def test_tn_state_dict_initial_values():
+    """Observability counters live in a mutable dict so global rebinding bugs are impossible."""
+    assert isinstance(bot.tn_state, dict)
+    for key in ("last_success_at", "last_error_at", "last_error", "last_alert_at"):
+        assert key in bot.tn_state
+
+
+# re needs to be accessible in the test module for regex-based assertions above.
+import re  # noqa: E402
