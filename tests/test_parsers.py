@@ -236,5 +236,68 @@ def test_tn_state_dict_initial_values():
         assert key in bot.tn_state
 
 
+# --- Task 5: API-first thread creation with UUID fallback ---
+
+def test_thread_create_endpoint_candidates_target_adventai():
+    """All candidate endpoints must be on the AdventAI host so we never leak tokens elsewhere."""
+    assert bot.TN_THREAD_CREATE_CANDIDATES, "candidates list must not be empty"
+    for url in bot.TN_THREAD_CREATE_CANDIDATES:
+        assert url.startswith("https://api.adventai.io/"), f"non-adventai endpoint: {url}"
+
+
+def test_rotate_thread_id_persists_uuid_fallback(tmp_path, monkeypatch):
+    """The synchronous rotate_thread_id() always produces a persisted UUID."""
+    cache_file = tmp_path / "thread_cache.json"
+    monkeypatch.setattr(bot, "THREAD_CACHE_PATH", str(cache_file))
+    new_id = bot.rotate_thread_id()
+    import uuid as _uuid
+    _uuid.UUID(new_id)  # raises if not a valid UUID
+    assert cache_file.exists()
+    cached = bot.load_cached_thread()
+    assert cached == new_id
+
+
+# --- Task 6: !brief confirmation routes to invoking channel ---
+
+def test_channel_mention_falls_back_when_channel_missing():
+    """_channel_mention should always produce a non-empty string, even on cache miss."""
+    # bot.get_channel returns None for unknown ids in our test stub; helper must fall back.
+    out = bot._channel_mention(999999999)
+    assert isinstance(out, str) and out
+
+
+# --- Extra coverage for the three categories the task list calls out ---
+
+def test_dollar_strip_handles_nested_and_whitespace():
+    """_clean_price strips leading $ and surrounding whitespace; idempotent."""
+    assert bot._clean_price("$$$110.50") == "110.50"
+    assert bot._clean_price("  $ 110.50  ") == "110.50"
+    assert bot._clean_price(bot._clean_price("$110.50")) == "110.50"
+
+
+def test_token_tag_inside_pipe_table_is_stripped():
+    """Token tags inside table rows must not leak to embed values."""
+    text = (
+        '$AAVE | LONG | High Conviction\n'
+        '| Entry | <Token tokenSymbol="AAVE" /> @ $110.50 |\n'
+        '| Stop Loss | $105.00 |\n'
+        '| Take Profit | $125.00 |\n'
+        '| R:R | 2.6:1 |\n'
+    )
+    trades = bot.parse_trades_from_text(text)
+    assert len(trades) == 1
+    for v in (trades[0]["entry"], trades[0]["sl"], trades[0]["tp"]):
+        assert "<Token" not in v and "tokenSymbol" not in v
+
+
+def test_decode_jwt_exp_invalid_base64_returns_none():
+    """A token whose payload segment isn't valid base64 must not raise."""
+    assert bot.decode_jwt_exp("aaa.!!!not-base64!!!.bbb") is None
+    # Payload that decodes but is not JSON
+    import base64
+    bogus = base64.urlsafe_b64encode(b"not json at all").decode().rstrip("=")
+    assert bot.decode_jwt_exp(f"hdr.{bogus}.sig") is None
+
+
 # re needs to be accessible in the test module for regex-based assertions above.
 import re  # noqa: E402

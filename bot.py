@@ -219,12 +219,103 @@ def ensure_thread_id() -> str:
     return _tn_thread_current
 
 def rotate_thread_id() -> str:
-    """Discard the current shared thread and mint a new one (persisted)."""
+    """Discard the current shared thread and mint a fresh UUID (persisted).
+
+    UUID-only synchronous fallback; for an API-first attempt use rotate_thread_id_async().
+    """
     global _tn_thread_current
     _tn_thread_current = str(uuid.uuid4())
     save_cached_thread(_tn_thread_current)
     print(f"[Thread] Rotated shared thread to: {_tn_thread_current}")
     return _tn_thread_current
+
+
+# AdventAI does not publish a thread-management spec, so we probe a small set of
+# REST siblings of the existing /sse/v2/streams endpoint. The first one that
+# returns 200/201 with a thread id is cached and reused; all failures fall back
+# to a fresh UUID (which the SSE endpoint accepts as an implicit new thread).
+TN_THREAD_CREATE_CANDIDATES = (
+    "https://api.adventai.io/api/discovery-agents/threads",
+    "https://api.adventai.io/api/discovery-agents/v2/threads",
+    "https://api.adventai.io/api/discovery-agents/sse/v2/threads",
+)
+_thread_create_endpoint: str | None = None  # cached after first success
+
+
+async def _try_api_create_thread() -> str | None:
+    """Try the candidate TrueNorth thread-create endpoints. Return id on success, None otherwise."""
+    global _thread_create_endpoint
+    candidates = (
+        [_thread_create_endpoint] if _thread_create_endpoint
+        else list(TN_THREAD_CREATE_CANDIDATES)
+    )
+    headers = {
+        "Authorization": f"Bearer {token_store['access']}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            for url in candidates:
+                try:
+                    resp = await client.post(url, headers=headers, json={})
+                except Exception as e:
+                    print(f"[Thread] candidate {url} network error: {type(e).__name__}: {e}")
+                    continue
+                print(f"[Thread] POST {url} -> {resp.status_code}")
+                if resp.status_code not in (200, 201):
+                    continue
+                try:
+                    data = resp.json()
+                except Exception as e:
+                    print(f"[Thread] {url} 200 OK but JSON parse failed: {e}")
+                    continue
+                tid = None
+                if isinstance(data, dict):
+                    tid = (
+                        data.get("thread_id")
+                        or data.get("id")
+                        or data.get("threadId")
+                    )
+                    if not tid and isinstance(data.get("thread"), dict):
+                        tid = data["thread"].get("id") or data["thread"].get("thread_id")
+                if tid and isinstance(tid, str):
+                    _thread_create_endpoint = url
+                    print(f"[Thread] API created thread {tid} via {url}")
+                    return tid
+                print(f"[Thread] {url} 200 OK but no thread id field: keys={list(data) if isinstance(data, dict) else type(data).__name__}")
+    except Exception as e:
+        print(f"[Thread] _try_api_create_thread fatal: {type(e).__name__}: {e}")
+    return None
+
+
+async def rotate_thread_id_async() -> str:
+    """API-first variant of rotate_thread_id. Falls back to UUID; persists either way."""
+    global _tn_thread_current
+    tid = await _try_api_create_thread()
+    if not tid:
+        tid = str(uuid.uuid4())
+        print(f"[Thread] API thread-create unavailable; falling back to uuid {tid}")
+    _tn_thread_current = tid
+    save_cached_thread(tid)
+    return tid
+
+
+async def ensure_thread_id_async() -> str:
+    """Async ensure: prefer env → cache → API-create → UUID. Used at boot/startup."""
+    global _tn_thread_current
+    if _tn_thread_current:
+        return _tn_thread_current
+    if TN_THREAD_ENV:
+        _tn_thread_current = TN_THREAD_ENV
+        print(f"[Thread] Using TN_THREAD_ID from env: {_tn_thread_current}")
+        return _tn_thread_current
+    cached = load_cached_thread()
+    if cached:
+        _tn_thread_current = cached
+        print(f"[Thread] Using cached thread id: {cached}")
+        return cached
+    return await rotate_thread_id_async()
 
 # --- JWT helper ---
 def decode_jwt_exp(token: str) -> datetime | None:
@@ -337,7 +428,10 @@ async def query_truenorth(
                 tid = str(uuid.uuid4())
                 print(f"[TN] thread denied -- retrying with fresh per-call uuid {tid}")
             else:
-                tid = rotate_thread_id()
+                tid = await rotate_thread_id_async()
+                if tid == _tn_thread_current and not _thread_create_endpoint:
+                    # API create failed — surface this so the alert below carries useful context.
+                    print("[TN] thread API-create unavailable; using uuid fallback")
             should_retry = True
         if should_retry:
             try:
@@ -762,12 +856,14 @@ def build_regime_embed(text: str) -> discord.Embed:
 def colors_map(session: str) -> int:
     return {"asia": COLOR_ASIA, "london": COLOR_LONDON, "us": COLOR_US}.get(session, COLOR_INFO)
 
-async def run_session_brief(session: str, phase: str):
+async def run_session_brief(session: str, phase: str) -> bool:
     """
     Query TrueNorth for a session brief, then:
       - Post analysis embed -> session channel
       - Post trade embeds   -> #trades channel
       - Post risk flag      -> both channels (if present)
+
+    Returns True if the brief was successfully posted to its session channel.
     """
     session_labels = {"asia": "Asia", "london": "London", "us": "US"}
     label = session_labels.get(session, session)
@@ -776,7 +872,7 @@ async def run_session_brief(session: str, phase: str):
     trades_channel = bot.get_channel(CH["trades"])
     if not session_channel:
         print(f"[SCHED] Cannot find #{ch_key} channel")
-        return
+        return False
     prompt = (
         f"Give me a {phase.lower()} brief for the {label} trading session. "
         f"Include: current BTC price and trend, key support/resistance levels, "
@@ -800,7 +896,7 @@ async def run_session_brief(session: str, phase: str):
         )
         e.set_footer(text=FOOTER)
         await session_channel.send(embed=e)
-        return
+        return False
     brief_embed = build_brief_embed(result, session, phase)
     await session_channel.send(embed=brief_embed)
     trades = parse_trades_from_text(result)
@@ -829,6 +925,7 @@ async def run_session_brief(session: str, phase: str):
         if trades_channel:
             await trades_channel.send(embed=risk_embed)
     print(f"[SCHED] {label} {phase} posted")
+    return True
 
 async def run_regime_update():
     """Daily regime outlook -> #regime-outlook."""
@@ -910,7 +1007,9 @@ async def on_ready():
         await refresh_tn_token()
     exp = decode_jwt_exp(token_store.get("access", ""))
     print(f"[BOOT] TN access token exp: {exp}")
-    print(f"[BOOT] TN thread id: {ensure_thread_id()}")
+    # Use async ensure so we attempt a real API thread-create when env+cache are empty.
+    boot_tid = await ensure_thread_id_async()
+    print(f"[BOOT] TN thread id: {boot_tid}")
     setup_scheduler()
     scheduler.start()
     print(f"[SCHED] {len(SCHEDULE)} session briefs + regime + token refresh scheduled")
@@ -971,9 +1070,22 @@ async def on_message(message: discord.Message):
         await handle_direct_tn(message, content)
 
 # --- Manual commands ---
+def _channel_mention(channel_id: int) -> str:
+    """Best-effort channel mention; falls back to a #name or raw id if cache miss."""
+    ch = bot.get_channel(channel_id)
+    if ch is None:
+        return f"<#{channel_id}>"
+    name = getattr(ch, "name", None)
+    return f"<#{channel_id}>" if name is None else f"#{name}"
+
+
 @bot.command(name="brief")
 async def manual_brief(ctx: commands.Context, session: str = "all"):
-    """Manually trigger a session brief. Usage: !brief asia/london/us/all"""
+    """Manually trigger a session brief. Usage: !brief asia/london/us/all
+
+    Posts the analysis to the relevant session channel and trade setups to
+    #trades. Sends a short confirmation back to the invoking channel.
+    """
     session = session.lower()
     valid = ["asia", "london", "us"]
     if session == "all":
@@ -983,9 +1095,28 @@ async def manual_brief(ctx: commands.Context, session: str = "all"):
     else:
         await ctx.send("Usage: !brief asia/london/us/all")
         return
-    await ctx.send(f"⏳ Fetching brief{'s' if len(targets) > 1 else ''}...")
+    label_map = {"asia": "Asia", "london": "London", "us": "US"}
+    target_names = ", ".join(label_map[s] for s in targets)
+    await ctx.send(f"⏳ Fetching {target_names} brief{'s' if len(targets) > 1 else ''}…")
+    posted: list[str] = []
+    failed: list[str] = []
     for s in targets:
-        await run_session_brief(s, "Manual Brief")
+        ok = await run_session_brief(s, "Manual Brief")
+        if ok:
+            posted.append(_channel_mention(CH[s]))
+        else:
+            failed.append(label_map.get(s, s))
+    trades_mention = _channel_mention(CH["trades"])
+    if posted:
+        msg = f"✅ Brief posted to {', '.join(posted)} and {trades_mention}"
+        if failed:
+            msg += f"\n⚠️ Failed: {', '.join(failed)}. Run `!health` for diagnostics."
+        await ctx.send(msg)
+    else:
+        await ctx.send(
+            f"⚠️ No briefs were posted ({', '.join(failed) or 'unknown error'}). "
+            "Run `!health` for diagnostics."
+        )
 
 @bot.command(name="trades")
 async def manual_trades(ctx: commands.Context):
