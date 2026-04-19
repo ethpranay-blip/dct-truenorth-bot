@@ -154,10 +154,13 @@ if _cached_tokens:
 # automatically via dict lookup).
 BOT_STARTED_AT: datetime = datetime.now(IST)
 tn_state: dict = {
-    "last_success_at": None,   # datetime | None
-    "last_error_at": None,     # datetime | None
-    "last_error": None,        # str | None
-    "last_alert_at": 0.0,      # time.time() float
+    "last_success_at": None,        # datetime | None
+    "last_error_at": None,          # datetime | None
+    "last_error": None,             # str | None
+    "last_alert_at": 0.0,           # time.time() float
+    "thread_invalid": False,        # bool — set when ping/empty-200 confirms TN doesn't know thread
+    "thread_invalid_reason": "",    # str — surfaced in failure embeds and !health
+    "boot_warning_posted": False,   # bool — guard against double-posting the boot warning
 }
 ALERT_COOLDOWN_SEC = 3600
 
@@ -199,8 +202,15 @@ def save_cached_thread(thread_id: str) -> None:
 
 _tn_thread_current: str | None = None
 
-def ensure_thread_id() -> str:
-    """Return the current TrueNorth thread id, falling back to env → cache → new UUID."""
+
+def ensure_thread_id() -> str | None:
+    """Return the current shared TrueNorth thread id from env/cache. NEVER mints a UUID.
+
+    Random UUIDs are not valid TN threads — TN responds with HTTP 200 + zero
+    chunks for unknown ids, which previously triggered ~25 minutes of useless
+    retries before surfacing as 'No response from TrueNorth'. Returning None
+    instead lets callers fast-fail with an actionable error.
+    """
     global _tn_thread_current
     if _tn_thread_current:
         return _tn_thread_current
@@ -213,37 +223,28 @@ def ensure_thread_id() -> str:
         _tn_thread_current = cached
         print(f"[Thread] Using cached thread id: {cached}")
         return cached
-    _tn_thread_current = str(uuid.uuid4())
-    save_cached_thread(_tn_thread_current)
-    print(f"[Thread] Created new thread id: {_tn_thread_current}")
-    return _tn_thread_current
-
-def rotate_thread_id() -> str:
-    """Discard the current shared thread and mint a fresh UUID (persisted).
-
-    UUID-only synchronous fallback; for an API-first attempt use rotate_thread_id_async().
-    """
-    global _tn_thread_current
-    _tn_thread_current = str(uuid.uuid4())
-    save_cached_thread(_tn_thread_current)
-    print(f"[Thread] Rotated shared thread to: {_tn_thread_current}")
-    return _tn_thread_current
+    return None
 
 
-# AdventAI does not publish a thread-management spec, so we probe a small set of
-# REST siblings of the existing /sse/v2/streams endpoint. The first one that
-# returns 200/201 with a thread id is cached and reused; all failures fall back
-# to a fresh UUID (which the SSE endpoint accepts as an implicit new thread).
+# AdventAI does not publish a thread-management spec. We probe a small set of
+# REST siblings of the existing /sse/v2/streams endpoint AND likely top-level
+# /api/threads paths. The first one that returns 200/201 with a thread id is
+# cached and reused. If none work we surface that to the user instead of
+# silently generating a UUID (which TN treats as an invalid thread).
 TN_THREAD_CREATE_CANDIDATES = (
     "https://api.adventai.io/api/discovery-agents/threads",
     "https://api.adventai.io/api/discovery-agents/v2/threads",
     "https://api.adventai.io/api/discovery-agents/sse/v2/threads",
+    "https://api.adventai.io/api/threads",
+    "https://api.adventai.io/api/v1/threads",
+    "https://api.adventai.io/api/chat/threads",
+    "https://api.adventai.io/api/discovery-agents/threads/create",
 )
 _thread_create_endpoint: str | None = None  # cached after first success
 
 
 async def _try_api_create_thread() -> str | None:
-    """Try the candidate TrueNorth thread-create endpoints. Return id on success, None otherwise."""
+    """Probe known thread-create endpoints. Return id on success, None otherwise."""
     global _thread_create_endpoint
     candidates = (
         [_thread_create_endpoint] if _thread_create_endpoint
@@ -262,7 +263,8 @@ async def _try_api_create_thread() -> str | None:
                 except Exception as e:
                     print(f"[Thread] candidate {url} network error: {type(e).__name__}: {e}")
                     continue
-                print(f"[Thread] POST {url} -> {resp.status_code}")
+                body_preview = resp.text[:200] if hasattr(resp, "text") else ""
+                print(f"[Thread] POST {url} -> {resp.status_code} body={body_preview}")
                 if resp.status_code not in (200, 201):
                     continue
                 try:
@@ -289,20 +291,11 @@ async def _try_api_create_thread() -> str | None:
     return None
 
 
-async def rotate_thread_id_async() -> str:
-    """API-first variant of rotate_thread_id. Falls back to UUID; persists either way."""
-    global _tn_thread_current
-    tid = await _try_api_create_thread()
-    if not tid:
-        tid = str(uuid.uuid4())
-        print(f"[Thread] API thread-create unavailable; falling back to uuid {tid}")
-    _tn_thread_current = tid
-    save_cached_thread(tid)
-    return tid
+async def ensure_thread_id_async() -> str | None:
+    """Boot-time thread acquisition: env → cache → API create. Returns None if all fail.
 
-
-async def ensure_thread_id_async() -> str:
-    """Async ensure: prefer env → cache → API-create → UUID. Used at boot/startup."""
+    Never falls back to a random UUID. Callers must check for None and fast-fail.
+    """
     global _tn_thread_current
     if _tn_thread_current:
         return _tn_thread_current
@@ -315,7 +308,36 @@ async def ensure_thread_id_async() -> str:
         _tn_thread_current = cached
         print(f"[Thread] Using cached thread id: {cached}")
         return cached
-    return await rotate_thread_id_async()
+    tid = await _try_api_create_thread()
+    if tid:
+        _tn_thread_current = tid
+        save_cached_thread(tid)
+        return tid
+    print("[Thread] No thread id available — TN-dependent commands will fast-fail.")
+    return None
+
+
+async def validate_thread(tid: str, timeout_s: float = 30.0) -> bool:
+    """Tiny ping to confirm the thread is real. True iff TN streams >0 chunks within timeout."""
+    if not tid:
+        return False
+    try:
+        text, status, _err, sse_err, _completed = await _tn_call_once("ping", tid, timeout_s)
+    except Exception as e:
+        print(f"[Thread] validate_thread({tid}) raised {type(e).__name__}: {e}")
+        return False
+    ok = status == 200 and bool(text) and not sse_err
+    print(f"[Thread] validate_thread({tid}) status={status} text_len={len(text)} ok={ok}")
+    return ok
+
+
+def invalidate_thread(reason: str) -> None:
+    """Mark the shared thread invalid; future calls fast-fail."""
+    global _tn_thread_current
+    print(f"[Thread] Marking thread invalid: {reason}")
+    tn_state["thread_invalid"] = True
+    tn_state["thread_invalid_reason"] = reason
+    _tn_thread_current = None
 
 # --- JWT helper ---
 def decode_jwt_exp(token: str) -> datetime | None:
@@ -480,90 +502,162 @@ def _looks_like_preamble(text: str) -> bool:
     )
 
 
+# Bounded retry policy: 3 attempts total, sleep-then-retry on transient failures.
+TN_MAX_ATTEMPTS = 3
+TN_RETRY_BACKOFF_S = (10.0, 30.0)  # before retry 1, before retry 2
+
+THREAD_INVALID_HINT = (
+    "TN_THREAD_ID is invalid or unknown to TrueNorth. "
+    "Get a fresh thread_id: open https://app.true-north.xyz, start any chat, "
+    "open DevTools → Network, find the request to /api/discovery-agents/sse/v2/streams, "
+    "copy `thread_id` from its JSON body, set TN_THREAD_ID in Railway, redeploy."
+)
+
+
+def _classify_failure(status: int, err: str, sse_error: bool, exc: Exception | None,
+                      text: str, completed: bool) -> str:
+    """Categorize a single _tn_call_once result. Returns a short tag used to pick error text."""
+    if exc is not None:
+        return "timeout" if isinstance(exc, (httpx.ReadTimeout, httpx.ConnectTimeout)) else "exception"
+    if status in (401, 403):
+        return "auth"
+    if status >= 400:
+        return "http_error"
+    if sse_error:
+        return "sse_error"
+    if status == 200 and not text:
+        # 200 OK with zero content is the signature of an unknown thread on TN.
+        return "empty_200"
+    if status == 200 and not completed and _looks_like_preamble(text):
+        return "incomplete_preamble"
+    return "ok"
+
+
 async def query_truenorth(
     prompt: str,
     thread_id: str | None = None,
     timeout_read: float = TN_DEFAULT_READ_TIMEOUT,
 ) -> str:
-    """Send prompt to TrueNorth; auto-refresh token, rotate thread, and retry on incomplete streams."""
+    """Send prompt to TrueNorth with bounded retries and honest fast-fail.
+
+    Retry policy (max 3 attempts total, capped at ~40s of backoff):
+      - auth failure → refresh token, retry once
+      - empty 200 (unknown thread) → mark thread invalid, do NOT retry
+      - timeout / 5xx → backoff 10s, then 30s
+      - incomplete preamble → one retry with longer timeout
+    """
     caller_pinned_thread = thread_id is not None
-    tid = thread_id or ensure_thread_id()
+    tid = thread_id
 
-    text, status, err, exc, sse_error, completed = "", 0, "", None, False, False
-    try:
-        text, status, err, sse_error, completed = await _tn_call_once(prompt, tid, timeout_read)
-    except Exception as e:
-        exc = e
-        print(f"[TN ERROR] {type(e).__name__}: {e}")
-        traceback.print_exc()
+    if tid is None:
+        if tn_state.get("thread_invalid"):
+            print("[TN] shared thread previously invalidated — fast-failing")
+            tn_state["last_error"] = THREAD_INVALID_HINT
+            tn_state["last_error_at"] = datetime.now(IST)
+            await alert_thread_invalid()
+            return ""
+        tid = ensure_thread_id()
+        if tid is None:
+            invalidate_thread("no thread id available (env unset, cache empty, API probe found no endpoint)")
+            await alert_thread_invalid()
+            return ""
 
-    # Recovery: token refresh / thread rotation / incomplete-stream retry
-    auth_fail, thread_fail = _classify_error(status, err)
-    incomplete_stream = (
-        exc is None
-        and status == 200
-        and not sse_error
-        and (not text or (not completed and _looks_like_preamble(text)))
-    )
+    last: dict = {"status": 0, "err": "", "sse_error": False, "exc": None, "text": "", "completed": False, "tag": "init"}
+    for attempt in range(1, TN_MAX_ATTEMPTS + 1):
+        if attempt > 1:
+            backoff = TN_RETRY_BACKOFF_S[min(attempt - 2, len(TN_RETRY_BACKOFF_S) - 1)]
+            print(f"[TN] backoff {backoff}s before attempt {attempt}/{TN_MAX_ATTEMPTS}")
+            await asyncio.sleep(backoff)
 
-    should_retry = False
-    if auth_fail:
-        print("[TN] auth failure detected -- attempting token refresh")
-        if await refresh_tn_token():
-            should_retry = True
-        else:
-            print("[TN] token refresh failed")
-    if thread_fail:
-        if caller_pinned_thread:
-            tid = str(uuid.uuid4())
-            print(f"[TN] thread denied -- retrying with fresh per-call uuid {tid}")
-        else:
-            tid = await rotate_thread_id_async()
-            if tid == _tn_thread_current and not _thread_create_endpoint:
-                print("[TN] thread API-create unavailable; using uuid fallback")
-        should_retry = True
-    if incomplete_stream and not should_retry:
-        # Bump the timeout and retry once. Bare exceptions / empty text count too.
-        print(f"[TN] stream incomplete (text={len(text)}, completed={completed}) -- retrying with longer timeout")
-        should_retry = True
-        timeout_read = TN_RETRY_READ_TIMEOUT
-
-    if should_retry:
+        text, status, err, sse_error, completed, exc = "", 0, "", False, False, None
         try:
             text, status, err, sse_error, completed = await _tn_call_once(prompt, tid, timeout_read)
-            exc = None
         except Exception as e:
             exc = e
-            print(f"[TN ERROR retry] {type(e).__name__}: {e}")
+            print(f"[TN ERROR attempt={attempt}] {type(e).__name__}: {e}")
 
-    if text:
-        tn_state["last_success_at"] = datetime.now(IST)
-        cleaned = dedupe_tn_text(sanitize_tn_text(text))
-        print(
-            f"[TN RESULT] raw={len(text)} cleaned={len(cleaned)} chars "
-            f"(completed={completed}, last_success_at updated)"
-        )
-        return cleaned
+        tag = _classify_failure(status, err, sse_error, exc, text, completed)
+        last = {"status": status, "err": err, "sse_error": sse_error, "exc": exc,
+                "text": text, "completed": completed, "tag": tag, "attempt": attempt, "tid": tid}
+        print(f"[TN] attempt={attempt} tag={tag} status={status} text_len={len(text)} completed={completed}")
 
-    # Decide whether this final-failure path warrants a Discord alert.
-    # Only alert on real failures, not on a 200 OK that returned an empty stream.
-    real_failure = (
-        exc is not None              # network / timeout exception
-        or (status not in (0, 200))  # HTTP error
-        or sse_error                 # explicit SSE error event
-    )
-    reason = err or (f"{type(exc).__name__}: {exc}" if exc else f"http status={status}")
+        if tag == "ok":
+            tn_state["last_success_at"] = datetime.now(IST)
+            cleaned = dedupe_tn_text(sanitize_tn_text(text))
+            return cleaned
+
+        # Empty 200: thread is unknown to TN. Stop immediately.
+        if tag == "empty_200":
+            invalidate_thread("TN returned HTTP 200 with zero stream chunks (unknown thread)")
+            await alert_thread_invalid()
+            tn_state["last_error"] = THREAD_INVALID_HINT
+            tn_state["last_error_at"] = datetime.now(IST)
+            return ""
+
+        if tag == "auth":
+            print("[TN] auth failure — attempting token refresh before retrying")
+            await refresh_tn_token()
+            timeout_read = TN_DEFAULT_READ_TIMEOUT
+            continue
+
+        if tag == "incomplete_preamble":
+            timeout_read = TN_RETRY_READ_TIMEOUT
+            continue
+
+        # timeout / http_error / sse_error / exception → backoff + retry
+        # Retry only if we have attempts left.
+        if attempt >= TN_MAX_ATTEMPTS:
+            break
+        # On http_error 5xx we keep timeout the same; on timeout we bump it.
+        if tag == "timeout":
+            timeout_read = TN_RETRY_READ_TIMEOUT
+
+    # All attempts exhausted.
+    reason = _format_failure_reason(last)
     tn_state["last_error"] = reason
     tn_state["last_error_at"] = datetime.now(IST)
-    if real_failure:
-        await alert_tn_failure(reason)
-    else:
-        print(f"[TN] empty 200 response, no SSE error — skipping alert. last reason={reason!r}")
+    await alert_tn_failure(reason, last)
     return ""
 
 
-async def alert_tn_failure(reason: str) -> None:
-    """Post a rate-limited alert embed to #claude-integration on unrecovered TN failure."""
+def _format_failure_reason(last: dict) -> str:
+    tag = last.get("tag", "unknown")
+    status = last.get("status", 0)
+    err = last.get("err", "") or ""
+    exc = last.get("exc")
+    if tag == "auth":
+        return f"Auth failed (HTTP {status}). Run !refreshtoken."
+    if tag == "empty_200":
+        return THREAD_INVALID_HINT
+    if tag == "http_error":
+        return f"TrueNorth API error: HTTP {status}. {err[:200]}"
+    if tag == "sse_error":
+        return f"TrueNorth SSE error: {err[:300]}"
+    if tag == "timeout":
+        return f"TrueNorth timed out after {TN_RETRY_READ_TIMEOUT}s. Try again."
+    if exc is not None:
+        return f"{type(exc).__name__}: {exc}"
+    return err or f"unknown failure (status={status})"
+
+
+def _token_exp_summary() -> str:
+    exp = decode_jwt_exp(token_store.get("access", ""))
+    if not exp:
+        return "unknown (token missing or malformed)"
+    now = datetime.now(IST)
+    delta = int((exp - now).total_seconds())
+    base = exp.strftime("%Y-%m-%d %H:%M %Z")
+    if delta > 0:
+        return f"{base} (in {delta // 3600}h {(delta % 3600) // 60}m)"
+    return f"{base} (EXPIRED {(-delta) // 60}m ago)"
+
+
+async def alert_tn_failure(reason: str, last: dict | None = None) -> None:
+    """Rate-limited diagnostic embed for unrecovered TN failures.
+
+    The embed reflects the ACTUAL failure mode (status, chunks, completed flag,
+    SSE error, retry count) instead of the old generic 'token may need refresh'.
+    """
     now = time.time()
     if now - tn_state["last_alert_at"] < ALERT_COOLDOWN_SEC:
         return
@@ -572,23 +666,62 @@ async def alert_tn_failure(reason: str) -> None:
         channel = bot.get_channel(CH["claude"])
         if not channel:
             return
-        e = discord.Embed(
-            title="🚨 TrueNorth failure (auto-recovery did not succeed)",
-            description=f"```\n{reason[:1500]}\n```",
-            color=COLOR_RISK,
-        )
-        e.add_field(name="Thread", value=(_tn_thread_current or "—"), inline=True)
-        exp = decode_jwt_exp(token_store.get("access", ""))
-        e.add_field(
-            name="Token exp",
-            value=(exp.strftime("%Y-%m-%d %H:%M %Z") if exp else "unknown"),
-            inline=True,
-        )
+        tag = (last or {}).get("tag", "unknown")
+        title_by_tag = {
+            "auth": "🚨 TrueNorth auth failure",
+            "http_error": "🚨 TrueNorth API error",
+            "sse_error": "🚨 TrueNorth SSE error",
+            "timeout": "🚨 TrueNorth timeout",
+            "exception": "🚨 TrueNorth network error",
+            "empty_200": "🚨 TrueNorth thread invalid",
+        }
+        title = title_by_tag.get(tag, "🚨 TrueNorth failure")
+        e = discord.Embed(title=title, description=f"```\n{reason[:1500]}\n```", color=COLOR_RISK)
+        e.add_field(name="Thread", value=f"`{_tn_thread_current or '—'}`", inline=True)
+        if last:
+            e.add_field(name="Status", value=str(last.get("status", "—")), inline=True)
+            e.add_field(name="Attempt", value=f"{last.get('attempt', '?')}/{TN_MAX_ATTEMPTS}", inline=True)
+            e.add_field(name="Chunks (text len)", value=str(len(last.get("text") or "")), inline=True)
+            e.add_field(name="Stream completed", value=("yes" if last.get("completed") else "no"), inline=True)
+            if last.get("err"):
+                e.add_field(name="Last SSE error", value=f"```\n{str(last.get('err'))[:400]}\n```", inline=False)
+        e.add_field(name="Token exp", value=_token_exp_summary(), inline=False)
         e.set_footer(text=f"{FOOTER} · alert rate-limited 1/hr")
         e.timestamp = datetime.now(IST)
         await channel.send(embed=e)
-    except Exception as e:
-        print(f"[Alert] send failed: {type(e).__name__}: {e}")
+    except Exception as send_err:
+        print(f"[Alert] send failed: {type(send_err).__name__}: {send_err}")
+
+
+async def alert_thread_invalid() -> None:
+    """One-time per-process warning when the shared thread is unusable."""
+    if tn_state.get("boot_warning_posted"):
+        return
+    tn_state["boot_warning_posted"] = True
+    try:
+        channel = bot.get_channel(CH["claude"])
+        if not channel:
+            return
+        reason = tn_state.get("thread_invalid_reason") or "TN_THREAD_ID rejected by TrueNorth"
+        e = discord.Embed(
+            title="⚠️ TN_THREAD_ID is invalid — TN-dependent commands are disabled",
+            description=THREAD_INVALID_HINT,
+            color=COLOR_RISK,
+        )
+        e.add_field(name="Detected because", value=reason[:1000], inline=False)
+        e.add_field(name="Currently configured thread", value=f"`{TN_THREAD_ENV or load_cached_thread() or '—'}`", inline=False)
+        e.add_field(name="What still works", value="`!health`, `!refreshtoken`", inline=False)
+        e.add_field(
+            name="What will fail",
+            value="`!brief`, `!trades`, `!regime`, scheduled session briefs",
+            inline=False,
+        )
+        e.add_field(name="Token exp", value=_token_exp_summary(), inline=False)
+        e.set_footer(text=FOOTER)
+        e.timestamp = datetime.now(IST)
+        await channel.send(embed=e)
+    except Exception as send_err:
+        print(f"[Alert] thread-invalid send failed: {type(send_err).__name__}: {send_err}")
 
 # --- Claude fallback ---
 def ask_claude(prompt: str) -> str:
@@ -756,12 +889,15 @@ def rate_limit_retry_min(user_id: int) -> int:
         return 0
     return max(1, int((RATE_LIMIT_WINDOW - (time.time() - calls[0])) / 60))
 
-def get_tn_thread(conv_id: int) -> str:
-    tid = tn_thread_map.get(conv_id)
-    if not tid:
-        tid = str(uuid.uuid4())
-        tn_thread_map[conv_id] = tid
-    return tid
+def get_tn_thread(conv_id: int) -> str | None:
+    """Per-conversation thread id.
+
+    Returns the shared validated thread for now — TrueNorth rejects unknown
+    UUIDs (HTTP 200 + zero chunks), so generating a per-conv UUID here just
+    breaks chat. Once a real thread-create endpoint is wired this can mint a
+    fresh thread per conversation again.
+    """
+    return ensure_thread_id()
 
 async def get_or_create_conv_thread(message: discord.Message, content: str) -> discord.abc.Messageable:
     if isinstance(message.channel, discord.Thread):
@@ -1496,9 +1632,24 @@ async def on_ready():
         await refresh_tn_token()
     exp = decode_jwt_exp(token_store.get("access", ""))
     print(f"[BOOT] TN access token exp: {exp}")
-    # Use async ensure so we attempt a real API thread-create when env+cache are empty.
+    # Acquire thread (env → cache → API create). Returns None when nothing works.
     boot_tid = await ensure_thread_id_async()
-    print(f"[BOOT] TN thread id: {boot_tid}")
+    if boot_tid:
+        print(f"[BOOT] Validating TN thread id={boot_tid} via ping…")
+        if await validate_thread(boot_tid, timeout_s=30.0):
+            print(f"[BOOT] TN thread is valid: {boot_tid}")
+        else:
+            invalidate_thread(
+                f"ping against {boot_tid} returned no chunks within 30s — "
+                "TN does not recognise this thread"
+            )
+            await alert_thread_invalid()
+    else:
+        invalidate_thread(
+            "TN_THREAD_ID is unset, no cached thread, and the API create probe "
+            "found no working endpoint"
+        )
+        await alert_thread_invalid()
     setup_scheduler()
     scheduler.start()
     print(f"[SCHED] {len(SCHEDULE)} session briefs + regime + token refresh scheduled")

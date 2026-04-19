@@ -245,16 +245,30 @@ def test_thread_create_endpoint_candidates_target_adventai():
         assert url.startswith("https://api.adventai.io/"), f"non-adventai endpoint: {url}"
 
 
-def test_rotate_thread_id_persists_uuid_fallback(tmp_path, monkeypatch):
-    """The synchronous rotate_thread_id() always produces a persisted UUID."""
+def test_ensure_thread_id_returns_none_when_no_source_available(tmp_path, monkeypatch):
+    """Critical regression: ensure_thread_id MUST NOT mint a random UUID.
+
+    TN responds with HTTP 200 + zero chunks for unknown UUIDs, which used to
+    burn ~25 minutes of useless retries. Returning None forces fast-fail.
+    """
     cache_file = tmp_path / "thread_cache.json"
     monkeypatch.setattr(bot, "THREAD_CACHE_PATH", str(cache_file))
-    new_id = bot.rotate_thread_id()
-    import uuid as _uuid
-    _uuid.UUID(new_id)  # raises if not a valid UUID
-    assert cache_file.exists()
-    cached = bot.load_cached_thread()
-    assert cached == new_id
+    monkeypatch.setattr(bot, "TN_THREAD_ENV", "")
+    monkeypatch.setattr(bot, "_tn_thread_current", None)
+    assert bot.ensure_thread_id() is None
+    # No cache file should have been written.
+    assert not cache_file.exists()
+
+
+def test_get_tn_thread_does_not_generate_per_conv_uuid(tmp_path, monkeypatch):
+    """Per-conversation calls must not synthesize random UUIDs either."""
+    cache_file = tmp_path / "thread_cache.json"
+    monkeypatch.setattr(bot, "THREAD_CACHE_PATH", str(cache_file))
+    monkeypatch.setattr(bot, "TN_THREAD_ENV", "")
+    monkeypatch.setattr(bot, "_tn_thread_current", None)
+    bot.tn_thread_map.clear()
+    assert bot.get_tn_thread(12345) is None
+    assert bot.get_tn_thread(12345) is None  # idempotent
 
 
 # --- Task 6: !brief confirmation routes to invoking channel ---
@@ -672,6 +686,69 @@ def test_extract_risk_flag_strips_leading_horizontal_rule():
     body = bot.extract_risk_flag(text)
     assert body is not None
     assert body.startswith("FOMC")
+
+
+def test_classify_failure_buckets_each_failure_mode():
+    """Each known failure mode must map to its tag so the embed picks the right copy."""
+    # ok path: status 200 with text and no SSE error
+    assert bot._classify_failure(200, "", False, None, "real content", True) == "ok"
+    # auth
+    assert bot._classify_failure(401, "Unauthorized", False, None, "", False) == "auth"
+    assert bot._classify_failure(403, "Forbidden", False, None, "", False) == "auth"
+    # generic http error
+    assert bot._classify_failure(500, "boom", False, None, "", False) == "http_error"
+    # explicit SSE error event
+    assert bot._classify_failure(200, '"detail": "denied"', True, None, "", False) == "sse_error"
+    # empty 200 (the unknown-thread signature)
+    assert bot._classify_failure(200, "", False, None, "", False) == "empty_200"
+    # incomplete preamble heuristic
+    assert bot._classify_failure(200, "", False, None, "Let me scan…", False) == "incomplete_preamble"
+    # exception path classifies as exception unless timeout
+    import httpx as _httpx
+    assert bot._classify_failure(0, "", False, _httpx.ReadTimeout("slow"), "", False) == "timeout"
+    assert bot._classify_failure(0, "", False, RuntimeError("boom"), "", False) == "exception"
+
+
+def test_format_failure_reason_uses_actionable_copy():
+    auth_msg = bot._format_failure_reason(
+        {"tag": "auth", "status": 401, "err": "Unauthorized"}
+    )
+    assert "Run !refreshtoken" in auth_msg
+
+    empty_msg = bot._format_failure_reason({"tag": "empty_200", "status": 200, "err": ""})
+    assert "TN_THREAD_ID is invalid" in empty_msg
+    assert "app.true-north.xyz" in empty_msg
+
+    timeout_msg = bot._format_failure_reason(
+        {"tag": "timeout", "status": 0, "err": "", "exc": None}
+    )
+    assert "timed out" in timeout_msg.lower()
+
+
+def test_invalidate_thread_marks_state_and_clears_current():
+    """invalidate_thread() must flip the flag, clear the current id, and record a reason."""
+    bot._tn_thread_current = "some-id"
+    bot.tn_state["thread_invalid"] = False
+    bot.tn_state["thread_invalid_reason"] = ""
+    bot.tn_state["boot_warning_posted"] = False
+    bot.invalidate_thread("manual test")
+    assert bot.tn_state["thread_invalid"] is True
+    assert "manual test" in bot.tn_state["thread_invalid_reason"]
+    assert bot._tn_thread_current is None
+
+
+def test_retry_policy_constants_match_spec():
+    """Spec: max 2 retries (3 attempts total) with backoff 10s, 30s."""
+    assert bot.TN_MAX_ATTEMPTS == 3
+    assert bot.TN_RETRY_BACKOFF_S == (10.0, 30.0)
+
+
+def test_thread_invalid_hint_includes_actionable_steps():
+    """The user-facing instruction must point at the right URL + steps."""
+    hint = bot.THREAD_INVALID_HINT
+    assert "app.true-north.xyz" in hint
+    assert "TN_THREAD_ID" in hint
+    assert "Railway" in hint
 
 
 def test_extract_risk_flag_preserves_inner_table_rows():
