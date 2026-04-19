@@ -299,5 +299,158 @@ def test_decode_jwt_exp_invalid_base64_returns_none():
     assert bot.decode_jwt_exp(f"hdr.{bogus}.sig") is None
 
 
+# --- Task 1: sanitize_tn_text covers Token + Anchor + generic tags ---
+
+SAMPLE_WITH_ANCHORS = """
+**BTC Update**
+
+Bitcoin <Token tokenAddress="btc" tokenSymbol="BTC" exchangeId="binance_futures" /> is
+testing the <Anchor annotationId="sr-bitcoin-resistance-1-76770-4h-short-liq-cluster" /> liquidation cluster.
+
+Watching <Token tokenAddress="ethena" tokenSymbol="ENA" /> closely against
+<Anchor annotationId="ena-pivot-3" /> support.
+"""
+
+
+def test_sanitize_tn_text_handles_token_anchor_and_generic_tags():
+    out = bot.sanitize_tn_text(SAMPLE_WITH_ANCHORS)
+    assert "<Token" not in out and "tokenSymbol" not in out
+    assert "<Anchor" not in out and "annotationId" not in out
+    assert "$BTC" in out
+    assert "$ENA" in out
+    # No double spaces left over from removed tags
+    assert "  " not in out
+    # Generic capitalised self-closing tag also stripped
+    assert bot.sanitize_tn_text("hi <Foo bar='x' /> there") == "hi there"
+
+
+def test_sanitize_tn_text_idempotent_and_safe_on_empty():
+    """Sanitizing twice should produce the same output, and empty input is a no-op."""
+    out = bot.sanitize_tn_text(SAMPLE_WITH_ANCHORS)
+    assert bot.sanitize_tn_text(out) == out
+    assert bot.sanitize_tn_text("") == ""
+    # Plain prose without tags must pass through unchanged.
+    plain = "BTC reclaimed VWAP and is consolidating at 67k."
+    assert bot.sanitize_tn_text(plain) == plain
+
+
+# --- Task 4: markdown tables wrapped in code blocks ---
+
+def test_wrap_markdown_tables_wraps_consecutive_pipe_lines():
+    text = (
+        "Intro line.\n\n"
+        "| Metric | Value | Read |\n"
+        "|--------|-------|------|\n"
+        "| Regime | Bearish | 🔴 |\n\n"
+        "Trailing line."
+    )
+    out = bot.wrap_markdown_tables(text)
+    assert "```\n| Metric" in out
+    assert "🔴 |\n```" in out
+    # Trailing line must remain outside the fence
+    assert out.rstrip().endswith("Trailing line.")
+
+
+def test_wrap_markdown_tables_leaves_single_pipe_alone():
+    """A single pipe line is not a table — don't wrap it."""
+    text = "Note: BTC | ETH dominance flip incoming."
+    out = bot.wrap_markdown_tables(text)
+    assert "```" not in out
+
+
+def test_wrap_markdown_tables_empty_safe():
+    assert bot.wrap_markdown_tables("") == ""
+    assert bot.wrap_markdown_tables("plain text no pipes") == "plain text no pipes"
+
+
+# --- Task 5: extract_risk_flag captures the full body ---
+
+REALISTIC_BRIEF_WITH_RISK = """
+**London Pre-Open Brief**
+
+BTC trading at 67,450 with neutral 1H RSI.
+
+| Metric | Value | Read |
+|--------|-------|------|
+| Regime | Bearish trend | 🔴 Bear with bounce risk |
+| BTC.D  | 58.2%        | ⚠️ rotating into majors |
+
+---
+
+$BTC | LONG | High Conviction
+| Entry | $67,200 |
+| Stop Loss | $66,300 |
+| Take Profit | $69,800 |
+
+- Reclaimed weekly VWAP
+
+---
+
+⚠️ Session Risk Flags
+
+| Catalyst | Time UTC | Impact |
+|----------|----------|--------|
+| US CPI   | 13:30    | High   |
+| FOMC mins| 18:00    | Medium |
+
+Reduce size into the CPI print; expect 1-2% intraday range expansion.
+
+## Disclaimer
+Not financial advice.
+"""
+
+
+def test_extract_risk_flag_captures_full_body_not_just_s():
+    """Regression: previous regex captured only the trailing 's' of 'Flags'."""
+    body = bot.extract_risk_flag(REALISTIC_BRIEF_WITH_RISK)
+    assert body is not None
+    assert body != "s", "regex regression — captured only the plural-s suffix"
+    # Body must contain the actual risk content, not the heading word
+    assert "CPI" in body
+    assert "13:30" in body
+    assert "Reduce size" in body
+    # The terminator must stop at the next heading — the disclaimer must NOT be in the body
+    assert "Not financial advice" not in body
+    assert "Disclaimer" not in body
+    # Tables in the body must be preserved (so build_risk_embed can wrap them)
+    assert "| Catalyst |" in body
+
+
+def test_extract_risk_flag_singular_form_still_works():
+    text = "Some prose.\n\n**Risk Flag:**\nFOMC tomorrow at 18:00 UTC."
+    body = bot.extract_risk_flag(text)
+    assert body is not None
+    assert "FOMC" in body
+
+
+# --- Task 2: Privy refresh headers include Origin / Referer ---
+
+def test_privy_headers_include_origin_and_referer():
+    h = bot._privy_headers()
+    assert h["privy-app-id"] == bot.PRIVY_APP_ID
+    assert h["Content-Type"] == "application/json"
+    assert h["Origin"] == bot.TN_APP_ORIGIN
+    assert h["Referer"].startswith(bot.TN_APP_ORIGIN)
+    assert h["Referer"].endswith("/")
+
+
+# --- Task 3: false-positive alert suppression heuristics ---
+
+def test_looks_like_preamble_detects_thinking_prefixes():
+    assert bot._looks_like_preamble("Let me scan current market conditions for you...")
+    assert bot._looks_like_preamble("Let me check BTC funding right now")
+    assert not bot._looks_like_preamble("BTC is trading at 67,450 with positive funding.")
+    assert not bot._looks_like_preamble("")
+    # Very long text — not preamble even if it starts with one of the phrases
+    long_text = "Let me scan " + ("the market " * 200)
+    assert not bot._looks_like_preamble(long_text)
+
+
+def test_tn_default_read_timeout_is_at_least_240():
+    """Session briefs / !trades must have >=240s read timeout."""
+    assert bot.TN_DEFAULT_READ_TIMEOUT >= 240
+    assert bot.TN_RETRY_READ_TIMEOUT >= bot.TN_DEFAULT_READ_TIMEOUT
+
+
 # re needs to be accessible in the test module for regex-based assertions above.
 import re  # noqa: E402

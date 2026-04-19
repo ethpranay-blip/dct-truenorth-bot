@@ -334,8 +334,24 @@ def decode_jwt_exp(token: str) -> datetime | None:
     return None
 
 # --- TrueNorth SSE query ---
-async def _tn_call_once(prompt: str, thread_id: str, timeout_read: float) -> tuple[str, int, str]:
-    """One SSE call. Returns (text, status_code, error_snippet). Raises on network errors."""
+TN_DEFAULT_READ_TIMEOUT = 240.0  # TN multi-tool calls can take 2-3 min
+TN_RETRY_READ_TIMEOUT   = 360.0  # Bump on retry-after-incomplete
+_SSE_ERROR_MARKERS = (
+    "error", "denied", "expired", "unauthorized", "not authenticated",
+    "forbidden", "invalid", "fail",
+)
+
+
+async def _tn_call_once(
+    prompt: str,
+    thread_id: str,
+    timeout_read: float,
+) -> tuple[str, int, str, bool, bool]:
+    """One SSE call.
+
+    Returns (text, status_code, error_snippet, sse_error_flag, completed_flag).
+    Raises on network errors (timeouts/connection issues are signaled as exceptions).
+    """
     headers = {
         "Authorization": f"Bearer {token_store['access']}",
         "Content-Type": "application/json",
@@ -346,11 +362,14 @@ async def _tn_call_once(prompt: str, thread_id: str, timeout_read: float) -> tup
     body = {"query": prompt, "thread_id": thread_id}
     chunks: list[str] = []
     err_snippet = ""
+    sse_error = False
+    completed = False
+    current_event = ""
     timeout = httpx.Timeout(30.0, read=timeout_read)
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream("POST", TN_ENDPOINT, headers=headers, json=body) as resp:
             status = resp.status_code
-            print(f"[TN HTTP] status={status}")
+            print(f"[TN HTTP] status={status} (read_timeout={timeout_read}s)")
             if status != 200:
                 body_text = ""
                 async for chunk in resp.aiter_text():
@@ -359,32 +378,64 @@ async def _tn_call_once(prompt: str, thread_id: str, timeout_read: float) -> tup
                         break
                 err_snippet = body_text[:500]
                 print(f"[TN HTTP] error body: {err_snippet}")
-                return "", status, err_snippet
+                return "", status, err_snippet, False, False
             async for line in resp.aiter_lines():
-                line = line.strip()
+                line = line.rstrip()
                 if not line:
                     continue
-                if line.startswith("data:"):
-                    data = line[5:].strip()
-                    if not data or data == "[DONE]":
-                        continue
-                    try:
-                        obj = json.loads(data)
-                        if obj.get("event_type") == "llm_output":
-                            inner = obj.get("data", {})
-                            content = inner.get("content", "")
-                            if content:
-                                chunks.append(content)
-                        elif "content" in obj:
-                            chunks.append(obj["content"])
-                        elif "detail" in obj:
-                            snippet = json.dumps(obj["detail"])[:500]
-                            if not err_snippet:
-                                err_snippet = snippet
-                            print(f"[TN SSE] API error: {snippet[:300]}")
-                    except json.JSONDecodeError as e:
-                        print(f"[TN SSE] JSON error: {e} | raw: {data[:100]}")
-    return "".join(chunks).strip(), status, err_snippet
+                if line.startswith("event:"):
+                    current_event = line[6:].strip().lower()
+                    if current_event in ("done", "complete", "end"):
+                        completed = True
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data:
+                    continue
+                if data == "[DONE]":
+                    completed = True
+                    continue
+                try:
+                    obj = json.loads(data)
+                except json.JSONDecodeError as e:
+                    print(f"[TN SSE] JSON error: {e} | raw: {data[:100]}")
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                event_type = obj.get("event_type") or current_event
+                if event_type == "llm_output":
+                    inner = obj.get("data") or {}
+                    if isinstance(inner, dict):
+                        content = inner.get("content", "")
+                        if content:
+                            chunks.append(content)
+                elif event_type == "error":
+                    payload = obj.get("data") or obj
+                    err_snippet = json.dumps(payload)[:500]
+                    sse_error = True
+                    print(f"[TN SSE] explicit error event: {err_snippet[:300]}")
+                elif event_type in ("done", "complete", "end"):
+                    completed = True
+                elif "content" in obj and isinstance(obj["content"], str):
+                    chunks.append(obj["content"])
+                elif "detail" in obj:
+                    # `detail` is sometimes informational, sometimes an error.
+                    # Only flag as error when the payload contains error markers.
+                    detail_val = obj["detail"]
+                    detail_str = detail_val if isinstance(detail_val, str) else json.dumps(detail_val)
+                    detail_low = detail_str.lower()
+                    if any(m in detail_low for m in _SSE_ERROR_MARKERS):
+                        if not err_snippet:
+                            err_snippet = detail_str[:500]
+                        sse_error = True
+                        print(f"[TN SSE] error-shaped detail: {detail_str[:300]}")
+                    else:
+                        # benign informational detail — ignore
+                        pass
+    text = "".join(chunks).strip()
+    print(f"[TN STREAM] chunks={len(chunks)} text_len={len(text)} completed={completed} sse_error={sse_error}")
+    return text, status, err_snippet, sse_error, completed
 
 
 def _classify_error(status: int, err_snippet: str) -> tuple[bool, bool]:
@@ -397,59 +448,108 @@ def _classify_error(status: int, err_snippet: str) -> tuple[bool, bool]:
     return auth, thread
 
 
+def _looks_like_preamble(text: str) -> bool:
+    """Heuristic: TN occasionally closes the stream early with only a 'thinking' preamble.
+
+    If the captured text is short and matches typical preamble phrases, treat it
+    as an incomplete stream and retry with a longer timeout.
+    """
+    if not text:
+        return False
+    if len(text) > 600:
+        return False
+    head = text.strip().lower()[:200]
+    return any(
+        phrase in head
+        for phrase in (
+            "let me scan",
+            "let me check",
+            "let me look",
+            "let me analyze",
+            "let me pull",
+            "i'll scan",
+            "i'll check",
+            "scanning ",
+            "checking ",
+        )
+    )
+
+
 async def query_truenorth(
     prompt: str,
     thread_id: str | None = None,
-    timeout_read: float = 180.0,
+    timeout_read: float = TN_DEFAULT_READ_TIMEOUT,
 ) -> str:
-    """Send prompt to TrueNorth; auto-refresh token and rotate thread on recoverable errors."""
+    """Send prompt to TrueNorth; auto-refresh token, rotate thread, and retry on incomplete streams."""
     caller_pinned_thread = thread_id is not None
     tid = thread_id or ensure_thread_id()
 
-    text, status, err, exc = "", 0, "", None
+    text, status, err, exc, sse_error, completed = "", 0, "", None, False, False
     try:
-        text, status, err = await _tn_call_once(prompt, tid, timeout_read)
+        text, status, err, sse_error, completed = await _tn_call_once(prompt, tid, timeout_read)
     except Exception as e:
         exc = e
         print(f"[TN ERROR] {type(e).__name__}: {e}")
         traceback.print_exc()
 
-    if not text:
-        auth_fail, thread_fail = _classify_error(status, err)
-        should_retry = False
-        if auth_fail:
-            print("[TN] auth failure detected -- attempting token refresh")
-            if await refresh_tn_token():
-                should_retry = True
-            else:
-                print("[TN] token refresh failed")
-        if thread_fail:
-            if caller_pinned_thread:
-                tid = str(uuid.uuid4())
-                print(f"[TN] thread denied -- retrying with fresh per-call uuid {tid}")
-            else:
-                tid = await rotate_thread_id_async()
-                if tid == _tn_thread_current and not _thread_create_endpoint:
-                    # API create failed — surface this so the alert below carries useful context.
-                    print("[TN] thread API-create unavailable; using uuid fallback")
+    # Recovery: token refresh / thread rotation / incomplete-stream retry
+    auth_fail, thread_fail = _classify_error(status, err)
+    incomplete_stream = (
+        exc is None
+        and status == 200
+        and not sse_error
+        and (not text or (not completed and _looks_like_preamble(text)))
+    )
+
+    should_retry = False
+    if auth_fail:
+        print("[TN] auth failure detected -- attempting token refresh")
+        if await refresh_tn_token():
             should_retry = True
-        if should_retry:
-            try:
-                text, status, err = await _tn_call_once(prompt, tid, timeout_read)
-                exc = None
-            except Exception as e:
-                exc = e
-                print(f"[TN ERROR retry] {type(e).__name__}: {e}")
+        else:
+            print("[TN] token refresh failed")
+    if thread_fail:
+        if caller_pinned_thread:
+            tid = str(uuid.uuid4())
+            print(f"[TN] thread denied -- retrying with fresh per-call uuid {tid}")
+        else:
+            tid = await rotate_thread_id_async()
+            if tid == _tn_thread_current and not _thread_create_endpoint:
+                print("[TN] thread API-create unavailable; using uuid fallback")
+        should_retry = True
+    if incomplete_stream and not should_retry:
+        # Bump the timeout and retry once. Bare exceptions / empty text count too.
+        print(f"[TN] stream incomplete (text={len(text)}, completed={completed}) -- retrying with longer timeout")
+        should_retry = True
+        timeout_read = TN_RETRY_READ_TIMEOUT
+
+    if should_retry:
+        try:
+            text, status, err, sse_error, completed = await _tn_call_once(prompt, tid, timeout_read)
+            exc = None
+        except Exception as e:
+            exc = e
+            print(f"[TN ERROR retry] {type(e).__name__}: {e}")
 
     if text:
         tn_state["last_success_at"] = datetime.now(IST)
-        print(f"[TN RESULT] {len(text)} chars (last_success_at updated)")
-        return text
+        print(f"[TN RESULT] {len(text)} chars (completed={completed}, last_success_at updated)")
+        return sanitize_tn_text(text)
 
+    # Decide whether this final-failure path warrants a Discord alert.
+    # Only alert on real failures, not on a 200 OK that returned an empty stream.
+    real_failure = (
+        exc is not None              # network / timeout exception
+        or (status not in (0, 200))  # HTTP error
+        or sse_error                 # explicit SSE error event
+    )
     reason = err or (f"{type(exc).__name__}: {exc}" if exc else f"http status={status}")
     tn_state["last_error"] = reason
     tn_state["last_error_at"] = datetime.now(IST)
-    await alert_tn_failure(reason)
+    if real_failure:
+        await alert_tn_failure(reason)
+    else:
+        print(f"[TN] empty 200 response, no SSE error — skipping alert. last reason={reason!r}")
     return ""
 
 
@@ -496,6 +596,25 @@ def ask_claude(prompt: str) -> str:
         return "Something went wrong with Claude. Try again."
 
 # --- Token refresh ---
+TN_APP_ORIGIN = os.environ.get("TN_APP_ORIGIN", "https://app.true-north.xyz")
+
+
+def _privy_headers() -> dict[str, str]:
+    """Headers for the Privy /sessions endpoint.
+
+    Privy validates Origin against the app's allowed-origins list — without it,
+    refresh returns 403 missing_origin. Referer is also commonly checked.
+    """
+    return {
+        "privy-app-id": PRIVY_APP_ID,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "privy-client": "react-auth:2.0.0",
+        "Origin": TN_APP_ORIGIN,
+        "Referer": f"{TN_APP_ORIGIN.rstrip('/')}/",
+    }
+
+
 def _mask(tok: str) -> str:
     """Return a truncated token for log safety (first 8 + last 4 chars)."""
     if not tok:
@@ -521,12 +640,7 @@ async def refresh_tn_token() -> bool:
             resp = await client.post(
                 PRIVY_SESSION_URL,
                 json={"refresh_token": rt},
-                headers={
-                    "privy-app-id": PRIVY_APP_ID,
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                    "privy-client": "react-auth:2.0.0",
-                },
+                headers=_privy_headers(),
             )
             status = resp.status_code
             body_preview = resp.text[:500]
@@ -682,6 +796,10 @@ async def handle_sonnet(message: discord.Message, query: str):
 _TICKER_HEADER_RE = re.compile(r'\$[A-Z]{1,10}\s*\|\s*(LONG|SHORT)\b', re.IGNORECASE)
 _TOKEN_TAG_RE = re.compile(r'<\s*Token\b[^>]*/?>', re.IGNORECASE)
 _TOKEN_SYMBOL_ATTR_RE = re.compile(r'tokenSymbol\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+_ANCHOR_TAG_RE = re.compile(r'<\s*Anchor\b[^>]*/?>', re.IGNORECASE)
+# Generic fallback for any remaining self-closing capitalised XML-like tag.
+_GENERIC_TAG_RE = re.compile(r'<[A-Z][a-zA-Z]*(?:\s+[^>]*)?/>')
+_DUP_SPACE_RE = re.compile(r'[ \t]{2,}')
 
 
 def strip_token_tags(text: str) -> str:
@@ -693,6 +811,51 @@ def strip_token_tags(text: str) -> str:
     # Drop any stray closing </Token>
     text = re.sub(r'</\s*Token\s*>', '', text, flags=re.IGNORECASE)
     return text
+
+
+def sanitize_tn_text(text: str) -> str:
+    """Single chokepoint: scrub all TrueNorth-specific markup before downstream consumers.
+
+    - <Token tokenSymbol="X" .../> → $X
+    - <Anchor annotationId="..." /> → removed (no user value)
+    - Any other self-closing <Capitalised .../> tag → removed
+    - Stray </Token> closing tags → removed
+    - Collapse runs of intra-line whitespace produced by tag removal
+    """
+    if not text:
+        return text
+    text = strip_token_tags(text)
+    text = _ANCHOR_TAG_RE.sub("", text)
+    text = _GENERIC_TAG_RE.sub("", text)
+    # Tidy up double spaces left by tag removal, but preserve newlines/indentation.
+    text = _DUP_SPACE_RE.sub(" ", text)
+    # Trim spaces before line breaks for cleaner table alignment.
+    text = re.sub(r' +\n', '\n', text)
+    return text
+
+
+def wrap_markdown_tables(text: str) -> str:
+    """Wrap consecutive pipe-prefixed lines in fenced code blocks for monospace rendering."""
+    if not text or "|" not in text:
+        return text
+    lines = text.split("\n")
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        if lines[i].lstrip().startswith("|"):
+            j = i
+            while j < n and lines[j].lstrip().startswith("|"):
+                j += 1
+            if j - i >= 2:
+                out.append("```")
+                out.extend(lines[i:j])
+                out.append("```")
+                i = j
+                continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
 
 
 def _clean_price(s: str) -> str:
@@ -766,17 +929,42 @@ def parse_trades_from_text(text: str) -> list[dict]:
         trades.append(trade)
     return trades
 
+_RISK_HEADING_RE = re.compile(
+    # Optional warning emoji, optional bold/italic markers, optional "Session"
+    # prefix, "Risk Flag" with optional plural-s, then any combination of
+    # trailing punctuation/whitespace (including newlines and bold-close stars).
+    # We consume those trailing characters so they don't leak into the body.
+    r'(?:⚠️?\s*)?\**\s*(?:[Ss]ession\s+)?[Rr]isk\s+[Ff]lag[s]?\b[\s:.\-*]*',
+)
+# Stop the body when a clear new section heading appears: a markdown atx heading
+# (#…), a bold-on-its-own line, or "Trade Setups"/"Disclaimer" boundaries.
+_RISK_BODY_TERMINATOR_RE = re.compile(
+    r'\n(?:'
+    r'#{1,6}\s+\S'                              # ## Heading
+    r'|\*\*[A-Z][^\n]+\*\*\s*\n'                # **Bold Heading** alone
+    r'|(?:Trade Setups?|Disclaimer|Notes?|Glossary)\s*[:*\n]'  # known section names
+    r')',
+    re.MULTILINE,
+)
+
+
 def extract_risk_flag(text: str) -> str | None:
-    """Pull out a risk flag section if present."""
-    patterns = [
-        r'(?:⚠️?\s*)?[Ss]ession\s+[Rr]isk\s+[Ff]lag[:\s]*(.*?)(?:\n-{3,}|\Z)',
-        r'(?:⚠️?\s*)?[Rr]isk\s+[Ff]lag[:\s]*(.*?)(?:\n-{3,}|\Z)',
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, re.DOTALL)
-        if m:
-            return m.group(1).strip()
-    return None
+    """Pull out a Session Risk Flag section if present.
+
+    Greedy on body, terminating only at the next clear heading or end of text.
+    Tables and horizontal rules inside the body are preserved so callers can
+    code-block-wrap them for Discord rendering.
+    """
+    if not text:
+        return None
+    m = _RISK_HEADING_RE.search(text)
+    if not m:
+        return None
+    rest = text[m.end():]
+    end = _RISK_BODY_TERMINATOR_RE.search(rest)
+    body = rest[: end.start()] if end else rest
+    body = body.strip()
+    return body or None
 
 # --- Embed builders ---
 def build_trade_embeds(trades: list[dict]) -> list[discord.Embed]:
@@ -819,9 +1007,10 @@ def build_brief_embed(text: str, session: str, phase: str) -> discord.Embed:
     trade_start = re.search(r'\$[A-Z]+\s*\|?\s*(?:LONG|SHORT)', text, re.IGNORECASE)
     if trade_start:
         brief_text = text[:trade_start.start()].strip()
-    risk_start = re.search(r'(?:⚠️?\s*)?[Ss]ession\s+[Rr]isk\s+[Ff]lag', brief_text)
+    risk_start = _RISK_HEADING_RE.search(brief_text)
     if risk_start:
         brief_text = brief_text[:risk_start.start()].strip()
+    brief_text = wrap_markdown_tables(brief_text)
     if len(brief_text) > 4000:
         brief_text = brief_text[:3990] + "…"
     e = discord.Embed(title=title, description=brief_text, color=color)
@@ -830,10 +1019,13 @@ def build_brief_embed(text: str, session: str, phase: str) -> discord.Embed:
     return e
 
 def build_risk_embed(risk_text: str) -> discord.Embed:
-    """Build a yellow risk flag embed."""
+    """Build a yellow risk flag embed with markdown tables wrapped in code blocks."""
+    body = wrap_markdown_tables(risk_text)
+    if len(body) > 4000:
+        body = body[:3990] + "…"
     e = discord.Embed(
         title="⚠️ Session Risk Flag",
-        description=risk_text[:4000],
+        description=body,
         color=COLOR_RISK,
     )
     e.set_footer(text=FOOTER)
@@ -841,6 +1033,7 @@ def build_risk_embed(risk_text: str) -> discord.Embed:
 
 def build_regime_embed(text: str) -> discord.Embed:
     """Build the daily regime outlook embed."""
+    text = wrap_markdown_tables(text)
     if len(text) > 4000:
         text = text[:3990] + "…"
     e = discord.Embed(
@@ -1185,12 +1378,7 @@ async def _privy_refresh_verbose() -> tuple[bool, int, str, list[str]]:
             resp = await client.post(
                 PRIVY_SESSION_URL,
                 json={"refresh_token": rt},
-                headers={
-                    "privy-app-id": PRIVY_APP_ID,
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                    "privy-client": "react-auth:2.0.0",
-                },
+                headers=_privy_headers(),
             )
     except Exception as e:
         return False, 0, f"{type(e).__name__}: {e}", []
