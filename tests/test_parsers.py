@@ -570,5 +570,125 @@ def test_privy_refresh_variants_omit_access_variant_when_no_access_token():
     assert "snake_body+bearer_access" not in names
 
 
+# --- Round 5 Task 1: orphan opening/closing tags ---
+
+def test_sanitize_strips_orphan_anchor_close_in_sentence():
+    text = (
+        "BTC is testing the $74.4K long liquidation cluster gets hunted.</Anchor>\n"
+        "Next sentence continues."
+    )
+    out = bot.sanitize_tn_text(text)
+    assert "</Anchor>" not in out
+    assert "Anchor" not in out
+    # Surrounding text must be intact.
+    assert "$74.4K" in out
+    assert "Next sentence continues." in out
+
+
+def test_sanitize_strips_orphan_opening_tag():
+    """An orphan <Foo attr='x'> with no matching close still gets stripped."""
+    text = "before <Foo attr='x'> after"
+    out = bot.sanitize_tn_text(text)
+    assert "<Foo" not in out and ">" not in out
+    assert "before" in out and "after" in out
+
+
+def test_sanitize_keeps_paired_inner_text_before_orphan_pass():
+    """Paired tags must still keep their inner text — the orphan pass doesn't strip them first."""
+    text = "say <em>hello</em> world"
+    assert bot.sanitize_tn_text(text) == "say hello world"
+
+
+# --- Round 5 Task 2: stale date override ---
+
+def test_strip_stale_dates_removes_long_form_dates():
+    text = "As of Apr 19, 2025, BTC trades at 67k.\nNext line."
+    out = bot._strip_stale_dates(text)
+    assert "Apr 19, 2025" not in out
+    assert "BTC trades at 67k" in out
+    assert "Next line." in out
+
+
+def test_strip_stale_dates_removes_iso_dates_and_orphan_labels():
+    text = "Date: 2025-04-19\nReport: BTC steady."
+    out = bot._strip_stale_dates(text)
+    assert "2025-04-19" not in out
+    assert "Date:" not in out
+    assert "BTC steady" in out
+
+
+def test_strip_stale_dates_no_op_on_clean_text():
+    text = "BTC reclaimed VWAP. ETH lagging."
+    assert bot._strip_stale_dates(text) == text
+
+
+# --- Round 5 Task 3: section-aware truncation ---
+
+def test_truncate_does_not_leave_dangling_section_header():
+    """A truncate that lands right after '5.' must back up to the previous sentence."""
+    text = (
+        "1. Macro: dovish tone holding.\n"
+        "2. BTC: reclaimed weekly VWAP at 67k.\n"
+        "3. ETH: lagging the majors.\n"
+        "4. SOL: relative strength.\n"
+        "5. Risks ahead — multiple catalysts queued for the next 48 hours.\n"
+    )
+    # Force a truncation right around section "5.". Pick a limit that lands just
+    # after the "5." marker but before the body.
+    truncate_at = text.index("5.") + 3
+    out = bot._truncate_at_sentence(text, truncate_at)
+    # Output must not end with a dangling "5." style header.
+    body = out.rstrip("…").rstrip()
+    last_line = body.rsplit("\n", 1)[-1].strip()
+    assert not re.match(r'^\d+\.+\s*$', last_line), f"dangling header in {out!r}"
+
+
+def test_strip_dangling_header_removes_orphan_number_lines():
+    assert bot._strip_dangling_header("body.\n5.") == "body."
+    assert bot._strip_dangling_header("body.\n5....") == "body."
+    assert bot._strip_dangling_header("body.") == "body."
+    assert bot._strip_dangling_header("body.\n5. body") == "body.\n5. body"
+
+
+# --- Round 5 Task 4: leading/trailing --- stripped from risk flag ---
+
+def test_extract_risk_flag_strips_trailing_horizontal_rule():
+    text = (
+        "**Session Risk Flag**\n\n"
+        "FOMC at 18:00 UTC. Reduce size into print.\n\n"
+        "---\n"
+    )
+    body = bot.extract_risk_flag(text)
+    assert body is not None
+    assert body.endswith("Reduce size into print."), f"trailing --- leaked: {body!r}"
+
+
+def test_extract_risk_flag_strips_leading_horizontal_rule():
+    text = (
+        "**Session Risk Flag**\n\n"
+        "---\n\n"
+        "FOMC at 18:00 UTC. Reduce size."
+    )
+    body = bot.extract_risk_flag(text)
+    assert body is not None
+    assert body.startswith("FOMC")
+
+
+def test_extract_risk_flag_preserves_inner_table_rows():
+    """Tables inside the body must stay (they get fenced by build_risk_embed)."""
+    text = (
+        "**Risk Flag**\n\n"
+        "| Catalyst | Time |\n"
+        "|----------|------|\n"
+        "| CPI      | 13:30|\n\n"
+        "Reduce size.\n"
+        "---\n"
+    )
+    body = bot.extract_risk_flag(text)
+    assert body is not None
+    assert "| Catalyst" in body
+    assert body.endswith("Reduce size.")
+
+
 # re needs to be accessible in the test module for regex-based assertions above.
 import re  # noqa: E402

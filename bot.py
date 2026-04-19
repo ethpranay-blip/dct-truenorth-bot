@@ -866,6 +866,11 @@ _GENERIC_PAIRED_RE = re.compile(
     r'<([a-zA-Z][a-zA-Z0-9]*)(?:\s+[^>]*)?>(.*?)</\1>',
     re.DOTALL,
 )
+# Orphan tags left over after the paired pass: standalone </Foo> closes or
+# <Bar attr="x"> opens whose match was outside the captured slice (e.g. when
+# TrueNorth truncates mid-paragraph).
+_ORPHAN_CLOSING_RE = re.compile(r'</[a-zA-Z][a-zA-Z0-9]*\s*>')
+_ORPHAN_OPENING_RE = re.compile(r'<[a-zA-Z][a-zA-Z0-9]*(?:\s+[^>]*)?>')
 _DUP_SPACE_RE = re.compile(r'[ \t]{2,}')
 
 
@@ -916,6 +921,10 @@ def sanitize_tn_text(text: str) -> str:
         if new == text:
             break
         text = new
+    # Orphan tags (no surviving partner) — must run AFTER paired-tag handling
+    # so we don't accidentally chew away a valid wrapper before it's processed.
+    text = _ORPHAN_CLOSING_RE.sub("", text)
+    text = _ORPHAN_OPENING_RE.sub("", text)
     # Tidy up double spaces left by tag removal, but preserve newlines/indentation.
     text = _DUP_SPACE_RE.sub(" ", text)
     # Trim spaces before line breaks for cleaner table alignment.
@@ -1008,17 +1017,51 @@ def dedupe_tn_text(text: str) -> str:
     return dedupe_contiguous_lines(dedupe_repeated_substrings(text))
 
 
+_HEADER_LINE_RE = re.compile(r'^\s*(?:\d+[\.\)]|#{1,6})\s')
+# A line that is JUST a section number with no content (e.g. "5." or "5...."),
+# usually left behind when the truncate cuts mid-header.
+_DANGLING_HEADER_RE = re.compile(r'^\s*\d+[\.\)]+\s*\d*\s*$')
+
+
 def _truncate_at_sentence(text: str, limit: int) -> str:
-    """Truncate to <=limit chars, preferring the last sentence boundary."""
+    """Truncate to <=limit chars, preferring the last sentence boundary.
+
+    If the chosen cut would leave a dangling section-header line behind
+    (e.g. ``"5."`` or ``"5...."`` from a numbered list), back up to the
+    previous sentence boundary so the embed doesn't end with an orphan header.
+    """
     if len(text) <= limit:
-        return text
+        return _strip_dangling_header(text)
     cut = text[: limit - 1]
-    # Find the latest sentence terminator within the cut.
+
+    candidates: list[int] = []
     for term in (". ", "! ", "? ", ".\n", "!\n", "?\n"):
         idx = cut.rfind(term)
-        if idx >= limit * 0.5:  # avoid chopping the entire body off
-            return cut[: idx + 1].rstrip() + "…"
-    return cut.rstrip() + "…"
+        if idx >= limit * 0.5:
+            candidates.append(idx + 1)
+    candidates.sort(reverse=True)
+
+    for end_idx in candidates:
+        snippet = cut[:end_idx].rstrip()
+        # Reject snippets whose final line is a header (numbered or hashed) —
+        # that means the truncate landed right after the header marker but
+        # before the body, which renders as just "5." in Discord.
+        last_line = snippet.rsplit("\n", 1)[-1]
+        if _HEADER_LINE_RE.match(last_line):
+            continue
+        return _strip_dangling_header(snippet) + "…"
+
+    return _strip_dangling_header(cut.rstrip()) + "…"
+
+
+def _strip_dangling_header(text: str) -> str:
+    """Remove a trailing line that is just a numbered header (no body)."""
+    if not text:
+        return text
+    lines = text.rstrip().split("\n")
+    while lines and _DANGLING_HEADER_RE.match(lines[-1]):
+        lines.pop()
+    return "\n".join(lines).rstrip()
 
 
 def wrap_markdown_tables(text: str) -> str:
@@ -1135,12 +1178,28 @@ _RISK_BODY_TERMINATOR_RE = re.compile(
 )
 
 
+_HR_LINE_RE = re.compile(r'^\s*-{3,}\s*$')
+
+
+def _strip_hr_edges(body: str) -> str:
+    """Trim leading/trailing horizontal-rule lines (and surrounding blank lines)."""
+    if not body:
+        return body
+    lines = body.split("\n")
+    while lines and (not lines[0].strip() or _HR_LINE_RE.match(lines[0])):
+        lines.pop(0)
+    while lines and (not lines[-1].strip() or _HR_LINE_RE.match(lines[-1])):
+        lines.pop()
+    return "\n".join(lines)
+
+
 def extract_risk_flag(text: str) -> str | None:
     """Pull out a Session Risk Flag section if present.
 
     Greedy on body, terminating only at the next clear heading or end of text.
-    Tables and horizontal rules inside the body are preserved so callers can
-    code-block-wrap them for Discord rendering.
+    Tables inside the body are preserved so callers can code-block-wrap them.
+    Leading and trailing ``---`` rule lines are stripped — they create an ugly
+    empty line at the bottom of the embed.
     """
     if not text:
         return None
@@ -1150,7 +1209,7 @@ def extract_risk_flag(text: str) -> str | None:
     rest = text[m.end():]
     end = _RISK_BODY_TERMINATOR_RE.search(rest)
     body = rest[: end.start()] if end else rest
-    body = body.strip()
+    body = _strip_hr_edges(body.strip())
     return body or None
 
 # --- Embed builders ---
@@ -1202,13 +1261,39 @@ def _first_prose_paragraph(text: str) -> str:
     return ""
 
 
+# Stale dates regularly leak from TN's training horizon (e.g. "Apr 19, 2025")
+# even when the rest of the analysis is current. Strip them and rely on the
+# embed title for the authoritative date.
+_STALE_DATE_RE = re.compile(
+    r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?,?\s+20\d{2}\b',
+    re.IGNORECASE,
+)
+_ISO_DATE_RE = re.compile(r'\b20\d{2}-\d{2}-\d{2}\b')
+
+
+def _strip_stale_dates(text: str, replacement: str = "") -> str:
+    """Strip 'Mon DD, YYYY' and ISO date strings; collapse the empty lines they leave behind."""
+    if not text:
+        return text
+    text = _STALE_DATE_RE.sub(replacement, text)
+    text = _ISO_DATE_RE.sub(replacement, text)
+    # Tidy up "Date: " orphans and lonely commas/parens left behind.
+    text = re.sub(r'(?im)^\s*(?:as of|date)\s*:\s*\.?\s*$', '', text)
+    text = re.sub(r'\(\s*\)', '', text)
+    text = re.sub(r'\s+,', ',', text)
+    text = re.sub(r' {2,}', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
 def build_brief_embed(text: str, session: str, phase: str) -> discord.Embed:
     """Build a session brief embed (analysis portion, no trades)."""
     colors = {"asia": COLOR_ASIA, "london": COLOR_LONDON, "us": COLOR_US}
     labels = {"asia": "Asia", "london": "London", "us": "US"}
     color = colors.get(session, COLOR_INFO)
     label = labels.get(session, session.title())
-    title = f"📊 {label} Session -- {phase}"
+    today = datetime.now(IST).strftime("%b %d, %Y")
+    title = f"📊 {label} Session — {phase} · {today}"
     brief_text = text
     trade_start = re.search(r'\$[A-Z]+\s*\|?\s*(?:LONG|SHORT)', text, re.IGNORECASE)
     if trade_start:
@@ -1216,6 +1301,7 @@ def build_brief_embed(text: str, session: str, phase: str) -> discord.Embed:
     risk_start = _RISK_HEADING_RE.search(brief_text)
     if risk_start:
         brief_text = brief_text[:risk_start.start()].strip()
+    brief_text = _strip_stale_dates(brief_text)
     brief_text = dedupe_tn_text(brief_text)
     summary = _first_prose_paragraph(brief_text)
     body = wrap_markdown_tables(brief_text)
