@@ -452,5 +452,123 @@ def test_tn_default_read_timeout_is_at_least_240():
     assert bot.TN_RETRY_READ_TIMEOUT >= bot.TN_DEFAULT_READ_TIMEOUT
 
 
+# --- Task 2: lowercase tags + <sp> tool-use markup ---
+
+def test_sanitize_strips_sp_paired_tool_markup():
+    """The <sp p="…">…</sp> Claude tool-use markup must vanish entirely from TN output."""
+    text = (
+        "Brief content.\n"
+        '<sp p="deriv">Full liq cascade path: BTC at $76k</sp>\n'
+        '<sp p="setup">Long bias unless 4H closes below 75k</sp>\n'
+        "More analysis here."
+    )
+    out = bot.sanitize_tn_text(text)
+    assert "<sp" not in out
+    assert "</sp>" not in out
+    assert "deriv" not in out, f"sp inner content leaked: {out!r}"
+    assert "setup" not in out
+    assert "Brief content." in out
+    assert "More analysis here." in out
+
+
+def test_sanitize_strips_lowercase_self_closing_and_paired():
+    # Lowercase self-closing tag — drop entirely.
+    assert bot.sanitize_tn_text("a <foo bar='x' /> b") == "a b"
+    # Lowercase paired tag — keep inner text, drop wrapper (only <sp> is special-cased).
+    assert bot.sanitize_tn_text("a <em>hello</em> b") == "a hello b"
+    # Orphan <sp> opener (truncated stream) is also stripped.
+    assert bot.sanitize_tn_text("text <sp p='deriv'> trailing") == "text trailing"
+
+
+# --- Task 3: SSE chunk stitching + dedup ---
+
+def test_stitch_sse_chunks_dedupes_overlapping_tail_head():
+    chunks = [
+        "Events are down. Let me pull TA on the top RS names.",
+        "Events are down. Let me pull TA on the top RS names. Now BTC sits at 67k.",
+    ]
+    out = bot.stitch_sse_chunks(chunks)
+    # The duplicate prefix from chunk[1] must be removed.
+    assert out.count("Events are down. Let me pull TA") == 1
+    assert "Now BTC sits at 67k." in out
+
+
+def test_stitch_sse_chunks_handles_empty_and_unique():
+    assert bot.stitch_sse_chunks([]) == ""
+    assert bot.stitch_sse_chunks(["", "hello", "", " world"]) == "hello world"
+
+
+def test_dedupe_contiguous_lines_drops_immediate_repeats():
+    text = "Foo\nBar\nBar\nBaz\nBaz\nBaz\nQux"
+    out = bot.dedupe_contiguous_lines(text)
+    lines = [l for l in out.split("\n") if l]
+    assert lines == ["Foo", "Bar", "Baz", "Qux"]
+
+
+def test_dedupe_repeated_substrings_collapses_adjacent_blocks():
+    block = "BTC reclaimed VWAP and is consolidating at 67k."
+    text = block + block  # two identical blocks back-to-back
+    out = bot.dedupe_repeated_substrings(text)
+    assert out.count(block) == 1
+
+
+def test_dedupe_tn_text_pipeline_no_change_for_clean_text():
+    """Clean prose must round-trip unchanged (idempotent on non-duplicated input)."""
+    clean = "BTC at 67k. ETH at 3.4k. Risk-on tone holding."
+    assert bot.dedupe_tn_text(clean) == clean
+
+
+# --- Task 5: brief embed prose extraction ---
+
+def test_first_prose_paragraph_skips_tables_and_bullets():
+    text = (
+        "| col1 | col2 |\n|------|------|\n| 1 | 2 |\n\n"
+        "- bullet one\n- bullet two\n\n"
+        "Bitcoin is trading at 67,450 with neutral RSI on the 1H.\n\n"
+        "More content."
+    )
+    summary = bot._first_prose_paragraph(text)
+    assert summary.startswith("Bitcoin")
+
+
+def test_truncate_at_sentence_prefers_sentence_boundary():
+    text = "First sentence. Second sentence. Third sentence."
+    out = bot._truncate_at_sentence(text, 20)
+    # Should end with the ellipsis after a sentence terminator (period/exclaim/question).
+    assert out.endswith("…")
+    # The text body before the ellipsis must end at a sentence terminator.
+    body = out[:-1].rstrip()
+    assert body and body[-1] in ".!?", f"truncated body {body!r} did not end at sentence boundary"
+
+
+# --- Task 1: Privy refresh variant probing ---
+
+def test_privy_refresh_variants_cover_required_shapes():
+    variants = bot._privy_refresh_variants("rt-fake", "at-fake")
+    names = [v["name"] for v in variants]
+    assert "snake_body" in names
+    assert "snake_body+bearer_refresh" in names
+    assert "camel_body" in names
+    assert "bearer_refresh_only" in names
+    assert "snake_body+bearer_access" in names
+
+    # Verify the body/header shapes themselves.
+    by_name = {v["name"]: v for v in variants}
+    assert by_name["snake_body"]["body"] == {"refresh_token": "rt-fake"}
+    assert by_name["camel_body"]["body"] == {"refreshToken": "rt-fake"}
+    assert by_name["bearer_refresh_only"]["body"] == {}
+    assert by_name["snake_body+bearer_refresh"]["headers"]["Authorization"] == "Bearer rt-fake"
+    assert by_name["snake_body+bearer_access"]["headers"]["Authorization"] == "Bearer at-fake"
+    # Origin/Referer must be present in every variant (Task 2 from prior round).
+    for v in variants:
+        assert v["headers"]["Origin"] == bot.TN_APP_ORIGIN
+
+
+def test_privy_refresh_variants_omit_access_variant_when_no_access_token():
+    variants = bot._privy_refresh_variants("rt-only", "")
+    names = [v["name"] for v in variants]
+    assert "snake_body+bearer_access" not in names
+
+
 # re needs to be accessible in the test module for regex-based assertions above.
 import re  # noqa: E402

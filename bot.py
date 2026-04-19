@@ -409,6 +409,8 @@ async def _tn_call_once(
                     if isinstance(inner, dict):
                         content = inner.get("content", "")
                         if content:
+                            if TN_DEBUG:
+                                print(f"[Stream] +chunk len={len(content)}: {content[:80]!r}")
                             chunks.append(content)
                 elif event_type == "error":
                     payload = obj.get("data") or obj
@@ -433,8 +435,11 @@ async def _tn_call_once(
                     else:
                         # benign informational detail — ignore
                         pass
-    text = "".join(chunks).strip()
-    print(f"[TN STREAM] chunks={len(chunks)} text_len={len(text)} completed={completed} sse_error={sse_error}")
+    text = stitch_sse_chunks(chunks).strip()
+    print(
+        f"[TN STREAM] chunks={len(chunks)} stitched_len={len(text)} "
+        f"completed={completed} sse_error={sse_error}"
+    )
     return text, status, err_snippet, sse_error, completed
 
 
@@ -533,8 +538,12 @@ async def query_truenorth(
 
     if text:
         tn_state["last_success_at"] = datetime.now(IST)
-        print(f"[TN RESULT] {len(text)} chars (completed={completed}, last_success_at updated)")
-        return sanitize_tn_text(text)
+        cleaned = dedupe_tn_text(sanitize_tn_text(text))
+        print(
+            f"[TN RESULT] raw={len(text)} cleaned={len(cleaned)} chars "
+            f"(completed={completed}, last_success_at updated)"
+        )
+        return cleaned
 
     # Decide whether this final-failure path warrants a Discord alert.
     # Only alert on real failures, not on a 200 OK that returned an empty stream.
@@ -624,61 +633,110 @@ def _mask(tok: str) -> str:
     return f"{tok[:8]}…{tok[-4:]} (len={len(tok)})"
 
 
-async def refresh_tn_token() -> bool:
-    """Refresh TN access token via Privy. Returns True on success, False otherwise.
+def _privy_refresh_variants(refresh_token: str, access_token: str) -> list[dict]:
+    """Body+header variants we'll try in order until one returns 200.
 
-    Logs the HTTP status, response keys, and (truncated) body on every path so
-    the next failure is fully diagnosable in Railway logs.
+    Privy's session endpoint isn't publicly documented for direct calls; SDK
+    integrations differ in body shape. We probe the common shapes and cache
+    the first one that works in `_privy_refresh_variant`.
     """
+    base = _privy_headers()
+    rt_bearer = {**base, "Authorization": f"Bearer {refresh_token}"}
+    at_bearer = {**base, "Authorization": f"Bearer {access_token}"} if access_token else None
+    variants = [
+        # 1) Original spec shape (current default).
+        {"name": "snake_body", "body": {"refresh_token": refresh_token}, "headers": base},
+        # 2) Same body + bearer header carrying the refresh token.
+        {"name": "snake_body+bearer_refresh", "body": {"refresh_token": refresh_token}, "headers": rt_bearer},
+        # 3) camelCase body field.
+        {"name": "camel_body", "body": {"refreshToken": refresh_token}, "headers": base},
+        # 4) Empty body, refresh-token in bearer header.
+        {"name": "bearer_refresh_only", "body": {}, "headers": rt_bearer},
+    ]
+    if at_bearer:
+        # 5) Body + bearer header carrying current ACCESS token (some OAuth flows).
+        variants.append(
+            {"name": "snake_body+bearer_access", "body": {"refresh_token": refresh_token}, "headers": at_bearer},
+        )
+    return variants
+
+
+# Cache the first variant that ever returns 200 so we stop probing.
+_privy_refresh_variant: str | None = None
+
+
+async def _privy_attempt(client: httpx.AsyncClient, body: dict, headers: dict) -> tuple[int, str, dict | None]:
+    resp = await client.post(PRIVY_SESSION_URL, json=body, headers=headers)
+    status = resp.status_code
+    body_preview = resp.text[:500]
+    parsed: dict | None = None
+    if status == 200:
+        try:
+            parsed = resp.json() if isinstance(resp.json(), dict) else None
+        except Exception:
+            parsed = None
+    return status, body_preview, parsed
+
+
+async def refresh_tn_token() -> bool:
+    """Refresh TN access token via Privy. Tries multiple body/header shapes.
+
+    Returns True on success. Logs each attempt's status + body preview so the
+    next failure is fully diagnosable in Railway logs. Stops on the first 200
+    and caches the working variant for subsequent refreshes.
+    """
+    global _privy_refresh_variant
     rt = token_store["refresh"]
+    at = token_store.get("access", "")
     if not rt:
         print("[TokenRefresh] TN_REFRESH_TOKEN not set -- skipping")
         return False
     print(f"[TokenRefresh] POST {PRIVY_SESSION_URL} refresh={_mask(rt)} app_id={PRIVY_APP_ID}")
+    all_variants = _privy_refresh_variants(rt, at)
+    if _privy_refresh_variant:
+        # Try the cached variant first; fall through to others if it stopped working.
+        all_variants.sort(key=lambda v: 0 if v["name"] == _privy_refresh_variant else 1)
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                PRIVY_SESSION_URL,
-                json={"refresh_token": rt},
-                headers=_privy_headers(),
-            )
-            status = resp.status_code
-            body_preview = resp.text[:500]
-            print(f"[TokenRefresh] status={status} body={body_preview}")
-            if status != 200:
-                return False
-            try:
-                data = resp.json()
-            except Exception as e:
-                print(f"[TokenRefresh] JSON parse failed: {e}")
-                return False
-            if not isinstance(data, dict):
-                print(f"[TokenRefresh] unexpected response type: {type(data).__name__}")
-                return False
-            print(f"[TokenRefresh] response keys: {sorted(data.keys())}")
-            new_access = (
-                data.get("token")
-                or data.get("access_token")
-                or data.get("identity_token")
-                or data.get("privy_access_token")
-            )
-            new_refresh = (
-                data.get("refresh_token")
-                or data.get("privy_refresh_token")
-            )
-            if not new_access:
-                print("[TokenRefresh] 200 OK but no access-token field found in response")
-                return False
-            token_store["access"] = new_access
-            if new_refresh:
-                token_store["refresh"] = new_refresh
-                print(f"[TokenRefresh] refresh token rotated: {_mask(new_refresh)}")
-            _save_token_cache(token_store["access"], token_store["refresh"])
-            exp = decode_jwt_exp(token_store["access"])
-            print(f"[TokenRefresh] ok; access exp={exp}")
-            return True
+            for variant in all_variants:
+                name = variant["name"]
+                try:
+                    status, body_preview, data = await _privy_attempt(
+                        client, variant["body"], variant["headers"],
+                    )
+                except Exception as e:
+                    print(f"[TokenRefresh] variant={name} network error: {type(e).__name__}: {e}")
+                    continue
+                print(f"[TokenRefresh] variant={name} status={status} body={body_preview}")
+                if status != 200 or not isinstance(data, dict):
+                    continue
+                print(f"[TokenRefresh] variant={name} response keys: {sorted(data.keys())}")
+                new_access = (
+                    data.get("token")
+                    or data.get("access_token")
+                    or data.get("identity_token")
+                    or data.get("privy_access_token")
+                )
+                new_refresh = (
+                    data.get("refresh_token")
+                    or data.get("privy_refresh_token")
+                )
+                if not new_access:
+                    print(f"[TokenRefresh] variant={name} 200 OK but no access-token field")
+                    continue
+                token_store["access"] = new_access
+                if new_refresh:
+                    token_store["refresh"] = new_refresh
+                    print(f"[TokenRefresh] refresh token rotated: {_mask(new_refresh)}")
+                _save_token_cache(token_store["access"], token_store["refresh"])
+                _privy_refresh_variant = name
+                exp = decode_jwt_exp(token_store["access"])
+                print(f"[TokenRefresh] ok via variant={name}; access exp={exp}")
+                return True
+        print("[TokenRefresh] all variants failed; see status/body for each above")
+        return False
     except Exception as e:
-        print(f"[TokenRefresh] {type(e).__name__}: {e}")
+        print(f"[TokenRefresh] fatal: {type(e).__name__}: {e}")
         traceback.print_exc()
         return False
 
@@ -797,8 +855,17 @@ _TICKER_HEADER_RE = re.compile(r'\$[A-Z]{1,10}\s*\|\s*(LONG|SHORT)\b', re.IGNORE
 _TOKEN_TAG_RE = re.compile(r'<\s*Token\b[^>]*/?>', re.IGNORECASE)
 _TOKEN_SYMBOL_ATTR_RE = re.compile(r'tokenSymbol\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
 _ANCHOR_TAG_RE = re.compile(r'<\s*Anchor\b[^>]*/?>', re.IGNORECASE)
-# Generic fallback for any remaining self-closing capitalised XML-like tag.
-_GENERIC_TAG_RE = re.compile(r'<[A-Z][a-zA-Z]*(?:\s+[^>]*)?/>')
+# TrueNorth's "suggested prompts" markup: <sp p="deriv">…</sp>. Useless in Discord — drop entirely.
+_SP_PAIRED_RE = re.compile(r'<\s*sp\b[^>]*>.*?<\s*/\s*sp\s*>', re.DOTALL | re.IGNORECASE)
+_SP_OPEN_RE = re.compile(r'<\s*sp\b[^>]*/?>', re.IGNORECASE)
+_SP_CLOSE_RE = re.compile(r'<\s*/\s*sp\s*>', re.IGNORECASE)
+# Generic self-closing tag (any case).
+_GENERIC_SELF_CLOSING_RE = re.compile(r'<[a-zA-Z][a-zA-Z0-9]*(?:\s+[^>]*)?\s*/>')
+# Generic paired tag — keep inner text, drop wrapper. Names captured for backref.
+_GENERIC_PAIRED_RE = re.compile(
+    r'<([a-zA-Z][a-zA-Z0-9]*)(?:\s+[^>]*)?>(.*?)</\1>',
+    re.DOTALL,
+)
 _DUP_SPACE_RE = re.compile(r'[ \t]{2,}')
 
 
@@ -816,22 +883,142 @@ def strip_token_tags(text: str) -> str:
 def sanitize_tn_text(text: str) -> str:
     """Single chokepoint: scrub all TrueNorth-specific markup before downstream consumers.
 
-    - <Token tokenSymbol="X" .../> → $X
-    - <Anchor annotationId="..." /> → removed (no user value)
-    - Any other self-closing <Capitalised .../> tag → removed
-    - Stray </Token> closing tags → removed
-    - Collapse runs of intra-line whitespace produced by tag removal
+    Order matters: handle the named tags TrueNorth ships first, then the generic
+    fallbacks so they don't accidentally swallow inner content of named tags.
+
+    - <Token tokenSymbol="X" .../>            → $X
+    - <Anchor annotationId="..." />           → removed (no user value)
+    - <sp p="...">…</sp>                      → removed entirely (Claude tool-use markup)
+    - other self-closing <tag .../>           → removed
+    - other paired <tag>inner</tag>           → keep inner, drop wrapper
+    - Stray </Token>                          → removed
+    - Collapse intra-line whitespace, trim trailing spaces before newlines.
     """
     if not text:
         return text
     text = strip_token_tags(text)
     text = _ANCHOR_TAG_RE.sub("", text)
-    text = _GENERIC_TAG_RE.sub("", text)
+    # Drop entire <sp …>…</sp> elements first (paired). Apply twice in case of nesting.
+    for _ in range(2):
+        new = _SP_PAIRED_RE.sub("", text)
+        if new == text:
+            break
+        text = new
+    # Then drop any orphan <sp …> openings/closings that survived (truncated stream, etc).
+    text = _SP_OPEN_RE.sub("", text)
+    text = _SP_CLOSE_RE.sub("", text)
+    # Generic self-closing tags (covers any leftover Capitalised or lowercase).
+    text = _GENERIC_SELF_CLOSING_RE.sub("", text)
+    # Generic paired tags: keep the inner text, drop the wrapper. Apply iteratively
+    # to handle nesting like <a><b>x</b></a>.
+    for _ in range(3):
+        new = _GENERIC_PAIRED_RE.sub(lambda m: m.group(2), text)
+        if new == text:
+            break
+        text = new
     # Tidy up double spaces left by tag removal, but preserve newlines/indentation.
     text = _DUP_SPACE_RE.sub(" ", text)
     # Trim spaces before line breaks for cleaner table alignment.
     text = re.sub(r' +\n', '\n', text)
     return text
+
+
+# --- SSE chunk stitching (Task 3 + 4) -----------------------------------------
+TN_DEBUG = os.environ.get("TN_DEBUG", "").lower() in ("1", "true", "yes")
+
+
+def stitch_sse_chunks(chunks: list[str]) -> str:
+    """Join chunks while removing overlap between consecutive chunks.
+
+    TrueNorth's SSE stream sometimes re-emits the tail of the previous frame at
+    the head of the next frame (and occasionally the entire previous preamble).
+    Plain "".join produces visible duplications. This walks chunk-by-chunk and
+    drops the longest prefix of each new chunk that already matches the running
+    output's suffix (capped at 400 chars to keep this O(N·k)).
+    """
+    out_parts: list[str] = []
+    running: str = ""
+    for raw in chunks:
+        if not raw:
+            continue
+        if running:
+            cap = min(len(running), len(raw), 400)
+            overlap = 0
+            for n in range(cap, 0, -1):
+                if running.endswith(raw[:n]):
+                    overlap = n
+                    break
+            if overlap:
+                if TN_DEBUG:
+                    print(f"[Stream] dropped {overlap}-char overlap from chunk len={len(raw)}")
+                raw = raw[overlap:]
+        if raw:
+            out_parts.append(raw)
+            running += raw
+    return "".join(out_parts)
+
+
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
+
+
+def dedupe_contiguous_lines(text: str) -> str:
+    """Drop a line that immediately repeats the previous non-blank line."""
+    if not text:
+        return text
+    out: list[str] = []
+    last_non_blank: str | None = None
+    for line in text.split("\n"):
+        s = line.strip()
+        if s and s == last_non_blank:
+            continue
+        out.append(line)
+        if s:
+            last_non_blank = s
+    return "\n".join(out)
+
+
+def dedupe_repeated_substrings(text: str, min_len: int = 30, max_len: int = 400) -> str:
+    """Collapse adjacent identical substrings (helps when an entire preamble repeats)."""
+    if not text or len(text) < 2 * min_len:
+        return text
+    i = 0
+    out: list[str] = []
+    n = len(text)
+    while i < n:
+        cap = min((n - i) // 2, max_len)
+        match = 0
+        if cap >= min_len:
+            for k in range(cap, min_len - 1, -1):
+                if text[i:i + k] == text[i + k:i + 2 * k]:
+                    match = k
+                    break
+        if match:
+            out.append(text[i:i + match])
+            if TN_DEBUG:
+                print(f"[Stream] collapsed {match}-char repeat at offset {i}")
+            i += 2 * match
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def dedupe_tn_text(text: str) -> str:
+    """Pipeline: substring repeats → contiguous-line repeats."""
+    return dedupe_contiguous_lines(dedupe_repeated_substrings(text))
+
+
+def _truncate_at_sentence(text: str, limit: int) -> str:
+    """Truncate to <=limit chars, preferring the last sentence boundary."""
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    # Find the latest sentence terminator within the cut.
+    for term in (". ", "! ", "? ", ".\n", "!\n", "?\n"):
+        idx = cut.rfind(term)
+        if idx >= limit * 0.5:  # avoid chopping the entire body off
+            return cut[: idx + 1].rstrip() + "…"
+    return cut.rstrip() + "…"
 
 
 def wrap_markdown_tables(text: str) -> str:
@@ -996,6 +1183,25 @@ def build_trade_embeds(trades: list[dict]) -> list[discord.Embed]:
         embeds.append(e)
     return embeds
 
+def _first_prose_paragraph(text: str) -> str:
+    """Return the first non-empty paragraph that isn't a table or bullet list."""
+    for para in re.split(r'\n\s*\n', text):
+        s = para.strip()
+        if not s:
+            continue
+        lines = [ln.strip() for ln in s.split("\n") if ln.strip()]
+        if not lines:
+            continue
+        # Skip if this paragraph is entirely a table.
+        if all(ln.startswith("|") for ln in lines):
+            continue
+        # Skip pure bullet lists.
+        if all(ln[:1] in "-*•" for ln in lines):
+            continue
+        return s
+    return ""
+
+
 def build_brief_embed(text: str, session: str, phase: str) -> discord.Embed:
     """Build a session brief embed (analysis portion, no trades)."""
     colors = {"asia": COLOR_ASIA, "london": COLOR_LONDON, "us": COLOR_US}
@@ -1010,10 +1216,14 @@ def build_brief_embed(text: str, session: str, phase: str) -> discord.Embed:
     risk_start = _RISK_HEADING_RE.search(brief_text)
     if risk_start:
         brief_text = brief_text[:risk_start.start()].strip()
-    brief_text = wrap_markdown_tables(brief_text)
-    if len(brief_text) > 4000:
-        brief_text = brief_text[:3990] + "…"
-    e = discord.Embed(title=title, description=brief_text, color=color)
+    brief_text = dedupe_tn_text(brief_text)
+    summary = _first_prose_paragraph(brief_text)
+    body = wrap_markdown_tables(brief_text)
+    body = _truncate_at_sentence(body, 4000)
+    e = discord.Embed(title=title, description=body, color=color)
+    if summary and len(summary) <= 1024 and not body.lstrip().startswith(summary[:60]):
+        # Promote the regime summary to a top field when it isn't already at the top.
+        e.add_field(name="Market Regime", value=summary, inline=False)
     e.set_footer(text=FOOTER)
     e.timestamp = datetime.now(IST)
     return e
@@ -1368,62 +1578,67 @@ async def winrate(ctx: commands.Context):
     e.set_footer(text=FOOTER)
     await ctx.send(embed=e)
 
-async def _privy_refresh_verbose() -> tuple[bool, int, str, list[str]]:
-    """Run refresh once and return (ok, status, body_preview, response_keys) for Discord display."""
+async def _privy_refresh_verbose() -> tuple[bool, list[tuple[str, int, str]]]:
+    """Run every refresh variant and report (ok, [(name, status, body_preview), ...])."""
     rt = token_store["refresh"]
+    at = token_store.get("access", "")
     if not rt:
-        return False, 0, "TN_REFRESH_TOKEN not set", []
+        return False, [("(no token)", 0, "TN_REFRESH_TOKEN not set")]
+    attempts: list[tuple[str, int, str]] = []
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                PRIVY_SESSION_URL,
-                json={"refresh_token": rt},
-                headers=_privy_headers(),
-            )
-    except Exception as e:
-        return False, 0, f"{type(e).__name__}: {e}", []
-    status = resp.status_code
-    body = resp.text[:400]
-    keys: list[str] = []
-    if status == 200:
-        try:
-            data = resp.json()
-            if isinstance(data, dict):
-                keys = sorted(data.keys())
+            for variant in _privy_refresh_variants(rt, at):
+                name = variant["name"]
+                try:
+                    status, body_preview, data = await _privy_attempt(
+                        client, variant["body"], variant["headers"],
+                    )
+                except Exception as e:
+                    attempts.append((name, 0, f"{type(e).__name__}: {e}"))
+                    continue
+                attempts.append((name, status, body_preview))
+                if status != 200 or not isinstance(data, dict):
+                    continue
                 new_access = (
-                    data.get("token")
-                    or data.get("access_token")
-                    or data.get("identity_token")
-                    or data.get("privy_access_token")
+                    data.get("token") or data.get("access_token")
+                    or data.get("identity_token") or data.get("privy_access_token")
                 )
                 new_refresh = data.get("refresh_token") or data.get("privy_refresh_token")
-                if new_access:
-                    token_store["access"] = new_access
-                    if new_refresh:
-                        token_store["refresh"] = new_refresh
-                    _save_token_cache(token_store["access"], token_store["refresh"])
-                    return True, status, body, keys
-        except Exception as e:
-            body = f"(json decode failed: {type(e).__name__}: {e}) {body}"
-    return False, status, body, keys
+                if not new_access:
+                    continue
+                token_store["access"] = new_access
+                if new_refresh:
+                    token_store["refresh"] = new_refresh
+                _save_token_cache(token_store["access"], token_store["refresh"])
+                global _privy_refresh_variant
+                _privy_refresh_variant = name
+                return True, attempts
+    except Exception as e:
+        attempts.append(("(fatal)", 0, f"{type(e).__name__}: {e}"))
+    return False, attempts
 
 
 @bot.command(name="refreshtoken")
 async def manual_refresh(ctx: commands.Context):
-    """Manually refresh TrueNorth token and report the Privy response verbatim."""
-    await ctx.send("🔄 Attempting token refresh...")
-    ok, status, body, keys = await _privy_refresh_verbose()
+    """Manually refresh TrueNorth token and report every Privy variant attempt."""
+    await ctx.send("🔄 Attempting token refresh (probing variants)…")
+    ok, attempts = await _privy_refresh_verbose()
 
     diag = discord.Embed(
         title=("✅ Privy refresh OK" if ok else "⚠️ Privy refresh FAILED"),
         color=(COLOR_LONG if ok else COLOR_RISK),
     )
-    diag.add_field(name="HTTP status", value=str(status) if status else "no response", inline=True)
     diag.add_field(name="Refresh token", value=_mask(token_store["refresh"]), inline=True)
-    if keys:
-        diag.add_field(name="Response keys", value=f"`{', '.join(keys)}`", inline=False)
-    if body:
-        diag.add_field(name="Body (first 400 chars)", value=f"```\n{body}\n```", inline=False)
+    if _privy_refresh_variant:
+        diag.add_field(name="Variant in use", value=f"`{_privy_refresh_variant}`", inline=True)
+    # One field per variant attempt; truncate body to keep embed under limits.
+    for name, status, body in attempts[:5]:
+        body_short = body[:300].replace("`", "ʼ")
+        diag.add_field(
+            name=f"{name} → {status}",
+            value=f"```\n{body_short}\n```" if body else "(no body)",
+            inline=False,
+        )
     exp = decode_jwt_exp(token_store.get("access", ""))
     diag.add_field(
         name="Access token exp",
