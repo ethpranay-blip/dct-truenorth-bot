@@ -1,15 +1,28 @@
 """
-DCT TrueNorth Bot
+DCT TrueNorth Bot — Discord bridge for TrueNorth AI trading intelligence.
 
-Discord bot integrating TrueNorth AI trading intelligence with session-based scheduling.
+Single-process Python bot that:
+  * Posts scheduled session briefs (Asia / London / US, pre- and post-open/close)
+  * Parses exactly 3 high-conviction trade setups per brief into `#trades`
+  * Runs a daily macro-regime outlook at 05:00 IST
+  * Handles on-demand chat in `#claude-integration` — default streams TrueNorth
+    directly, the `!` prefix invokes a Claude Sonnet middleman that calls TN
+    multiple times in parallel and synthesises
+  * Auto-rotates Privy access tokens every 8 h and persists rotated refresh
+    tokens atomically to disk so Railway restarts don't break auth
+  * Fast-fails with honest diagnostics (`!health`, `!refreshtoken`) when TN
+    rejects the thread or Privy rejects the refresh
 
-Channels:
-  #claude-integration -- Universal chat (finance->TN, general->Claude)
-  #asia-session       -- Asia session briefs only
-  #london-session     -- London session briefs only
-  #us-session         -- US session briefs only
-  #regime-outlook     -- Daily 24h macro outlook
-  #trades             -- All trade setups from every session brief
+Channels (routed via env vars):
+  #claude-integration · CH_CLAUDE_INTEGRATION — universal chat
+  #asia-session       · CH_ASIA_SESSION       — Asia session briefs only
+  #london-session     · CH_LONDON_SESSION     — London session briefs only
+  #us-session         · CH_US_SESSION         — US session briefs only
+  #regime-outlook     · CH_REGIME_OUTLOOK     — daily 24 h macro outlook
+  #trades             · CH_TRADES             — trade setups from every brief
+
+See README.md for setup, README_SETUP.md for credential rotation, and
+ARCHITECTURE.md for request-flow / state-machine details.
 """
 
 from __future__ import annotations
@@ -1196,6 +1209,11 @@ async def refresh_tn_token() -> bool:
 
 # --- Chat routing helpers ---
 def check_rate_limit(user_id: int) -> bool:
+    """Enforce ``RATE_LIMIT_MAX`` Sonnet-middleman calls per user per hour.
+
+    Returns True if the caller is under the limit (and records the hit); False
+    if the caller is already at the cap.
+    """
     now = time.time()
     calls = user_sonnet_calls[user_id]
     calls[:] = [t for t in calls if now - t < RATE_LIMIT_WINDOW]
@@ -1205,6 +1223,7 @@ def check_rate_limit(user_id: int) -> bool:
     return True
 
 def rate_limit_retry_min(user_id: int) -> int:
+    """Minutes until the user's oldest tracked call falls out of the rate-limit window."""
     calls = user_sonnet_calls[user_id]
     if not calls:
         return 0
@@ -1221,17 +1240,25 @@ def get_tn_thread(conv_id: int) -> str | None:
     return ensure_thread_id()
 
 async def get_or_create_conv_thread(message: discord.Message, content: str) -> discord.abc.Messageable:
+    """Return the Discord thread hosting this conversation (creates one if needed).
+
+    If the message is already inside a thread, reuse it. Otherwise spin up a
+    new public thread named after the first line of ``content`` (truncated to
+    80 chars) with a 60-minute auto-archive.
+    """
     if isinstance(message.channel, discord.Thread):
         return message.channel
     name = content.strip().splitlines()[0][:80] if content.strip() else "chat"
     return await message.create_thread(name=name or "chat", auto_archive_duration=60)
 
 async def send_long(channel, text: str):
+    """Chunk-send ``text`` across multiple Discord messages to respect the 2 000-char limit."""
     text = text.strip() or "(empty response)"
     for i in range(0, len(text), 1900):
         await channel.send(text[i:i+1900])
 
 async def handle_direct_tn(message: discord.Message, content: str):
+    """Stream a direct TrueNorth answer into a conversation thread (no Sonnet middleman)."""
     conv = await get_or_create_conv_thread(message, content)
     tn_id = get_tn_thread(conv.id)
     async with conv.typing():
@@ -1242,6 +1269,13 @@ async def handle_direct_tn(message: discord.Message, content: str):
         await send_long(conv, result)
 
 async def run_sonnet_loop(query: str, tn_thread_id: str, max_iter: int = 5) -> str:
+    """Run the Claude Sonnet middleman loop.
+
+    Sonnet can call the ``query_truenorth`` tool multiple times (in parallel,
+    with different angles — TA, derivatives, sentiment, smart money) and
+    synthesise a single trader-native answer. Caps iterations at ``max_iter``
+    so a misbehaving tool loop can't hang the bot.
+    """
     messages = [{"role": "user", "content": query}]
     for _ in range(max_iter):
         response = await asyncio.to_thread(
@@ -1281,6 +1315,12 @@ async def run_sonnet_loop(query: str, tn_thread_id: str, max_iter: int = 5) -> s
     return "(sonnet exceeded tool-call iteration limit)"
 
 async def handle_sonnet(message: discord.Message, query: str):
+    """Route a ``!``-prefixed message through the Claude Sonnet middleman loop.
+
+    Rate-limited per-user via ``check_rate_limit``. Handles Claude's BadRequest
+    and RateLimit errors with targeted user-facing copy; other exceptions
+    reply with a truncated error string.
+    """
     if not check_rate_limit(message.author.id):
         wait_min = rate_limit_retry_min(message.author.id)
         await message.reply(
@@ -1800,6 +1840,7 @@ def build_regime_embed(text: str) -> discord.Embed:
 
 # --- Core session brief logic ---
 def colors_map(session: str) -> int:
+    """Return the embed colour for a session key (asia/london/us)."""
     return {"asia": COLOR_ASIA, "london": COLOR_LONDON, "us": COLOR_US}.get(session, COLOR_INFO)
 
 async def run_session_brief(session: str, phase: str) -> bool:
@@ -1919,6 +1960,11 @@ SCHEDULE = [
 ]
 
 def setup_scheduler():
+    """Register every recurring job (12 session briefs + regime + refresh + harvester).
+
+    All cron triggers run on the ``Asia/Kolkata`` timezone. Idempotent — safe to
+    call again (``replace_existing=True``) if the bot reconnects.
+    """
     for session, phase, hour, minute in SCHEDULE:
         scheduler.add_job(
             run_session_brief,
@@ -1952,6 +1998,7 @@ def setup_scheduler():
 # --- Bot events ---
 @bot.event
 async def on_ready():
+    """Boot sequence: refresh tokens, acquire + validate thread, start the scheduler."""
     print(f"DCT TrueNorth Bot online as {bot.user}")
     if not token_store["refresh"]:
         print("[BOOT] WARNING: TN_REFRESH_TOKEN is not set. Auto token refresh disabled — "
@@ -2018,6 +2065,13 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
+    """Route every incoming Discord message: commands first, then free-form chat.
+
+    ``bot.process_commands`` handles ``!``-prefixed commands via the registered
+    ``@bot.command`` handlers. Free-form text in ``#claude-integration``
+    (or any thread under it) falls through to the direct-TN or Sonnet handler
+    depending on whether the message starts with ``!``.
+    """
     if message.author == bot.user:
         return
     await bot.process_commands(message)
