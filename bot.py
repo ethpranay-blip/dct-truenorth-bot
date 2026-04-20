@@ -23,7 +23,7 @@ import base64
 import asyncio
 import traceback
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import discord
 from discord.ext import commands
@@ -120,43 +120,120 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 scheduler = AsyncIOScheduler(timezone=IST)
 
+# --- JWT helper (defined early so cache freshness can be evaluated at module load) ---
+def decode_jwt_exp(token: str) -> datetime | None:
+    """Decode the `exp` claim from a JWT. Returns tz-aware datetime or None."""
+    if not token or token.count(".") < 2:
+        return None
+    try:
+        payload_b64 = token.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode()))
+        exp = payload.get("exp")
+        if isinstance(exp, (int, float)):
+            return datetime.fromtimestamp(int(exp), tz=IST)
+    except Exception:
+        return None
+    return None
+
+
+def _cache_access_is_fresh(access: str, grace_hours: int = 1) -> bool:
+    """True iff the cached access token is within `grace_hours` of its exp (or still valid).
+
+    Grace lets us accept a just-expired token at boot — refresh_tn_token will
+    promptly rotate it. Tokens that expired more than an hour ago are
+    overwhelmingly likely to mean the cache is stale from a long downtime
+    and env vars should win.
+    """
+    exp = decode_jwt_exp(access)
+    if exp is None:
+        return False
+    return exp > datetime.now(IST) - timedelta(hours=grace_hours)
+
+
 # --- Token cache (survives in-container restarts; helps because Privy refresh
 # tokens are single-use — each refresh rotates them, so env-only storage loses
 # the rotated token if the process restarts).
 def _load_token_cache() -> dict:
+    """Load the token cache file. Deletes and returns {} on corruption."""
     try:
         with open(TOKEN_CACHE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, dict):
-                return data
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
-    return {}
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[Token] cache file corrupt ({type(e).__name__}: {e}); deleting")
+        try:
+            os.remove(TOKEN_CACHE_PATH)
+        except OSError as rm_err:
+            print(f"[Token] failed to remove corrupt cache: {rm_err}")
+        return {}
+    if not isinstance(data, dict):
+        print(f"[Token] cache root is {type(data).__name__}, not dict; deleting")
+        try:
+            os.remove(TOKEN_CACHE_PATH)
+        except OSError:
+            pass
+        return {}
+    return data
 
 
-def _save_token_cache(access: str, refresh: str) -> None:
+def _save_token_cache(access: str, refresh: str) -> bool:
+    """Atomic write to the cache file. Returns True on success.
+
+    Writes to `<path>.tmp`, fsyncs, then os.replace — a crash mid-write can
+    never corrupt the canonical cache file (either the old complete state
+    or the new complete state survives).
+    """
+    payload = {
+        "access": access,
+        "refresh": refresh,
+        "updated_at": datetime.now(IST).isoformat(),
+    }
+    tmp_path = f"{TOKEN_CACHE_PATH}.tmp"
     try:
-        with open(TOKEN_CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "access": access,
-                    "refresh": refresh,
-                    "updated_at": datetime.now(IST).isoformat(),
-                },
-                f,
-            )
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except (OSError, AttributeError):
+                pass
+        os.replace(tmp_path, TOKEN_CACHE_PATH)
+        print(f"[Token] cache saved atomically to {TOKEN_CACHE_PATH}")
+        return True
     except OSError as e:
-        print(f"[Token] cache write failed: {e}")
+        print(f"[Token] cache write failed (LOUD): {type(e).__name__}: {e}")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return False
 
 
-_cached_tokens = _load_token_cache()
-# Mutable token holder: prefer cached values (they are newer than env after any prior refresh)
-token_store = {
-    "access": _cached_tokens.get("access") or TN_TOKEN,
-    "refresh": _cached_tokens.get("refresh") or TN_REFRESH,
-}
-if _cached_tokens:
-    print(f"[BOOT] Loaded tokens from {TOKEN_CACHE_PATH} (updated_at={_cached_tokens.get('updated_at')})")
+def _load_initial_tokens() -> tuple[str, str, str, str]:
+    """Pick startup access/refresh pair.
+
+    Precedence: valid cached access token (exp within last 1h or future) >
+    env vars. Returns (access, refresh, source_label, updated_at_iso).
+    """
+    cache = _load_token_cache()
+    c_access = cache.get("access") or ""
+    c_refresh = cache.get("refresh") or ""
+    c_updated = cache.get("updated_at") or ""
+    if c_access and _cache_access_is_fresh(c_access):
+        print(f"[BOOT] tokens loaded from cache (updated_at={c_updated})")
+        return c_access, c_refresh, "cache", c_updated
+    if cache:
+        print(f"[BOOT] tokens loaded from env (cache present but access token is stale, updated_at={c_updated})")
+    else:
+        print("[BOOT] tokens loaded from env (cache missing)")
+    return TN_TOKEN, TN_REFRESH, "env", ""
+
+
+_initial_access, _initial_refresh, _initial_token_source, _initial_cache_updated_at = _load_initial_tokens()
+token_store = {"access": _initial_access, "refresh": _initial_refresh}
 
 # --- Observability state ---
 # A single mutable dict avoids any ambiguity about `global` declarations in
@@ -171,6 +248,8 @@ tn_state: dict = {
     "thread_invalid": False,        # bool — set when ping/empty-200 confirms TN doesn't know thread
     "thread_invalid_reason": "",    # str — surfaced in failure embeds and !health
     "boot_warning_posted": False,   # bool — guard against double-posting the boot warning
+    "token_source": _initial_token_source,          # "cache" | "env" | "refresh"
+    "token_cache_updated_at": _initial_cache_updated_at,  # ISO string or ""
 }
 ALERT_COOLDOWN_SEC = 3600
 
@@ -348,22 +427,6 @@ def invalidate_thread(reason: str) -> None:
     tn_state["thread_invalid"] = True
     tn_state["thread_invalid_reason"] = reason
     _tn_thread_current = None
-
-# --- JWT helper ---
-def decode_jwt_exp(token: str) -> datetime | None:
-    """Decode the `exp` claim from a JWT. Returns tz-aware datetime or None."""
-    if not token or token.count(".") < 2:
-        return None
-    try:
-        payload_b64 = token.split(".")[1]
-        payload_b64 += "=" * (-len(payload_b64) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode()))
-        exp = payload.get("exp")
-        if isinstance(exp, (int, float)):
-            return datetime.fromtimestamp(int(exp), tz=IST)
-    except Exception:
-        return None
-    return None
 
 # --- TrueNorth SSE query ---
 TN_DEFAULT_READ_TIMEOUT = 240.0  # TN multi-tool calls can take 2-3 min
@@ -692,6 +755,31 @@ def _token_exp_summary() -> str:
     return f"{base} (EXPIRED {(-delta) // 60}m ago)"
 
 
+def _token_source_summary() -> str:
+    """Human-readable 'where did the current tokens come from' for !health."""
+    source = tn_state.get("token_source") or "env"
+    updated_raw = tn_state.get("token_cache_updated_at") or ""
+    if not updated_raw:
+        if source == "env":
+            return "env (cache missing or stale on boot)"
+        return source
+    try:
+        updated_dt = datetime.fromisoformat(updated_raw)
+    except ValueError:
+        return f"{source} (saved at {updated_raw})"
+    age = datetime.now(IST) - updated_dt
+    age_secs = int(age.total_seconds())
+    if age_secs < 60:
+        age_str = f"{age_secs}s ago"
+    elif age_secs < 3600:
+        age_str = f"{age_secs // 60}m ago"
+    elif age_secs < 86400:
+        age_str = f"{age_secs // 3600}h {(age_secs % 3600) // 60}m ago"
+    else:
+        age_str = f"{age_secs // 86400}d ago"
+    return f"{source} (saved {age_str})"
+
+
 async def alert_tn_failure(reason: str, last: dict | None = None) -> None:
     """Rate-limited diagnostic embed for unrecovered TN failures.
 
@@ -872,7 +960,9 @@ async def _apply_harvested_creds(update: dict) -> None:
     if refresh:
         token_store["refresh"] = refresh
     if access or refresh:
-        _save_token_cache(token_store["access"], token_store["refresh"])
+        if _save_token_cache(token_store["access"], token_store["refresh"]):
+            tn_state["token_source"] = "cache"
+            tn_state["token_cache_updated_at"] = datetime.now(IST).isoformat()
     if thread_id:
         _tn_thread_current = thread_id
         save_cached_thread(thread_id)
@@ -973,7 +1063,12 @@ async def refresh_tn_token() -> bool:
                 if new_refresh:
                     token_store["refresh"] = new_refresh
                     print(f"[TokenRefresh] refresh token rotated: {_mask(new_refresh)}")
-                _save_token_cache(token_store["access"], token_store["refresh"])
+                if _save_token_cache(token_store["access"], token_store["refresh"]):
+                    print("[TokenRefresh] persisted rotated tokens to cache")
+                    tn_state["token_source"] = "refresh"
+                    tn_state["token_cache_updated_at"] = datetime.now(IST).isoformat()
+                else:
+                    print("[TokenRefresh] WARNING: cache write failed — rotated refresh token will be lost on restart")
                 _privy_refresh_variant = name
                 exp = decode_jwt_exp(token_store["access"])
                 print(f"[TokenRefresh] ok via variant={name}; access exp={exp}")
@@ -1972,7 +2067,10 @@ async def _privy_refresh_verbose() -> tuple[bool, list[tuple[str, int, str]]]:
                 token_store["access"] = new_access
                 if new_refresh:
                     token_store["refresh"] = new_refresh
-                _save_token_cache(token_store["access"], token_store["refresh"])
+                if _save_token_cache(token_store["access"], token_store["refresh"]):
+                    print("[TokenRefresh] persisted rotated tokens to cache (verbose path)")
+                    tn_state["token_source"] = "refresh"
+                    tn_state["token_cache_updated_at"] = datetime.now(IST).isoformat()
                 global _privy_refresh_variant
                 _privy_refresh_variant = name
                 return True, attempts
@@ -2105,7 +2203,9 @@ async def manual_setcreds(ctx: commands.Context, *, raw: str = ""):
     global _tn_thread_current, _privy_refresh_variant
     token_store["access"] = access
     token_store["refresh"] = refresh
-    _save_token_cache(access, refresh)
+    if _save_token_cache(access, refresh):
+        tn_state["token_source"] = "cache"
+        tn_state["token_cache_updated_at"] = datetime.now(IST).isoformat()
     _tn_thread_current = thread_id
     save_cached_thread(thread_id)
     tn_state["thread_invalid"] = False
@@ -2237,6 +2337,7 @@ async def manual_health(ctx: commands.Context):
     e.add_field(name="Thread ID", value=f"`{_tn_thread_current or 'unset'}`", inline=True)
     e.add_field(name="Refresh token", value=("set" if token_store["refresh"] else "NOT SET"), inline=True)
     e.add_field(name="Access token exp", value=exp_str, inline=False)
+    e.add_field(name="Token source", value=_token_source_summary(), inline=False)
     e.add_field(name="Last TN success", value=_format_delta(tn_state["last_success_at"]), inline=True)
     e.add_field(name="Last TN error", value=_format_delta(tn_state["last_error_at"]), inline=True)
     if tn_state["last_error"]:

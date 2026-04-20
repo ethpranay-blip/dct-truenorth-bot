@@ -1,4 +1,7 @@
 """Unit tests for TrueNorth markdown response parsers."""
+import os
+from datetime import datetime, timedelta
+
 import bot
 
 
@@ -900,6 +903,152 @@ def test_harvester_parse_cookies_rejects_non_list_and_invalid_json():
     assert harvester._parse_cookies("") is None
     assert harvester._parse_cookies("{not json") is None
     assert harvester._parse_cookies('{"name":"x"}') is None  # not a list
+
+
+def test_save_token_cache_atomic_write_survives_crash(tmp_path, monkeypatch):
+    """Mid-write failure must leave the canonical cache file in its prior state (or empty if new)."""
+    cache_path = tmp_path / "tn_token_cache.json"
+    monkeypatch.setattr(bot, "TOKEN_CACHE_PATH", str(cache_path))
+
+    # 1) Write an initial complete record.
+    assert bot._save_token_cache("access_v1", "refresh_v1") is True
+    assert cache_path.exists()
+    baseline = json.loads(cache_path.read_text())
+    assert baseline["access"] == "access_v1"
+    assert baseline["refresh"] == "refresh_v1"
+
+    # 2) Simulate a crash during the NEXT write by making os.replace raise.
+    #    The .tmp file may exist briefly, but the canonical file must still
+    #    contain the old complete record (never partial JSON).
+    original_replace = os.replace
+
+    def _boom(src, dst):
+        raise OSError("simulated crash during rename")
+
+    monkeypatch.setattr(os, "replace", _boom)
+    assert bot._save_token_cache("access_v2", "refresh_v2") is False
+    monkeypatch.setattr(os, "replace", original_replace)
+
+    preserved = json.loads(cache_path.read_text())
+    assert preserved == baseline, "canonical cache file must not be corrupted by failed writes"
+
+
+def test_load_token_cache_deletes_corrupt_file(tmp_path, monkeypatch):
+    """Corrupt JSON must be cleared out so the bot falls back to env cleanly."""
+    cache_path = tmp_path / "tn_token_cache.json"
+    monkeypatch.setattr(bot, "TOKEN_CACHE_PATH", str(cache_path))
+    cache_path.write_text("{bad json")
+    assert bot._load_token_cache() == {}
+    assert not cache_path.exists(), "corrupt cache file must be deleted on load"
+
+
+def test_load_token_cache_missing_returns_empty(tmp_path, monkeypatch):
+    cache_path = tmp_path / "does_not_exist.json"
+    monkeypatch.setattr(bot, "TOKEN_CACHE_PATH", str(cache_path))
+    assert bot._load_token_cache() == {}
+
+
+def test_cache_access_is_fresh_respects_grace():
+    """Tokens expired <1h ago are still 'fresh' (refresh will rotate them); stale after that."""
+    import base64, json as _json
+    now = datetime.now(bot.IST)
+    future = int((now + timedelta(hours=5)).timestamp())
+    recently_expired = int((now - timedelta(minutes=30)).timestamp())
+    long_expired = int((now - timedelta(hours=6)).timestamp())
+
+    def _jwt(exp_ts: int) -> str:
+        hdr = base64.urlsafe_b64encode(b'{"alg":"HS256"}').decode().rstrip("=")
+        body = base64.urlsafe_b64encode(_json.dumps({"exp": exp_ts}).encode()).decode().rstrip("=")
+        return f"{hdr}.{body}.sig"
+
+    assert bot._cache_access_is_fresh(_jwt(future)) is True
+    assert bot._cache_access_is_fresh(_jwt(recently_expired)) is True
+    assert bot._cache_access_is_fresh(_jwt(long_expired)) is False
+    # Empty / malformed tokens never count as fresh.
+    assert bot._cache_access_is_fresh("") is False
+    assert bot._cache_access_is_fresh("not.a.jwt") is False
+
+
+def test_load_initial_tokens_prefers_fresh_cache_over_env(tmp_path, monkeypatch):
+    import base64, json as _json
+    cache_path = tmp_path / "cache.json"
+    monkeypatch.setattr(bot, "TOKEN_CACHE_PATH", str(cache_path))
+    monkeypatch.setattr(bot, "TN_TOKEN", "env_access")
+    monkeypatch.setattr(bot, "TN_REFRESH", "env_refresh")
+    # Write a cache file with a fresh access token.
+    future = int((datetime.now(bot.IST) + timedelta(hours=5)).timestamp())
+    hdr = base64.urlsafe_b64encode(b'{"alg":"HS256"}').decode().rstrip("=")
+    body = base64.urlsafe_b64encode(_json.dumps({"exp": future}).encode()).decode().rstrip("=")
+    jwt = f"{hdr}.{body}.sig"
+    cache_path.write_text(_json.dumps({
+        "access": jwt,
+        "refresh": "cache_refresh",
+        "updated_at": datetime.now(bot.IST).isoformat(),
+    }))
+    access, refresh, source, updated_at = bot._load_initial_tokens()
+    assert access == jwt
+    assert refresh == "cache_refresh"
+    assert source == "cache"
+    assert updated_at
+
+
+def test_load_initial_tokens_falls_back_to_env_when_cache_is_stale(tmp_path, monkeypatch):
+    import base64, json as _json
+    cache_path = tmp_path / "cache.json"
+    monkeypatch.setattr(bot, "TOKEN_CACHE_PATH", str(cache_path))
+    monkeypatch.setattr(bot, "TN_TOKEN", "env_access")
+    monkeypatch.setattr(bot, "TN_REFRESH", "env_refresh")
+    # Cache with a long-expired access token.
+    old = int((datetime.now(bot.IST) - timedelta(hours=6)).timestamp())
+    hdr = base64.urlsafe_b64encode(b'{"alg":"HS256"}').decode().rstrip("=")
+    body = base64.urlsafe_b64encode(_json.dumps({"exp": old}).encode()).decode().rstrip("=")
+    stale_jwt = f"{hdr}.{body}.sig"
+    cache_path.write_text(_json.dumps({"access": stale_jwt, "refresh": "cache_refresh"}))
+    access, refresh, source, _ = bot._load_initial_tokens()
+    assert access == "env_access"
+    assert refresh == "env_refresh"
+    assert source == "env"
+
+
+def test_load_initial_tokens_falls_back_to_env_on_corrupt_cache(tmp_path, monkeypatch):
+    cache_path = tmp_path / "cache.json"
+    monkeypatch.setattr(bot, "TOKEN_CACHE_PATH", str(cache_path))
+    monkeypatch.setattr(bot, "TN_TOKEN", "env_access")
+    monkeypatch.setattr(bot, "TN_REFRESH", "env_refresh")
+    cache_path.write_text("{not json")
+    access, refresh, source, _ = bot._load_initial_tokens()
+    assert access == "env_access"
+    assert refresh == "env_refresh"
+    assert source == "env"
+    # Corrupt file was removed.
+    assert not cache_path.exists()
+
+
+def test_save_token_cache_writes_both_access_and_refresh(tmp_path, monkeypatch):
+    """Every successful save must persist BOTH tokens — never just the access half."""
+    cache_path = tmp_path / "cache.json"
+    monkeypatch.setattr(bot, "TOKEN_CACHE_PATH", str(cache_path))
+    assert bot._save_token_cache("A", "R") is True
+    loaded = json.loads(cache_path.read_text())
+    assert loaded["access"] == "A"
+    assert loaded["refresh"] == "R"
+    assert "updated_at" in loaded
+
+
+def test_token_source_summary_reports_cache_age(monkeypatch):
+    past = (datetime.now(bot.IST) - timedelta(minutes=3)).isoformat()
+    monkeypatch.setitem(bot.tn_state, "token_source", "cache")
+    monkeypatch.setitem(bot.tn_state, "token_cache_updated_at", past)
+    out = bot._token_source_summary()
+    assert "cache" in out
+    assert "m ago" in out
+
+
+def test_token_source_summary_when_cache_missing(monkeypatch):
+    monkeypatch.setitem(bot.tn_state, "token_source", "env")
+    monkeypatch.setitem(bot.tn_state, "token_cache_updated_at", "")
+    out = bot._token_source_summary()
+    assert "env" in out
 
 
 def test_harvest_session_without_playwright_returns_skip_reason():
