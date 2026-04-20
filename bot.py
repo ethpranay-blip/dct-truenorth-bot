@@ -31,7 +31,15 @@ import httpx
 import anthropic
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from zoneinfo import ZoneInfo
+
+# Optional harvester — imports playwright internally with graceful degradation.
+try:
+    import harvester as _harvester
+except Exception as _harvester_import_err:  # pragma: no cover — defensive
+    _harvester = None
+    print(f"[BOOT] harvester module unavailable: {_harvester_import_err}")
 
 # --- Config ---
 DISCORD_TOKEN    = os.environ["DISCORD_BOT_TOKEN"]
@@ -39,6 +47,8 @@ ANTHROPIC_KEY    = os.environ["ANTHROPIC_API_KEY"]
 TN_TOKEN         = os.environ.get("TN_TOKEN", "")
 TN_REFRESH       = os.environ.get("TN_REFRESH_TOKEN", "")
 PRIVY_APP_ID     = os.environ.get("PRIVY_APP_ID", "cm6afcumv0688a6x3r78jkx7v")
+PRANAY_DISCORD_ID = os.environ.get("PRANAY_DISCORD_ID", "").strip()
+TN_SESSION_COOKIES = os.environ.get("TN_SESSION_COOKIES", "").strip()
 
 TN_ENDPOINT      = "https://api.adventai.io/api/discovery-agents/sse/v2/streams"
 TN_THREAD_ENV    = os.environ.get("TN_THREAD_ID", "").strip()
@@ -61,7 +71,7 @@ CH = {
 SONNET_MODEL = "claude-sonnet-4-6"
 RATE_LIMIT_MAX = 3
 RATE_LIMIT_WINDOW = 3600
-KNOWN_COMMANDS = ("!brief", "!trades", "!regime", "!winrate", "!refreshtoken", "!health")
+KNOWN_COMMANDS = ("!brief", "!trades", "!regime", "!winrate", "!refreshtoken", "!health", "!setcreds")
 
 SONNET_SYSTEM = """You are a research assistant for crypto traders in the Corgi Calls Discord. You have access to TrueNorth AI, a multi-agent trading intelligence platform covering crypto, equities, Polymarket, derivatives, on-chain, smart money flow, options, liquidation risk, and meme discovery.
 
@@ -514,6 +524,26 @@ THREAD_INVALID_HINT = (
 )
 
 
+def _parse_sse_error_payload(err: str) -> dict:
+    """Best-effort pull of error_type / error_code / error_message out of a JSON SSE error blob."""
+    out = {"error_type": "", "error_code": "", "error_message": ""}
+    if not err:
+        return out
+    try:
+        obj = json.loads(err)
+    except Exception:
+        return out
+    if not isinstance(obj, dict):
+        return out
+    # TN wraps the actual fields under "data" sometimes.
+    candidate = obj.get("data") if isinstance(obj.get("data"), dict) else obj
+    for k in ("error_type", "error_code", "error_message"):
+        v = candidate.get(k) or obj.get(k)
+        if isinstance(v, str):
+            out[k] = v
+    return out
+
+
 def _classify_failure(status: int, err: str, sse_error: bool, exc: Exception | None,
                       text: str, completed: bool) -> str:
     """Categorize a single _tn_call_once result. Returns a short tag used to pick error text."""
@@ -524,6 +554,9 @@ def _classify_failure(status: int, err: str, sse_error: bool, exc: Exception | N
     if status >= 400:
         return "http_error"
     if sse_error:
+        parsed = _parse_sse_error_payload(err)
+        if parsed["error_type"] == "InvalidRequestError" or "InvalidRequestError" in (err or ""):
+            return "invalid_request"
         return "sse_error"
     if status == 200 and not text:
         # 200 OK with zero content is the signature of an unknown thread on TN.
@@ -629,6 +662,13 @@ def _format_failure_reason(last: dict) -> str:
         return f"Auth failed (HTTP {status}). Run !refreshtoken."
     if tag == "empty_200":
         return THREAD_INVALID_HINT
+    if tag == "invalid_request":
+        parsed = _parse_sse_error_payload(err)
+        msg = parsed["error_message"] or err[:300] or "request rejected"
+        return (
+            f"Request rejected by TrueNorth: {msg}. "
+            f"Thread may be stale — try `!setcreds` with a fresh thread_id."
+        )
     if tag == "http_error":
         return f"TrueNorth API error: HTTP {status}. {err[:200]}"
     if tag == "sse_error":
@@ -671,6 +711,7 @@ async def alert_tn_failure(reason: str, last: dict | None = None) -> None:
             "auth": "🚨 TrueNorth auth failure",
             "http_error": "🚨 TrueNorth API error",
             "sse_error": "🚨 TrueNorth SSE error",
+            "invalid_request": "🚨 TrueNorth rejected request",
             "timeout": "🚨 TrueNorth timeout",
             "exception": "🚨 TrueNorth network error",
             "empty_200": "🚨 TrueNorth thread invalid",
@@ -683,8 +724,17 @@ async def alert_tn_failure(reason: str, last: dict | None = None) -> None:
             e.add_field(name="Attempt", value=f"{last.get('attempt', '?')}/{TN_MAX_ATTEMPTS}", inline=True)
             e.add_field(name="Chunks (text len)", value=str(len(last.get("text") or "")), inline=True)
             e.add_field(name="Stream completed", value=("yes" if last.get("completed") else "no"), inline=True)
-            if last.get("err"):
-                e.add_field(name="Last SSE error", value=f"```\n{str(last.get('err'))[:400]}\n```", inline=False)
+            err_val = last.get("err") or ""
+            parsed = _parse_sse_error_payload(err_val)
+            if parsed["error_type"] or parsed["error_code"] or parsed["error_message"]:
+                if parsed["error_type"]:
+                    e.add_field(name="SSE error_type", value=f"`{parsed['error_type']}`", inline=True)
+                if parsed["error_code"]:
+                    e.add_field(name="SSE error_code", value=f"`{parsed['error_code']}`", inline=True)
+                if parsed["error_message"]:
+                    e.add_field(name="SSE error_message", value=f"```\n{parsed['error_message'][:400]}\n```", inline=False)
+            elif err_val:
+                e.add_field(name="Last SSE error", value=f"```\n{str(err_val)[:400]}\n```", inline=False)
         e.add_field(name="Token exp", value=_token_exp_summary(), inline=False)
         e.set_footer(text=f"{FOOTER} · alert rate-limited 1/hr")
         e.timestamp = datetime.now(IST)
@@ -809,6 +859,68 @@ async def _privy_attempt(client: httpx.AsyncClient, body: dict, headers: dict) -
         except Exception:
             parsed = None
     return status, body_preview, parsed
+
+
+async def _apply_harvested_creds(update: dict) -> None:
+    """Callback for harvester.harvest_session. Persists new creds to memory + caches."""
+    global _tn_thread_current
+    access = update.get("access_token") or ""
+    refresh = update.get("refresh_token") or ""
+    thread_id = update.get("thread_id") or ""
+    if access:
+        token_store["access"] = access
+    if refresh:
+        token_store["refresh"] = refresh
+    if access or refresh:
+        _save_token_cache(token_store["access"], token_store["refresh"])
+    if thread_id:
+        _tn_thread_current = thread_id
+        save_cached_thread(thread_id)
+    tn_state["thread_invalid"] = False
+    tn_state["thread_invalid_reason"] = ""
+    tn_state["boot_warning_posted"] = False
+    print("[Harvester] applied harvested credentials to in-memory state")
+
+
+async def run_cookie_harvest() -> dict:
+    """Run the Playwright harvester once. Posts a Discord alert if the session is dead.
+
+    Returns the raw status dict from harvester.harvest_session (or an equivalent).
+    """
+    if not TN_SESSION_COOKIES:
+        return {"ok": False, "reason": "TN_SESSION_COOKIES not set", "applied": False}
+    if _harvester is None:
+        return {"ok": False, "reason": "harvester module failed to import", "applied": False}
+    status = await _harvester.harvest_session(TN_SESSION_COOKIES, _apply_harvested_creds)
+    if not status.get("ok"):
+        await _alert_session_cookies_dead(status.get("reason") or "unknown")
+    return status
+
+
+async def _alert_session_cookies_dead(reason: str) -> None:
+    """One post per hour if the harvester can't keep the session alive."""
+    now = time.time()
+    if now - tn_state.get("last_alert_at", 0.0) < ALERT_COOLDOWN_SEC:
+        return
+    tn_state["last_alert_at"] = now
+    try:
+        channel = bot.get_channel(CH["claude"])
+        if not channel:
+            return
+        e = discord.Embed(
+            title="⚠️ TrueNorth session cookies expired",
+            description=(
+                "The harvester could not restore an authenticated session. "
+                f"`{reason[:400]}`\n\n"
+                "Use `!setcreds` with fresh values or re-export TN_SESSION_COOKIES."
+            ),
+            color=COLOR_RISK,
+        )
+        e.set_footer(text=FOOTER)
+        e.timestamp = datetime.now(IST)
+        await channel.send(embed=e)
+    except Exception as e:
+        print(f"[Alert] session-cookies-dead send failed: {type(e).__name__}: {e}")
 
 
 async def refresh_tn_token() -> bool:
@@ -1618,6 +1730,15 @@ def setup_scheduler():
         id="token_refresh",
         replace_existing=True,
     )
+    if TN_SESSION_COOKIES and _harvester is not None:
+        # Run the cookie harvester preemptively before Privy's 24h expiry.
+        scheduler.add_job(
+            run_cookie_harvest,
+            IntervalTrigger(hours=20),
+            id="cookie_harvest",
+            replace_existing=True,
+            next_run_time=None,  # don't double-run on boot; on_ready already handles boot.
+        )
 
 # --- Bot events ---
 @bot.event
@@ -1632,6 +1753,11 @@ async def on_ready():
         await refresh_tn_token()
     exp = decode_jwt_exp(token_store.get("access", ""))
     print(f"[BOOT] TN access token exp: {exp}")
+    if TN_SESSION_COOKIES and _harvester is not None:
+        print("[BOOT] TN_SESSION_COOKIES present; running cookie harvester…")
+        await run_cookie_harvest()
+    elif TN_SESSION_COOKIES and _harvester is None:
+        print("[BOOT] TN_SESSION_COOKIES set but harvester module missing — skipping")
     # Acquire thread (env → cache → API create). Returns None when nothing works.
     boot_tid = await ensure_thread_id_async()
     if boot_tid:
@@ -1675,7 +1801,7 @@ async def on_ready():
         e.add_field(name="🎯 #trades", value="3 high-conviction setups per session brief.", inline=False)
         e.add_field(
             name="⌨️ Manual Commands",
-            value="!brief asia/london/us · !regime · !trades · !refreshtoken · !health",
+            value="!brief asia/london/us · !regime · !trades · !refreshtoken · !health · !setcreds (owner)",
             inline=False,
         )
         e.set_footer(text=FOOTER)
@@ -1853,6 +1979,178 @@ async def _privy_refresh_verbose() -> tuple[bool, list[tuple[str, int, str]]]:
     except Exception as e:
         attempts.append(("(fatal)", 0, f"{type(e).__name__}: {e}"))
     return False, attempts
+
+
+_UUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+
+
+def _is_valid_thread_id(tid: str) -> bool:
+    """Stricter than uuid.UUID() so we don't accept formatted-but-wrong ids."""
+    return bool(tid) and bool(_UUID_RE.match(tid.strip()))
+
+
+def _is_jwt_shape(token: str) -> tuple[bool, str]:
+    """Check JWT-ish structure (3 dot-separated segments + decodable payload).
+
+    Returns (ok, error_message). Non-empty error_message explains why it failed.
+    """
+    if not token or not isinstance(token, str):
+        return False, "empty token"
+    token = token.strip()
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False, f"expected 3 dot-separated segments, got {len(parts)}"
+    payload_b64 = parts[1]
+    payload_b64 += "=" * (-len(payload_b64) % 4)
+    try:
+        json.loads(base64.urlsafe_b64decode(payload_b64.encode()))
+    except Exception as e:
+        return False, f"payload not valid base64-JSON: {type(e).__name__}"
+    return True, ""
+
+
+def _parse_setcreds_payload(raw: str) -> tuple[dict | None, str]:
+    """Accept either JSON blob OR three space-separated values.
+
+    Returns (dict with access_token/refresh_token/thread_id, error_message).
+    """
+    s = raw.strip()
+    if not s:
+        return None, "empty payload"
+    if s.startswith("{"):
+        try:
+            obj = json.loads(s)
+        except Exception as e:
+            return None, f"JSON parse failed: {type(e).__name__}: {e}"
+        if not isinstance(obj, dict):
+            return None, "JSON must be an object"
+        for key in ("access_token", "refresh_token", "thread_id"):
+            if key not in obj or not isinstance(obj[key], str) or not obj[key].strip():
+                return None, f"missing or empty field: {key}"
+        return {k: obj[k].strip() for k in ("access_token", "refresh_token", "thread_id")}, ""
+    # Space-separated form
+    parts = s.split()
+    if len(parts) < 3:
+        return None, f"expected 3 space-separated values (access_token, refresh_token, thread_id); got {len(parts)}"
+    return {
+        "access_token": parts[0].strip(),
+        "refresh_token": parts[1].strip(),
+        "thread_id": parts[2].strip(),
+    }, ""
+
+
+def _is_owner(ctx_or_id) -> bool:
+    """Return True iff the caller is the configured Pranay Discord ID."""
+    if not PRANAY_DISCORD_ID:
+        return False
+    user_id = ctx_or_id.author.id if hasattr(ctx_or_id, "author") else ctx_or_id
+    try:
+        return int(user_id) == int(PRANAY_DISCORD_ID)
+    except (TypeError, ValueError):
+        return False
+
+
+@bot.command(name="setcreds")
+async def manual_setcreds(ctx: commands.Context, *, raw: str = ""):
+    """Owner-only. Update TN access + refresh + thread_id at runtime.
+
+    Usage:
+      !setcreds <access_token> <refresh_token> <thread_id>
+      !setcreds {"access_token":"...","refresh_token":"...","thread_id":"..."}
+
+    The original message is deleted on success so JWTs don't sit in chat history.
+    """
+    if not _is_owner(ctx):
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
+        await ctx.send("⛔ `!setcreds` is restricted to the bot owner.")
+        return
+
+    payload, err = _parse_setcreds_payload(raw)
+    if not payload:
+        await _reply_and_try_delete(
+            ctx, f"⚠️ `!setcreds` parse error: {err}. "
+                 f"Use JSON blob or `!setcreds <access> <refresh> <thread_id>`.",
+        )
+        return
+
+    access = payload["access_token"]
+    refresh = payload["refresh_token"]
+    thread_id = payload["thread_id"]
+
+    # Validate inputs
+    ok, jwt_err = _is_jwt_shape(access)
+    if not ok:
+        await _reply_and_try_delete(ctx, f"⚠️ access_token rejected: {jwt_err}")
+        return
+    if len(refresh) < 20:
+        await _reply_and_try_delete(
+            ctx, f"⚠️ refresh_token looks too short (len={len(refresh)}). "
+                 "Make sure you copied the full `privy:refresh_token` value.",
+        )
+        return
+    if not _is_valid_thread_id(thread_id):
+        await _reply_and_try_delete(
+            ctx, f"⚠️ thread_id `{thread_id[:40]}` is not a valid UUID. "
+                 "Grab it from the /streams request body in DevTools.",
+        )
+        return
+
+    # Delete the user's message FIRST (security — don't leave JWTs in chat).
+    await _try_delete_message(ctx.message)
+
+    # Apply to in-memory state and persist token+thread caches.
+    global _tn_thread_current, _privy_refresh_variant
+    token_store["access"] = access
+    token_store["refresh"] = refresh
+    _save_token_cache(access, refresh)
+    _tn_thread_current = thread_id
+    save_cached_thread(thread_id)
+    tn_state["thread_invalid"] = False
+    tn_state["thread_invalid_reason"] = ""
+    tn_state["boot_warning_posted"] = False
+
+    progress = await ctx.send("🔐 Credentials updated. Validating against TrueNorth…")
+    ok_ping = await validate_thread(thread_id, timeout_s=30.0)
+    exp = decode_jwt_exp(access)
+    exp_str = exp.strftime("%Y-%m-%d %H:%M %Z") if exp else "unknown"
+
+    if ok_ping:
+        await progress.edit(
+            content=f"✅ Credentials updated. Thread valid. Access token exp: `{exp_str}`."
+        )
+    else:
+        # Ping failed — thread likely still invalid.
+        invalidate_thread("ping against new thread_id still returned no chunks")
+        await progress.edit(
+            content=(
+                "⚠️ Credentials stored but thread ping returned 0 chunks in 30s. "
+                "Double-check the `thread_id` from the /streams request body. "
+                f"Access token exp: `{exp_str}`."
+            )
+        )
+
+
+async def _try_delete_message(message: discord.Message) -> bool:
+    """Best-effort message delete. Returns True on success."""
+    try:
+        await message.delete()
+        return True
+    except discord.Forbidden:
+        print("[setcreds] bot lacks Manage Messages permission to delete the creds message")
+    except discord.HTTPException as e:
+        print(f"[setcreds] delete failed: {e}")
+    except Exception as e:
+        print(f"[setcreds] delete unexpected error: {type(e).__name__}: {e}")
+    return False
+
+
+async def _reply_and_try_delete(ctx: commands.Context, message: str) -> None:
+    """Send `message` and attempt to delete the originating command message."""
+    await _try_delete_message(ctx.message)
+    await ctx.send(message)
 
 
 @bot.command(name="refreshtoken")

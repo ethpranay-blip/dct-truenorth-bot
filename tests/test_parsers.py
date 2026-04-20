@@ -751,6 +751,181 @@ def test_thread_invalid_hint_includes_actionable_steps():
     assert "Railway" in hint
 
 
+# --- Round 7: !setcreds validation ---
+
+def _make_fake_jwt(payload=None) -> str:
+    """Build a shape-valid JWT for tests (no real signing)."""
+    import base64
+    hdr = base64.urlsafe_b64encode(b'{"alg":"HS256"}').decode().rstrip("=")
+    body = base64.urlsafe_b64encode(json.dumps(payload or {"sub": "test"}).encode()).decode().rstrip("=")
+    return f"{hdr}.{body}.sig"
+
+
+def test_is_jwt_shape_accepts_wellformed_and_rejects_garbage():
+    good = _make_fake_jwt({"exp": 2000000000})
+    ok, err = bot._is_jwt_shape(good)
+    assert ok and not err
+    ok, err = bot._is_jwt_shape("not-a-jwt")
+    assert not ok and "3 dot-separated" in err
+    ok, err = bot._is_jwt_shape("")
+    assert not ok
+    ok, err = bot._is_jwt_shape("aaa.!!!not-base64!!!.ccc")
+    assert not ok and "base64-JSON" in err
+
+
+def test_is_valid_thread_id_accepts_uuid_rejects_garbage():
+    assert bot._is_valid_thread_id("78536e88-e440-43dd-a61d-584640f8792b")
+    assert not bot._is_valid_thread_id("not-a-uuid")
+    assert not bot._is_valid_thread_id("")
+    assert not bot._is_valid_thread_id("78536e88e44043dda61d584640f8792b")  # no dashes
+
+
+def test_parse_setcreds_payload_accepts_json_and_space_forms():
+    jwt = _make_fake_jwt()
+    uuid_str = "78536e88-e440-43dd-a61d-584640f8792b"
+    # JSON form
+    obj, err = bot._parse_setcreds_payload(
+        f'{{"access_token":"{jwt}","refresh_token":"rt-aaaaaaaaaaaaaaaaaaaaaa","thread_id":"{uuid_str}"}}'
+    )
+    assert obj is not None and not err
+    assert obj["access_token"] == jwt
+    assert obj["thread_id"] == uuid_str
+    # Space form
+    obj, err = bot._parse_setcreds_payload(f"{jwt} rt-aaaaaaaaaaaaaaaaaaaaaa {uuid_str}")
+    assert obj is not None and not err
+    # Missing fields
+    obj, err = bot._parse_setcreds_payload("only-one")
+    assert obj is None and "expected 3" in err
+    obj, err = bot._parse_setcreds_payload('{"access_token":"x"}')
+    assert obj is None and "missing or empty field" in err
+    obj, err = bot._parse_setcreds_payload("")
+    assert obj is None and "empty" in err
+    obj, err = bot._parse_setcreds_payload("{bad json")
+    assert obj is None and "JSON parse failed" in err
+
+
+def test_is_owner_requires_matching_discord_id(monkeypatch):
+    """Owner check must fail when PRANAY_DISCORD_ID is unset, and match only the configured id."""
+    monkeypatch.setattr(bot, "PRANAY_DISCORD_ID", "")
+    assert bot._is_owner(123) is False  # no owner configured → nobody is owner
+    monkeypatch.setattr(bot, "PRANAY_DISCORD_ID", "100000000000000001")
+    assert bot._is_owner(100000000000000001) is True
+    assert bot._is_owner(999) is False
+    # Ctx-like objects also work.
+    class _Ctx:
+        class _Author:
+            id = 100000000000000001
+        author = _Author()
+    assert bot._is_owner(_Ctx()) is True
+    class _NotCtx:
+        class _Author:
+            id = 42
+        author = _Author()
+    assert bot._is_owner(_NotCtx()) is False
+
+
+# --- Round 7: InvalidRequestError classification ---
+
+def test_parse_sse_error_payload_pulls_fields():
+    err = json.dumps({
+        "error_type": "InvalidRequestError",
+        "error_code": "thread_unknown",
+        "error_message": "Thread not found for this user",
+    })
+    parsed = bot._parse_sse_error_payload(err)
+    assert parsed["error_type"] == "InvalidRequestError"
+    assert parsed["error_code"] == "thread_unknown"
+    assert "Thread not found" in parsed["error_message"]
+
+    # Nested under "data".
+    err_nested = json.dumps({"data": {
+        "error_type": "InvalidRequestError",
+        "error_message": "nested",
+    }})
+    parsed = bot._parse_sse_error_payload(err_nested)
+    assert parsed["error_type"] == "InvalidRequestError"
+    assert parsed["error_message"] == "nested"
+
+    # Non-JSON safely returns empty fields.
+    parsed = bot._parse_sse_error_payload("not json")
+    assert parsed == {"error_type": "", "error_code": "", "error_message": ""}
+
+
+def test_classify_failure_tags_invalid_request():
+    err = json.dumps({"error_type": "InvalidRequestError", "error_message": "bad thread"})
+    assert bot._classify_failure(200, err, True, None, "", False) == "invalid_request"
+    # Other SSE errors still classify as sse_error.
+    other = json.dumps({"error_type": "InternalServerError", "error_message": "x"})
+    assert bot._classify_failure(200, other, True, None, "", False) == "sse_error"
+
+
+def test_format_failure_reason_invalid_request_mentions_setcreds():
+    err = json.dumps({"error_type": "InvalidRequestError", "error_message": "Thread not found"})
+    msg = bot._format_failure_reason({"tag": "invalid_request", "status": 200, "err": err})
+    assert "Thread not found" in msg
+    assert "!setcreds" in msg
+
+
+# --- Round 7: harvester module ---
+
+def test_harvester_module_imports_without_playwright():
+    """Importing harvester must succeed even if Playwright isn't installed."""
+    import harvester
+    assert hasattr(harvester, "harvest_session")
+    assert hasattr(harvester, "HAS_PLAYWRIGHT")
+
+
+def test_harvester_parse_cookies_handles_cookie_editor_format():
+    import harvester
+    raw = json.dumps([
+        {
+            "domain": ".true-north.xyz", "name": "sid", "value": "abc",
+            "path": "/", "sameSite": "no_restriction", "secure": True,
+            "expirationDate": 1900000000.0,
+        },
+        {"name": "foo", "value": "bar"},  # minimal form
+        "garbage",                          # filtered out
+    ])
+    out = harvester._parse_cookies(raw)
+    assert isinstance(out, list)
+    names = [c["name"] for c in out]
+    assert names == ["sid", "foo"]
+    assert out[0]["sameSite"] == "None"
+    assert out[0]["expires"] == 1900000000
+    assert out[0]["secure"] is True
+
+
+def test_harvester_parse_cookies_rejects_non_list_and_invalid_json():
+    import harvester
+    assert harvester._parse_cookies("") is None
+    assert harvester._parse_cookies("{not json") is None
+    assert harvester._parse_cookies('{"name":"x"}') is None  # not a list
+
+
+def test_harvest_session_without_playwright_returns_skip_reason():
+    """When Playwright isn't available the harvester must not crash."""
+    import asyncio as _asyncio
+    import harvester
+
+    original_flag = harvester.HAS_PLAYWRIGHT
+    try:
+        harvester.HAS_PLAYWRIGHT = False
+
+        async def _apply(_update):
+            raise AssertionError("apply_creds should not be called when Playwright is absent")
+
+        status = _asyncio.run(harvester.harvest_session('[{"name":"a","value":"b"}]', _apply))
+        assert status["ok"] is False
+        assert status["applied"] is False
+        assert "playwright" in status["reason"].lower()
+    finally:
+        harvester.HAS_PLAYWRIGHT = original_flag
+
+
+# Ensure json is importable in the test module for the helpers above.
+import json  # noqa: E402
+
+
 def test_extract_risk_flag_preserves_inner_table_rows():
     """Tables inside the body must stay (they get fenced by build_risk_embed)."""
     text = (
