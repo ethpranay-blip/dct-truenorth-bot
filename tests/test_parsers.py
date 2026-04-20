@@ -905,6 +905,128 @@ def test_harvester_parse_cookies_rejects_non_list_and_invalid_json():
     assert harvester._parse_cookies('{"name":"x"}') is None  # not a list
 
 
+def test_save_cached_thread_atomic_roundtrip(tmp_path, monkeypatch):
+    """save → load must return exactly the UUID that was written."""
+    cache_path = tmp_path / "thread_cache.json"
+    monkeypatch.setattr(bot, "THREAD_CACHE_PATH", str(cache_path))
+    uuid_str = "78536e88-e440-43dd-a61d-584640f8792b"
+    assert bot.save_cached_thread(uuid_str) is True
+    assert cache_path.exists()
+    assert bot.load_cached_thread() == uuid_str
+
+
+def test_save_cached_thread_atomic_survives_crash(tmp_path, monkeypatch):
+    """Mid-write failure must leave the canonical thread cache in its prior state."""
+    cache_path = tmp_path / "thread_cache.json"
+    monkeypatch.setattr(bot, "THREAD_CACHE_PATH", str(cache_path))
+    uuid_v1 = "11111111-1111-1111-1111-111111111111"
+    uuid_v2 = "22222222-2222-2222-2222-222222222222"
+    assert bot.save_cached_thread(uuid_v1) is True
+    baseline = json.loads(cache_path.read_text())
+    assert baseline["thread_id"] == uuid_v1
+
+    original_replace = os.replace
+
+    def _boom(src, dst):
+        raise OSError("simulated crash during rename")
+
+    monkeypatch.setattr(os, "replace", _boom)
+    assert bot.save_cached_thread(uuid_v2) is False
+    monkeypatch.setattr(os, "replace", original_replace)
+
+    preserved = json.loads(cache_path.read_text())
+    assert preserved["thread_id"] == uuid_v1, "canonical thread cache must not be corrupted"
+
+
+def test_load_cached_thread_deletes_corrupt_file(tmp_path, monkeypatch):
+    """Corrupt JSON must be removed so boot falls back cleanly to env/API."""
+    cache_path = tmp_path / "thread_cache.json"
+    monkeypatch.setattr(bot, "THREAD_CACHE_PATH", str(cache_path))
+    cache_path.write_text("{bad json")
+    assert bot.load_cached_thread() is None
+    assert not cache_path.exists(), "corrupt thread cache file must be deleted on load"
+
+
+def test_load_cached_thread_rejects_non_uuid_payload(tmp_path, monkeypatch):
+    cache_path = tmp_path / "thread_cache.json"
+    monkeypatch.setattr(bot, "THREAD_CACHE_PATH", str(cache_path))
+    cache_path.write_text(json.dumps({"thread_id": "not-a-uuid"}))
+    assert bot.load_cached_thread() is None
+
+
+def test_save_cached_thread_refuses_non_uuid(tmp_path, monkeypatch):
+    cache_path = tmp_path / "thread_cache.json"
+    monkeypatch.setattr(bot, "THREAD_CACHE_PATH", str(cache_path))
+    assert bot.save_cached_thread("not-a-uuid") is False
+    assert not cache_path.exists()
+
+
+def test_load_initial_thread_prefers_cache_over_env(tmp_path, monkeypatch):
+    """Regression: after !setcreds persists, a Railway restart must pick the cached thread."""
+    cache_path = tmp_path / "thread_cache.json"
+    monkeypatch.setattr(bot, "THREAD_CACHE_PATH", str(cache_path))
+    monkeypatch.setattr(bot, "TN_THREAD_ENV", "99999999-9999-9999-9999-999999999999")
+
+    cached = "78536e88-e440-43dd-a61d-584640f8792b"
+    cache_path.write_text(json.dumps({
+        "thread_id": cached,
+        "updated_at": datetime.now(bot.IST).isoformat(),
+    }))
+    tid, source, updated_at = bot._load_initial_thread()
+    assert tid == cached
+    assert source == "cache"
+    assert updated_at
+
+
+def test_load_initial_thread_falls_back_to_env_when_cache_missing(tmp_path, monkeypatch):
+    cache_path = tmp_path / "thread_cache.json"
+    monkeypatch.setattr(bot, "THREAD_CACHE_PATH", str(cache_path))
+    env_uuid = "abcdef12-3456-7890-abcd-ef1234567890"
+    monkeypatch.setattr(bot, "TN_THREAD_ENV", env_uuid)
+    tid, source, _ = bot._load_initial_thread()
+    assert tid == env_uuid
+    assert source == "env"
+
+
+def test_load_initial_thread_returns_unset_when_nothing_available(tmp_path, monkeypatch):
+    cache_path = tmp_path / "thread_cache.json"
+    monkeypatch.setattr(bot, "THREAD_CACHE_PATH", str(cache_path))
+    monkeypatch.setattr(bot, "TN_THREAD_ENV", "")
+    tid, source, _ = bot._load_initial_thread()
+    assert tid is None
+    assert source == "unset"
+
+
+def test_ensure_thread_id_prefers_cache_over_env(tmp_path, monkeypatch):
+    """Live path (not just boot): cache beats env."""
+    cache_path = tmp_path / "thread_cache.json"
+    monkeypatch.setattr(bot, "THREAD_CACHE_PATH", str(cache_path))
+    env_uuid = "99999999-9999-9999-9999-999999999999"
+    cached = "78536e88-e440-43dd-a61d-584640f8792b"
+    monkeypatch.setattr(bot, "TN_THREAD_ENV", env_uuid)
+    monkeypatch.setattr(bot, "_tn_thread_current", None)
+    assert bot.save_cached_thread(cached) is True
+    assert bot.ensure_thread_id() == cached
+
+
+def test_thread_source_summary_variants(monkeypatch):
+    monkeypatch.setitem(bot.tn_state, "thread_source", "cache")
+    monkeypatch.setitem(
+        bot.tn_state, "thread_cache_updated_at",
+        (datetime.now(bot.IST) - timedelta(minutes=3)).isoformat(),
+    )
+    out = bot._thread_source_summary()
+    assert "cache" in out and "m ago" in out
+
+    monkeypatch.setitem(bot.tn_state, "thread_source", "env")
+    monkeypatch.setitem(bot.tn_state, "thread_cache_updated_at", "")
+    assert "env" in bot._thread_source_summary()
+
+    monkeypatch.setitem(bot.tn_state, "thread_source", "unset")
+    assert "unset" in bot._thread_source_summary()
+    assert "!setcreds" in bot._thread_source_summary()
+
+
 def test_save_token_cache_atomic_write_survives_crash(tmp_path, monkeypatch):
     """Mid-write failure must leave the canonical cache file in its prior state (or empty if new)."""
     cache_path = tmp_path / "tn_token_cache.json"

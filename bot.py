@@ -250,6 +250,8 @@ tn_state: dict = {
     "boot_warning_posted": False,   # bool — guard against double-posting the boot warning
     "token_source": _initial_token_source,          # "cache" | "env" | "refresh"
     "token_cache_updated_at": _initial_cache_updated_at,  # ISO string or ""
+    "thread_source": "unset",                        # "cache" | "env" | "api" | "unset"
+    "thread_cache_updated_at": "",                   # ISO string or ""
 }
 ALERT_COOLDOWN_SEC = 3600
 
@@ -268,50 +270,139 @@ THREAD_ERROR_MARKERS = (
     "no such thread",
 )
 
-# --- Thread id cache ---
-def load_cached_thread() -> str | None:
+# --- Thread id cache (mirrors the token cache durability pattern) ---
+_THREAD_UUID_RE = re.compile(
+    r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+)
+
+
+def _is_cached_thread_valid(tid: str | None) -> bool:
+    """Cache is only useful if the stored value parses as a UUID."""
+    return bool(tid) and isinstance(tid, str) and bool(_THREAD_UUID_RE.match(tid.strip()))
+
+
+def _raw_load_cached_thread() -> tuple[str | None, str]:
+    """Returns (thread_id, updated_at_iso). Deletes the file if it is unreadable or malformed."""
     try:
         with open(THREAD_CACHE_PATH, "r", encoding="utf-8") as f:
-            tid = json.load(f).get("thread_id")
-            if tid and isinstance(tid, str):
-                return tid
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
-    return None
+            data = json.load(f)
+    except FileNotFoundError:
+        return None, ""
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[Thread] cache file corrupt ({type(e).__name__}: {e}); deleting")
+        try:
+            os.remove(THREAD_CACHE_PATH)
+        except OSError as rm_err:
+            print(f"[Thread] failed to remove corrupt thread cache: {rm_err}")
+        return None, ""
+    if not isinstance(data, dict):
+        print(f"[Thread] cache root is {type(data).__name__}, not dict; deleting")
+        try:
+            os.remove(THREAD_CACHE_PATH)
+        except OSError:
+            pass
+        return None, ""
+    tid = data.get("thread_id")
+    updated = data.get("updated_at") or ""
+    if not _is_cached_thread_valid(tid):
+        return None, updated if isinstance(updated, str) else ""
+    return tid.strip(), updated if isinstance(updated, str) else ""
 
-def save_cached_thread(thread_id: str) -> None:
+
+def load_cached_thread() -> str | None:
+    """Public loader — returns a valid UUID string or None."""
+    tid, _updated = _raw_load_cached_thread()
+    return tid
+
+
+def save_cached_thread(thread_id: str) -> bool:
+    """Atomic write to the thread cache file. Returns True on success.
+
+    Mirrors _save_token_cache: write to `<path>.tmp`, fsync, then os.replace.
+    A crash between open() and replace can never corrupt the canonical file.
+    """
+    if not _is_cached_thread_valid(thread_id):
+        print(f"[Thread] refusing to cache non-UUID value {thread_id!r}")
+        return False
+    payload = {
+        "thread_id": thread_id,
+        "updated_at": datetime.now(IST).isoformat(),
+    }
+    tmp_path = f"{THREAD_CACHE_PATH}.tmp"
     try:
-        with open(THREAD_CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump(
-                {"thread_id": thread_id, "updated_at": datetime.now(IST).isoformat()},
-                f,
-            )
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except (OSError, AttributeError):
+                pass
+        os.replace(tmp_path, THREAD_CACHE_PATH)
+        print(f"[Thread] cache saved atomically to {THREAD_CACHE_PATH}")
+        return True
     except OSError as e:
-        print(f"[Thread] cache write failed: {e}")
+        print(f"[Thread] cache write failed (LOUD): {type(e).__name__}: {e}")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return False
+
 
 _tn_thread_current: str | None = None
 
 
-def ensure_thread_id() -> str | None:
-    """Return the current shared TrueNorth thread id from env/cache. NEVER mints a UUID.
+def _load_initial_thread() -> tuple[str | None, str, str]:
+    """Boot-time thread picker.
 
-    Random UUIDs are not valid TN threads — TN responds with HTTP 200 + zero
-    chunks for unknown ids, which previously triggered ~25 minutes of useless
-    retries before surfacing as 'No response from TrueNorth'. Returning None
-    instead lets callers fast-fail with an actionable error.
+    Precedence (per spec):
+      1. cache file if valid UUID
+      2. TN_THREAD_ID env var
+      3. None → API-create happens asynchronously later in on_ready
+    Returns (thread_id, source_label, updated_at_iso).
+    """
+    cached_tid, cached_updated = _raw_load_cached_thread()
+    if cached_tid:
+        print(f"[BOOT] thread_id loaded from cache: {cached_tid} (updated_at={cached_updated})")
+        return cached_tid, "cache", cached_updated
+    if TN_THREAD_ENV and _is_cached_thread_valid(TN_THREAD_ENV):
+        print(f"[BOOT] thread_id from env: {TN_THREAD_ENV}")
+        return TN_THREAD_ENV, "env", ""
+    if TN_THREAD_ENV:
+        print(f"[BOOT] TN_THREAD_ID env var is set but not a valid UUID: {TN_THREAD_ENV!r}")
+    else:
+        print("[BOOT] thread_id unset (no cache, no env) — will attempt API create in on_ready")
+    return None, "unset", ""
+
+
+_initial_thread_id, _initial_thread_source, _initial_thread_updated_at = _load_initial_thread()
+_tn_thread_current = _initial_thread_id
+# Backfill tn_state (declared above with default placeholders) now that we know the source.
+tn_state["thread_source"] = _initial_thread_source
+tn_state["thread_cache_updated_at"] = _initial_thread_updated_at
+
+
+def ensure_thread_id() -> str | None:
+    """Return the current shared TrueNorth thread id. NEVER mints a UUID.
+
+    Precedence: in-memory > cache > env. Cache beats env because a post-
+    !setcreds rotation writes to cache; env may be a stale pre-deploy value.
     """
     global _tn_thread_current
     if _tn_thread_current:
         return _tn_thread_current
-    if TN_THREAD_ENV:
-        _tn_thread_current = TN_THREAD_ENV
-        print(f"[Thread] Using TN_THREAD_ID from env: {_tn_thread_current}")
-        return _tn_thread_current
     cached = load_cached_thread()
     if cached:
         _tn_thread_current = cached
+        tn_state["thread_source"] = "cache"
         print(f"[Thread] Using cached thread id: {cached}")
         return cached
+    if TN_THREAD_ENV and _is_cached_thread_valid(TN_THREAD_ENV):
+        _tn_thread_current = TN_THREAD_ENV
+        tn_state["thread_source"] = "env"
+        print(f"[Thread] Using TN_THREAD_ID from env: {_tn_thread_current}")
+        return _tn_thread_current
     return None
 
 
@@ -381,26 +472,30 @@ async def _try_api_create_thread() -> str | None:
 
 
 async def ensure_thread_id_async() -> str | None:
-    """Boot-time thread acquisition: env → cache → API create. Returns None if all fail.
+    """Boot-time thread acquisition: cache → env → API create. Returns None if all fail.
 
     Never falls back to a random UUID. Callers must check for None and fast-fail.
     """
     global _tn_thread_current
     if _tn_thread_current:
         return _tn_thread_current
-    if TN_THREAD_ENV:
-        _tn_thread_current = TN_THREAD_ENV
-        print(f"[Thread] Using TN_THREAD_ID from env: {_tn_thread_current}")
-        return _tn_thread_current
     cached = load_cached_thread()
     if cached:
         _tn_thread_current = cached
+        tn_state["thread_source"] = "cache"
         print(f"[Thread] Using cached thread id: {cached}")
         return cached
+    if TN_THREAD_ENV and _is_cached_thread_valid(TN_THREAD_ENV):
+        _tn_thread_current = TN_THREAD_ENV
+        tn_state["thread_source"] = "env"
+        print(f"[Thread] Using TN_THREAD_ID from env: {_tn_thread_current}")
+        return _tn_thread_current
     tid = await _try_api_create_thread()
     if tid:
         _tn_thread_current = tid
-        save_cached_thread(tid)
+        if save_cached_thread(tid):
+            tn_state["thread_source"] = "api"
+            tn_state["thread_cache_updated_at"] = datetime.now(IST).isoformat()
         return tid
     print("[Thread] No thread id available — TN-dependent commands will fast-fail.")
     return None
@@ -755,29 +850,46 @@ def _token_exp_summary() -> str:
     return f"{base} (EXPIRED {(-delta) // 60}m ago)"
 
 
+def _age_summary(updated_raw: str) -> str:
+    """Return a short 'Xm ago' string for an ISO timestamp, or empty if unparseable."""
+    if not updated_raw:
+        return ""
+    try:
+        updated_dt = datetime.fromisoformat(updated_raw)
+    except ValueError:
+        return f"saved at {updated_raw}"
+    age_secs = int((datetime.now(IST) - updated_dt).total_seconds())
+    if age_secs < 60:
+        return f"saved {age_secs}s ago"
+    if age_secs < 3600:
+        return f"saved {age_secs // 60}m ago"
+    if age_secs < 86400:
+        return f"saved {age_secs // 3600}h {(age_secs % 3600) // 60}m ago"
+    return f"saved {age_secs // 86400}d ago"
+
+
 def _token_source_summary() -> str:
     """Human-readable 'where did the current tokens come from' for !health."""
     source = tn_state.get("token_source") or "env"
     updated_raw = tn_state.get("token_cache_updated_at") or ""
-    if not updated_raw:
-        if source == "env":
-            return "env (cache missing or stale on boot)"
-        return source
-    try:
-        updated_dt = datetime.fromisoformat(updated_raw)
-    except ValueError:
-        return f"{source} (saved at {updated_raw})"
-    age = datetime.now(IST) - updated_dt
-    age_secs = int(age.total_seconds())
-    if age_secs < 60:
-        age_str = f"{age_secs}s ago"
-    elif age_secs < 3600:
-        age_str = f"{age_secs // 60}m ago"
-    elif age_secs < 86400:
-        age_str = f"{age_secs // 3600}h {(age_secs % 3600) // 60}m ago"
-    else:
-        age_str = f"{age_secs // 86400}d ago"
-    return f"{source} (saved {age_str})"
+    age = _age_summary(updated_raw)
+    if source == "env" and not age:
+        return "env (cache missing or stale on boot)"
+    return f"{source} ({age})" if age else source
+
+
+def _thread_source_summary() -> str:
+    """Human-readable 'where did the current thread id come from' for !health."""
+    source = tn_state.get("thread_source") or ("unset" if not _tn_thread_current else "env")
+    updated_raw = tn_state.get("thread_cache_updated_at") or ""
+    age = _age_summary(updated_raw)
+    if source == "unset":
+        return "unset — run !setcreds with a fresh thread_id"
+    if source == "env":
+        return "env (TN_THREAD_ID from Railway)"
+    if source == "api":
+        return f"API-created ({age})" if age else "API-created"
+    return f"{source} ({age})" if age else source
 
 
 async def alert_tn_failure(reason: str, last: dict | None = None) -> None:
@@ -965,7 +1077,9 @@ async def _apply_harvested_creds(update: dict) -> None:
             tn_state["token_cache_updated_at"] = datetime.now(IST).isoformat()
     if thread_id:
         _tn_thread_current = thread_id
-        save_cached_thread(thread_id)
+        if save_cached_thread(thread_id):
+            tn_state["thread_source"] = "cache"
+            tn_state["thread_cache_updated_at"] = datetime.now(IST).isoformat()
     tn_state["thread_invalid"] = False
     tn_state["thread_invalid_reason"] = ""
     tn_state["boot_warning_posted"] = False
@@ -2199,15 +2313,28 @@ async def manual_setcreds(ctx: commands.Context, *, raw: str = ""):
     # Delete the user's message FIRST (security — don't leave JWTs in chat).
     await _try_delete_message(ctx.message)
 
-    # Apply to in-memory state and persist token+thread caches.
+    # Persist thread_id to disk BEFORE touching tokens / in-memory state so a
+    # crash between the two can't leave the cache out of sync with memory.
     global _tn_thread_current, _privy_refresh_variant
+    if not save_cached_thread(thread_id):
+        await ctx.send(
+            "❌ `!setcreds` failed: could not write thread_cache.json (disk full "
+            "or read-only filesystem?). In-memory state NOT updated — run "
+            "`!setcreds` again once the filesystem is writable."
+        )
+        return
+    tn_state["thread_source"] = "cache"
+    tn_state["thread_cache_updated_at"] = datetime.now(IST).isoformat()
+
+    # Then tokens.
     token_store["access"] = access
     token_store["refresh"] = refresh
     if _save_token_cache(access, refresh):
         tn_state["token_source"] = "cache"
         tn_state["token_cache_updated_at"] = datetime.now(IST).isoformat()
+
+    # Finally in-memory thread + flags.
     _tn_thread_current = thread_id
-    save_cached_thread(thread_id)
     tn_state["thread_invalid"] = False
     tn_state["thread_invalid_reason"] = ""
     tn_state["boot_warning_posted"] = False
@@ -2335,6 +2462,7 @@ async def manual_health(ctx: commands.Context):
     e = discord.Embed(title="🩺 Bot Health", color=COLOR_INFO)
     e.add_field(name="Uptime", value=uptime_str, inline=True)
     e.add_field(name="Thread ID", value=f"`{_tn_thread_current or 'unset'}`", inline=True)
+    e.add_field(name="Thread source", value=_thread_source_summary(), inline=True)
     e.add_field(name="Refresh token", value=("set" if token_store["refresh"] else "NOT SET"), inline=True)
     e.add_field(name="Access token exp", value=exp_str, inline=False)
     e.add_field(name="Token source", value=_token_source_summary(), inline=False)
