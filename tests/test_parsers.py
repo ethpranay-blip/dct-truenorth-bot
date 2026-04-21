@@ -1193,6 +1193,245 @@ def test_harvest_session_without_playwright_returns_skip_reason():
         harvester.HAS_PLAYWRIGHT = original_flag
 
 
+# --- Round 10: activated harvester paths ---
+
+class _FakeResponse:
+    def __init__(self, status: int = 200):
+        self.status = status
+
+
+class _FakeRequest:
+    def __init__(self, url, method="POST", body=None):
+        self.url = url
+        self.method = method
+        self.post_data_json = body
+        self.post_data = json.dumps(body) if body is not None else None
+
+
+class _FakePage:
+    """Mimics the handful of playwright.Page methods used by harvester.harvest_session."""
+    def __init__(self, *, final_url="https://app.true-north.xyz/", status=200,
+                 access="eyJheHA.body.sig", refresh="rt_opaque_string_plenty_long",
+                 streams_body=None):
+        self.url = final_url
+        self._status = status
+        self._access = access
+        self._refresh = refresh
+        self._streams_body = streams_body
+        self._request_handlers: list = []
+
+    def on(self, event: str, handler):
+        if event == "request":
+            self._request_handlers.append(handler)
+
+    async def goto(self, url, **_kwargs):
+        return _FakeResponse(self._status)
+
+    async def wait_for_timeout(self, _ms):
+        # Trigger the captured streams request (simulating TN's front-end firing it on load).
+        if self._streams_body is not None:
+            req = _FakeRequest(
+                "https://api.adventai.io/api/discovery-agents/sse/v2/streams",
+                method="POST",
+                body=self._streams_body,
+            )
+            for h in self._request_handlers:
+                h(req)
+
+    async def evaluate(self, expr: str):
+        if "privy:token" in expr:
+            return self._access
+        if "privy:refresh_token" in expr:
+            return self._refresh
+        return None
+
+
+class _FakeContext:
+    def __init__(self, page: _FakePage):
+        self._page = page
+        self.added_cookies = None
+
+    async def add_cookies(self, cookies):
+        self.added_cookies = cookies
+
+    async def new_page(self):
+        return self._page
+
+
+class _FakeBrowser:
+    def __init__(self, page: _FakePage):
+        self._page = page
+        self.closed = False
+
+    async def new_context(self):
+        return _FakeContext(self._page)
+
+    async def close(self):
+        self.closed = True
+
+
+class _FakeChromiumLauncher:
+    def __init__(self, page: _FakePage):
+        self._page = page
+
+    async def launch(self, **_kwargs):
+        return _FakeBrowser(self._page)
+
+
+class _FakePlaywright:
+    def __init__(self, page: _FakePage):
+        self.chromium = _FakeChromiumLauncher(page)
+        self.stopped = False
+
+    async def start(self):
+        return self
+
+    async def stop(self):
+        self.stopped = True
+
+
+def _install_fake_playwright(monkeypatch, page: _FakePage):
+    import harvester
+    monkeypatch.setattr(harvester, "HAS_PLAYWRIGHT", True)
+    monkeypatch.setattr(harvester, "async_playwright", lambda: _FakePlaywright(page))
+
+
+def test_harvest_session_happy_path_applies_creds_and_captures_thread_id(monkeypatch):
+    """Full flow: restore cookies → read localStorage → capture thread_id → apply creds."""
+    import asyncio as _asyncio
+    import harvester
+
+    captured_thread = "78536e88-e440-43dd-a61d-584640f8792b"
+    page = _FakePage(
+        access="access_token_from_localstorage",
+        refresh="refresh_token_from_localstorage_xxxxx",
+        streams_body={"query": "ping", "thread_id": captured_thread},
+    )
+    _install_fake_playwright(monkeypatch, page)
+
+    applied: dict = {}
+
+    async def _apply(update):
+        applied.update(update)
+
+    raw_cookies = '[{"name":"sid","value":"abc","domain":".true-north.xyz"}]'
+    status = _asyncio.run(harvester.harvest_session(raw_cookies, _apply))
+    assert status["ok"] is True
+    assert status["applied"] is True
+    assert status["cookies_expired"] is False
+    assert status["thread_id"] == captured_thread
+    assert applied["access_token"] == "access_token_from_localstorage"
+    assert applied["refresh_token"] == "refresh_token_from_localstorage_xxxxx"
+    assert applied["thread_id"] == captured_thread
+
+
+def test_harvest_session_expired_cookies_redirected_to_login(monkeypatch):
+    """Redirect to /login → cookies_expired=True, applied=False, no apply_creds call."""
+    import asyncio as _asyncio
+    import harvester
+
+    page = _FakePage(final_url="https://app.true-north.xyz/login", status=200)
+    _install_fake_playwright(monkeypatch, page)
+
+    async def _apply(_update):
+        raise AssertionError("apply_creds must not be called when cookies are expired")
+
+    status = _asyncio.run(harvester.harvest_session(
+        '[{"name":"sid","value":"x","domain":".true-north.xyz"}]', _apply,
+    ))
+    assert status["ok"] is False
+    assert status["applied"] is False
+    assert status["cookies_expired"] is True
+    assert "login" in status["reason"].lower()
+
+
+def test_harvest_session_localstorage_empty_marks_cookies_expired(monkeypatch):
+    """Page loaded but privy:token missing → treat as expired, don't apply nothing."""
+    import asyncio as _asyncio
+    import harvester
+
+    page = _FakePage(access=None, refresh=None)
+    _install_fake_playwright(monkeypatch, page)
+
+    async def _apply(_update):
+        raise AssertionError("apply_creds must not be called when tokens are missing")
+
+    status = _asyncio.run(harvester.harvest_session(
+        '[{"name":"sid","value":"x","domain":".true-north.xyz"}]', _apply,
+    ))
+    assert status["ok"] is False
+    assert status["applied"] is False
+    assert status["cookies_expired"] is True
+    assert "localstorage" in status["reason"].lower()
+
+
+def test_harvest_session_skips_when_cookies_env_not_set(monkeypatch):
+    """Even with Playwright installed, empty TN_SESSION_COOKIES must short-circuit."""
+    import asyncio as _asyncio
+    import harvester
+
+    monkeypatch.setattr(harvester, "HAS_PLAYWRIGHT", True)
+
+    async def _apply(_update):
+        raise AssertionError("apply_creds must not be called when cookies env is empty")
+
+    status = _asyncio.run(harvester.harvest_session("", _apply))
+    assert status["ok"] is False
+    assert status["applied"] is False
+    assert "missing" in status["reason"].lower() or "unparseable" in status["reason"].lower()
+
+
+def test_extract_thread_id_from_post_body_string_and_dict():
+    import harvester
+    uuid_str = "78536e88-e440-43dd-a61d-584640f8792b"
+    assert harvester._extract_thread_id_from_post_body({"thread_id": uuid_str}) == uuid_str
+    assert harvester._extract_thread_id_from_post_body(json.dumps({"thread_id": uuid_str})) == uuid_str
+    assert harvester._extract_thread_id_from_post_body({"thread_id": "not-a-uuid"}) is None
+    assert harvester._extract_thread_id_from_post_body(None) is None
+    assert harvester._extract_thread_id_from_post_body("not json") is None
+    assert harvester._extract_thread_id_from_post_body({}) is None
+
+
+def test_harvester_available_reflects_flags(monkeypatch):
+    """harvester_available() is True only when both playwright is installed AND cookies are set."""
+    import harvester
+    monkeypatch.setattr(bot, "TN_SESSION_COOKIES", "[]")
+    monkeypatch.setattr(harvester, "HAS_PLAYWRIGHT", True)
+    monkeypatch.setattr(bot, "_harvester", harvester)
+    assert bot.harvester_available() is True
+
+    monkeypatch.setattr(bot, "TN_SESSION_COOKIES", "")
+    assert bot.harvester_available() is False
+
+    monkeypatch.setattr(bot, "TN_SESSION_COOKIES", "[]")
+    monkeypatch.setattr(harvester, "HAS_PLAYWRIGHT", False)
+    assert bot.harvester_available() is False
+
+
+def test_failure_embed_uses_honest_reason_from_tn_state(monkeypatch):
+    """_failure_embed must render tn_state['last_error'], not a hardcoded 'token may need refresh'."""
+    monkeypatch.setitem(bot.tn_state, "last_error", "TrueNorth timed out after 360s. Try again.")
+    embed = bot._failure_embed("Test Title")
+    assert embed.title == "Test Title"
+    assert "timed out" in (embed.description or "").lower()
+    assert "token may need refresh" not in (embed.description or "").lower()
+
+
+def test_cookies_expired_message_contains_actionable_steps():
+    assert "app.true-north.xyz" in bot.COOKIES_EXPIRED_MESSAGE
+    assert "Cookie-Editor" in bot.COOKIES_EXPIRED_MESSAGE
+    assert "TN_SESSION_COOKIES" in bot.COOKIES_EXPIRED_MESSAGE
+    assert "Railway" in bot.COOKIES_EXPIRED_MESSAGE
+
+
+def test_format_failure_reason_never_says_token_may_need_refresh():
+    """Regression: the honest-reason pipeline must not resurrect the old stale copy."""
+    for tag in ("auth", "empty_200", "invalid_request", "http_error", "sse_error",
+                "timeout", "exception", "unknown"):
+        msg = bot._format_failure_reason({"tag": tag, "status": 200, "err": "", "exc": None})
+        assert "token may need refresh" not in msg.lower()
+
+
 # Ensure json is importable in the test module for the helpers above.
 import json  # noqa: E402
 

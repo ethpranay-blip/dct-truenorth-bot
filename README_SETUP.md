@@ -185,16 +185,34 @@ If you export your browser cookies once and paste them into Railway, the bot can
 - If the session is still authenticated, reads `privy:token` + `privy:refresh_token` from `localStorage` and updates the bot state.
 - If the session has expired (redirect to login), posts a warning to `#claude-integration` asking you to `!setcreds` or re-export cookies.
 
-### Playwright is optional
+### Railway installs Playwright automatically (nixpacks.toml)
 
-The harvester needs Playwright installed. On a fresh Railway deploy, run once in the Railway shell:
+`nixpacks.toml` in the repo root tells Railway to:
+
+1. Install Chromium's native system deps via `apt` (libnss3, libatk1.0-0, etc.).
+2. Run `pip install -r requirements.txt` (Playwright is now pinned in `requirements.txt`).
+3. Run `python -m playwright install chromium --with-deps` to download the Chromium binary.
+
+First deploy after this change takes ~2–3 minutes longer than normal (Chromium is ~170 MB).
+
+### Memory impact — size your Railway instance accordingly
+
+- Idle bot (Python + discord.py + deps): **~120 MB RAM**
+- While the harvester runs (Chromium spawned, ~25–30 s): **+180–220 MB**, so ~320 MB peak
+- After harvest completes and Chromium exits: back to ~120 MB
+
+**Plan for at least 512 MB on Railway.** The free tier (256 MB) is too tight once Chromium launches and will OOM. Bump to Starter ($5/mo) or higher.
+
+### Running it manually (dev / debugging)
+
+On your local machine:
 
 ```bash
 pip install playwright
 python -m playwright install chromium
 ```
 
-If Playwright isn't installed, the harvester is a no-op — the core bot keeps working, you just fall back to `!setcreds` / env vars.
+If Playwright isn't installed the harvester is a clean no-op — `run_cookie_harvest()` returns `{"ok": False, "reason": "playwright not installed …"}`, `!health` shows `Harvester available: no`, and nothing else in the bot is affected. You still have `!setcreds` + env vars as the fallback paths.
 
 ---
 

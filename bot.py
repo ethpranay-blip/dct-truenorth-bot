@@ -265,6 +265,11 @@ tn_state: dict = {
     "token_cache_updated_at": _initial_cache_updated_at,  # ISO string or ""
     "thread_source": "unset",                        # "cache" | "env" | "api" | "unset"
     "thread_cache_updated_at": "",                   # ISO string or ""
+    "last_harvest_at": None,                         # datetime | None
+    "last_harvest_ok": None,                         # bool | None
+    "last_harvest_reason": "",                       # str
+    "last_cookies_alert_at": 0.0,                    # time.time() float, separate cooldown
+    "next_harvest_at": None,                         # datetime | None — scheduled
 }
 ALERT_COOLDOWN_SEC = 3600
 
@@ -790,11 +795,20 @@ async def query_truenorth(
             cleaned = dedupe_tn_text(sanitize_tn_text(text))
             return cleaned
 
-        # Empty 200: thread is unknown to TN. Stop immediately.
-        if tag == "empty_200":
-            invalidate_thread("TN returned HTTP 200 with zero stream chunks (unknown thread)")
+        # Empty 200 or InvalidRequestError: shared thread is stale. Try the
+        # cookie harvester first — it might yield a fresh thread_id from
+        # localStorage + /streams interception. If harvest+retry succeeds,
+        # return that text. Otherwise fall through to the actionable warning.
+        if tag in ("empty_200", "invalid_request"):
+            recovered = await _try_harvest_recovery(prompt, timeout_read)
+            if recovered:
+                return recovered
+            if tag == "empty_200":
+                invalidate_thread("TN returned HTTP 200 with zero stream chunks (unknown thread)")
+            else:
+                invalidate_thread("TN SSE returned InvalidRequestError — thread stale")
             await alert_thread_invalid()
-            tn_state["last_error"] = THREAD_INVALID_HINT
+            tn_state["last_error"] = _format_failure_reason(last)
             tn_state["last_error_at"] = datetime.now(IST)
             return ""
 
@@ -851,6 +865,24 @@ def _format_failure_reason(last: dict) -> str:
     return err or f"unknown failure (status={status})"
 
 
+def _failure_embed(title: str) -> discord.Embed:
+    """Build a consistent failure embed using the last honest error from tn_state.
+
+    Used by scheduled briefs and manual commands when query_truenorth returns
+    empty. Never hard-codes "Token may need refresh" — it routes through the
+    last classification tag so the user sees the real failure mode.
+    """
+    reason = tn_state.get("last_error") or "TrueNorth returned no data. Run !health for diagnostics."
+    e = discord.Embed(
+        title=title,
+        description=f"⚠️ {reason}",
+        color=COLOR_RISK,
+    )
+    e.set_footer(text=FOOTER)
+    e.timestamp = datetime.now(IST)
+    return e
+
+
 def _token_exp_summary() -> str:
     exp = decode_jwt_exp(token_store.get("access", ""))
     if not exp:
@@ -889,6 +921,51 @@ def _token_source_summary() -> str:
     if source == "env" and not age:
         return "env (cache missing or stale on boot)"
     return f"{source} ({age})" if age else source
+
+
+def _harvest_summary() -> str:
+    """One-liner for !health describing the most recent harvest attempt."""
+    dt = tn_state.get("last_harvest_at")
+    ok = tn_state.get("last_harvest_ok")
+    reason = tn_state.get("last_harvest_reason") or ""
+    if dt is None:
+        return "never"
+    age = _age_summary(dt.isoformat()) or "just now"
+    if ok:
+        tid_suffix = ""
+        return f"✅ {age.replace('saved ', '')}"
+    # Truncate noisy reasons for the embed.
+    short = reason[:120].replace("`", "'")
+    return f"❌ {age.replace('saved ', '')} — {short}" if short else f"❌ {age.replace('saved ', '')}"
+
+
+def _next_harvest_summary() -> str:
+    """Describe when the next scheduled harvest will fire."""
+    if not harvester_available():
+        return "— (disabled)"
+    dt = tn_state.get("next_harvest_at")
+    if dt is None:
+        try:
+            job = scheduler.get_job("cookie_harvest")
+        except Exception:
+            job = None
+        if job is not None and job.next_run_time is not None:
+            dt = job.next_run_time
+            tn_state["next_harvest_at"] = dt
+    if dt is None:
+        return "not scheduled"
+    now = datetime.now(IST)
+    try:
+        delta = int((dt - now).total_seconds())
+    except Exception:
+        return str(dt)[:40]
+    if delta <= 0:
+        return "imminent"
+    if delta < 3600:
+        return f"in {delta // 60}m"
+    if delta < 86400:
+        return f"in {delta // 3600}h {(delta % 3600) // 60}m"
+    return f"in {delta // 86400}d"
 
 
 def _thread_source_summary() -> str:
@@ -1099,45 +1176,111 @@ async def _apply_harvested_creds(update: dict) -> None:
     print("[Harvester] applied harvested credentials to in-memory state")
 
 
-async def run_cookie_harvest() -> dict:
-    """Run the Playwright harvester once. Posts a Discord alert if the session is dead.
+def harvester_available() -> bool:
+    """True iff the Playwright harvester can actually run (installed + cookies set)."""
+    return bool(TN_SESSION_COOKIES) and _harvester is not None and getattr(_harvester, "HAS_PLAYWRIGHT", False)
 
-    Returns the raw status dict from harvester.harvest_session (or an equivalent).
+
+async def run_cookie_harvest() -> dict:
+    """Run the Playwright harvester once. Tracks last attempt in tn_state and
+    posts a rate-limited Discord alert when cookies have expired.
+
+    Returns the raw status dict from harvester.harvest_session (plus a
+    no-op fast-path when prerequisites aren't met).
     """
+    tn_state["last_harvest_at"] = datetime.now(IST)
     if not TN_SESSION_COOKIES:
-        return {"ok": False, "reason": "TN_SESSION_COOKIES not set", "applied": False}
-    if _harvester is None:
-        return {"ok": False, "reason": "harvester module failed to import", "applied": False}
-    status = await _harvester.harvest_session(TN_SESSION_COOKIES, _apply_harvested_creds)
-    if not status.get("ok"):
-        await _alert_session_cookies_dead(status.get("reason") or "unknown")
+        status = {"ok": False, "reason": "TN_SESSION_COOKIES not set", "applied": False, "cookies_expired": False}
+    elif _harvester is None:
+        status = {"ok": False, "reason": "harvester module failed to import", "applied": False, "cookies_expired": False}
+    elif not getattr(_harvester, "HAS_PLAYWRIGHT", False):
+        status = {
+            "ok": False,
+            "reason": "playwright not installed — run `pip install playwright && python -m playwright install chromium`",
+            "applied": False,
+            "cookies_expired": False,
+        }
+    else:
+        status = await _harvester.harvest_session(TN_SESSION_COOKIES, _apply_harvested_creds)
+    tn_state["last_harvest_ok"] = bool(status.get("ok"))
+    tn_state["last_harvest_reason"] = status.get("reason") or ("ok" if status.get("ok") else "unknown")
+    if status.get("cookies_expired"):
+        await _alert_cookies_expired()
     return status
 
 
-async def _alert_session_cookies_dead(reason: str) -> None:
-    """One post per hour if the harvester can't keep the session alive."""
+COOKIES_EXPIRED_MESSAGE = (
+    "⚠️ **TrueNorth session cookies expired.** "
+    "Re-export from `app.true-north.xyz` using Cookie-Editor and update "
+    "`TN_SESSION_COOKIES` in Railway."
+)
+
+
+async def _alert_cookies_expired() -> None:
+    """Rate-limited (once per hour) cookies-expired alert to #claude-integration.
+
+    Uses its own cooldown bucket (``last_cookies_alert_at``) so it doesn't
+    compete with the generic TN-failure alerts.
+    """
     now = time.time()
-    if now - tn_state.get("last_alert_at", 0.0) < ALERT_COOLDOWN_SEC:
+    if now - tn_state.get("last_cookies_alert_at", 0.0) < ALERT_COOLDOWN_SEC:
         return
-    tn_state["last_alert_at"] = now
+    tn_state["last_cookies_alert_at"] = now
     try:
         channel = bot.get_channel(CH["claude"])
         if not channel:
             return
         e = discord.Embed(
             title="⚠️ TrueNorth session cookies expired",
-            description=(
-                "The harvester could not restore an authenticated session. "
-                f"`{reason[:400]}`\n\n"
-                "Use `!setcreds` with fresh values or re-export TN_SESSION_COOKIES."
-            ),
+            description=COOKIES_EXPIRED_MESSAGE,
             color=COLOR_RISK,
         )
-        e.set_footer(text=FOOTER)
+        reason = tn_state.get("last_harvest_reason") or ""
+        if reason:
+            e.add_field(name="Detail", value=f"```\n{reason[:400]}\n```", inline=False)
+        e.set_footer(text=f"{FOOTER} · alert rate-limited 1/hr")
         e.timestamp = datetime.now(IST)
         await channel.send(embed=e)
     except Exception as e:
-        print(f"[Alert] session-cookies-dead send failed: {type(e).__name__}: {e}")
+        print(f"[Alert] cookies-expired send failed: {type(e).__name__}: {e}")
+
+
+async def _try_harvest_recovery(prompt: str, timeout_read: float) -> str | None:
+    """Last-ditch recovery: run the harvester, then retry the original call once.
+
+    Called from query_truenorth on ``empty_200`` and ``invalid_request`` before
+    falling through to the invalidate-and-alert path. Returns the cleaned text
+    on recovery, or None to indicate "recovery didn't work — give up".
+
+    Only attempts the full harvest+retry when the harvester is actually
+    runnable (Playwright installed + cookies configured). Otherwise returns
+    None immediately so the caller proceeds to the actionable "!setcreds"
+    warning with no added latency.
+    """
+    if not harvester_available():
+        return None
+    print("[TN] runtime recovery — attempting cookie harvester")
+    status = await run_cookie_harvest()
+    if not status.get("ok"):
+        print(f"[TN] harvester recovery failed: {status.get('reason')}")
+        return None
+    # Retry the original prompt on the (possibly updated) shared thread.
+    tid = _tn_thread_current
+    if tid is None:
+        print("[TN] harvester succeeded but thread still unset — no retry possible")
+        return None
+    try:
+        text, status_code, err, sse_error, completed = await _tn_call_once(prompt, tid, timeout_read)
+    except Exception as e:
+        print(f"[TN] post-harvest retry raised {type(e).__name__}: {e}")
+        return None
+    if text and status_code == 200 and not sse_error:
+        tn_state["last_success_at"] = datetime.now(IST)
+        cleaned = dedupe_tn_text(sanitize_tn_text(text))
+        print(f"[TN] harvester recovery succeeded — returning {len(cleaned)} chars")
+        return cleaned
+    print(f"[TN] post-harvest retry still failed (status={status_code}, text_len={len(text)}, sse_error={sse_error})")
+    return None
 
 
 async def refresh_tn_token() -> bool:
@@ -1876,13 +2019,9 @@ async def run_session_brief(session: str, phase: str) -> bool:
     result = await query_truenorth(prompt)
     if not result:
         print(f"[SCHED] No response from TrueNorth for {label} {phase}")
-        e = discord.Embed(
-            title=f"📊 {label} Session -- {phase}",
-            description="⚠️ TrueNorth did not return data. Token may need refresh.\nUse !refreshtoken to check.",
-            color=COLOR_RISK,
-        )
-        e.set_footer(text=FOOTER)
-        await session_channel.send(embed=e)
+        await session_channel.send(embed=_failure_embed(
+            f"📊 {label} Session -- {phase}",
+        ))
         return False
     brief_embed = build_brief_embed(result, session, phase)
     await session_channel.send(embed=brief_embed)
@@ -1931,13 +2070,7 @@ async def run_regime_update():
     print("[SCHED] Querying TN for daily regime outlook...")
     result = await query_truenorth(prompt)
     if not result:
-        e = discord.Embed(
-            title="🌐 Daily Regime Outlook",
-            description="⚠️ TrueNorth did not return data. Token may need refresh.",
-            color=COLOR_RISK,
-        )
-        e.set_footer(text=FOOTER)
-        await channel.send(embed=e)
+        await channel.send(embed=_failure_embed("🌐 Daily Regime Outlook"))
         return
     embed = build_regime_embed(result)
     await channel.send(embed=embed)
@@ -2162,13 +2295,7 @@ async def manual_trades(ctx: commands.Context):
     )
     result = await query_truenorth(prompt)
     if not result:
-        e = discord.Embed(
-            title="📊 Trade Setups",
-            description="⚠️ No response from TrueNorth. Token may need refresh.\nUse !refreshtoken to check.",
-            color=COLOR_RISK,
-        )
-        e.set_footer(text=FOOTER)
-        await ctx.send(embed=e)
+        await ctx.send(embed=_failure_embed("📊 Trade Setups"))
         return
     trades = parse_trades_from_text(result)
     if trades:
@@ -2525,6 +2652,14 @@ async def manual_health(ctx: commands.Context):
     if tn_state["last_error"]:
         err_preview = str(tn_state["last_error"])[:400]
         e.add_field(name="Error detail", value=f"```\n{err_preview}\n```", inline=False)
+    # Harvester health
+    e.add_field(
+        name="Harvester available",
+        value=("yes" if harvester_available() else "no"),
+        inline=True,
+    )
+    e.add_field(name="Last harvest", value=_harvest_summary(), inline=True)
+    e.add_field(name="Next harvest", value=_next_harvest_summary(), inline=True)
     e.set_footer(text=FOOTER)
     e.timestamp = now
     await ctx.send(embed=e)

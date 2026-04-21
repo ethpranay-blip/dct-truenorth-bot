@@ -4,7 +4,8 @@ Stopgap until TN ships an official API key: if TN_SESSION_COOKIES is set
 (JSON array in the "Cookie-Editor" / Chrome DevTools export format), launch
 headless Chromium, restore the cookies, open app.true-north.xyz, confirm the
 session is authenticated, and yank the current Privy access/refresh tokens
-out of localStorage. The caller plugs those into token_store.
+out of localStorage. We also listen for any POST to /sse/v2/streams and
+intercept its `thread_id` so the caller can refresh the shared thread too.
 
 Design constraints:
   - Playwright is an optional dependency. Importing this module MUST NOT fail
@@ -14,14 +15,20 @@ Design constraints:
     only.
   - Every external interaction runs with short timeouts so a broken harvest
     never blocks the main bot loop.
+  - Chromium needs ~180-220 MB RAM at launch. Run on a Railway instance with
+    at least 512 MB available.
 """
 from __future__ import annotations
 
 import json
-import os
+import re
 from typing import Any, Awaitable, Callable
 
 TN_URL = "https://app.true-north.xyz"
+STREAMS_URL_FRAGMENT = "/sse/v2/streams"
+_UUID_RE = re.compile(
+    r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+)
 
 try:
     from playwright.async_api import async_playwright  # type: ignore
@@ -76,14 +83,39 @@ def _parse_cookies(raw: str) -> list[dict] | None:
     return normalised or None
 
 
+def _extract_thread_id_from_post_body(body_raw: Any) -> str | None:
+    """Pull a UUID `thread_id` out of a POST body (str or dict). None if absent."""
+    if body_raw is None:
+        return None
+    data: Any = body_raw
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except Exception:
+            return None
+    if not isinstance(data, dict):
+        return None
+    tid = data.get("thread_id")
+    if isinstance(tid, str) and _UUID_RE.match(tid.strip()):
+        return tid.strip()
+    return None
+
+
 async def harvest_session(raw_cookies: str, apply_creds: Callable[[dict], Awaitable[None]]) -> dict:
     """Run one harvest attempt.
 
-    Returns a status dict {ok, reason, applied}. Applies credentials only when
-    the session is confirmed authenticated and the tokens were successfully
-    extracted from localStorage.
+    Returns a status dict with keys:
+      * ``ok`` (bool)         — True iff tokens were successfully applied
+      * ``reason`` (str)      — failure reason, empty on success
+      * ``applied`` (bool)    — True iff apply_creds was called
+      * ``cookies_expired`` (bool) — True iff Chromium was redirected to
+                                     login (session cookies are dead)
+      * ``thread_id`` (str|None)   — the intercepted thread_id if captured
     """
-    status: dict[str, Any] = {"ok": False, "reason": "", "applied": False}
+    status: dict[str, Any] = {
+        "ok": False, "reason": "", "applied": False,
+        "cookies_expired": False, "thread_id": None,
+    }
     if not HAS_PLAYWRIGHT:
         status["reason"] = "playwright not installed (pip install playwright && python -m playwright install chromium)"
         print(f"[Harvester] skip: {status['reason']}")
@@ -95,19 +127,45 @@ async def harvest_session(raw_cookies: str, apply_creds: Callable[[dict], Awaita
 
     pw = None
     browser = None
+    captured_thread_id: list[str] = []  # mutable cell so the event handler can append
+
+    def _on_request(request: Any) -> None:
+        if captured_thread_id:
+            return
+        try:
+            if STREAMS_URL_FRAGMENT not in request.url:
+                return
+            if request.method.upper() != "POST":
+                return
+            # Prefer post_data_json when Playwright exposes it.
+            body = getattr(request, "post_data_json", None)
+            if body is None:
+                body = getattr(request, "post_data", None)
+            tid = _extract_thread_id_from_post_body(body)
+            if tid:
+                captured_thread_id.append(tid)
+                print(f"[Harvester] captured thread_id from {request.url}: {tid}")
+        except Exception as e:  # pragma: no cover — defensive
+            print(f"[Harvester] request handler error: {type(e).__name__}: {e}")
+
     try:
         pw = await async_playwright().start()
         browser = await pw.chromium.launch(headless=True)
         context = await browser.new_context()
         await context.add_cookies(cookies)
         page = await context.new_page()
+        page.on("request", _on_request)
         resp = await page.goto(TN_URL, timeout=20_000, wait_until="domcontentloaded")
         final_url = page.url
         if "login" in final_url or (resp is not None and resp.status >= 400):
+            status["cookies_expired"] = True
             status["reason"] = f"session invalid: redirected to {final_url} (status={resp.status if resp else '?'})"
             return status
-        # Give the app a moment to populate localStorage.
-        await page.wait_for_timeout(3_000)
+        # Give the app a moment to populate localStorage and issue its
+        # first /streams request (it usually fetches the user's current
+        # thread on mount). We wait longer than the original 3 s so the
+        # request interceptor has a real chance to fire.
+        await page.wait_for_timeout(8_000)
         access = await page.evaluate("() => window.localStorage.getItem('privy:token')")
         refresh = await page.evaluate("() => window.localStorage.getItem('privy:refresh_token')")
         if access:
@@ -115,17 +173,15 @@ async def harvest_session(raw_cookies: str, apply_creds: Callable[[dict], Awaita
         if refresh:
             refresh = refresh.strip('"')
         if not access or not refresh:
+            status["cookies_expired"] = True
             status["reason"] = "cookies loaded but privy:token / privy:refresh_token not found in localStorage"
             return status
         # Don't log the tokens themselves — just their lengths for sanity.
         print(f"[Harvester] extracted tokens (access_len={len(access)}, refresh_len={len(refresh)})")
-        # Attempt to read current thread_id from any captured SSE request payload.
-        # This is best-effort — if the user doesn't trigger a chat in <20s we
-        # fall back to the cached / env thread_id.
-        thread_id = os.environ.get("TN_THREAD_ID", "") or None
         update: dict[str, str] = {"access_token": access, "refresh_token": refresh}
-        if thread_id:
-            update["thread_id"] = thread_id
+        if captured_thread_id:
+            update["thread_id"] = captured_thread_id[0]
+            status["thread_id"] = captured_thread_id[0]
         await apply_creds(update)
         status["applied"] = True
         status["ok"] = True

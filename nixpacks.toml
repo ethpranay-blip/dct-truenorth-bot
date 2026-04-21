@@ -1,0 +1,25 @@
+# Railway (Nixpacks) build config.
+#
+# After `pip install -r requirements.txt` finishes, Playwright's Chromium
+# binary and its system libraries are not yet present — playwright ships only
+# the Python client. `playwright install chromium --with-deps` downloads the
+# browser and installs the native shared libs (libnss3, libatk1.0-0, etc).
+#
+# Memory footprint on Railway:
+#   - Base Python + discord.py + deps: ~120 MB
+#   - Harvester run (headless Chromium spawns for ~30 s, then exits): +180-220 MB
+#   - Steady-state after harvest: back to ~120 MB
+# Plan for a 512 MB instance at minimum. Free tier (256 MB) is too tight
+# once Chromium launches.
+
+[phases.setup]
+aptPkgs = ["...", "libnss3", "libnspr4", "libatk1.0-0", "libatk-bridge2.0-0", "libcups2", "libdrm2", "libxkbcommon0", "libxcomposite1", "libxdamage1", "libxfixes3", "libxrandr2", "libgbm1", "libasound2"]
+
+[phases.install]
+cmds = [
+  "pip install -r requirements.txt",
+  "python -m playwright install chromium --with-deps"
+]
+
+[start]
+cmd = "python bot.py"
