@@ -185,15 +185,51 @@ If you export your browser cookies once and paste them into Railway, the bot can
 - If the session is still authenticated, reads `privy:token` + `privy:refresh_token` from `localStorage` and updates the bot state.
 - If the session has expired (redirect to login), posts a warning to `#claude-integration` asking you to `!setcreds` or re-export cookies.
 
-### Railway installs Playwright automatically (nixpacks.toml)
+### Railway install flow (nixpacks.toml + start.sh)
 
-`nixpacks.toml` in the repo root tells Railway to:
+Two-layer setup because Railway's build → runtime filesystem copy has been observed to drop the default Chromium cache:
 
-1. Install Chromium's native system deps via `apt` (libnss3, libatk1.0-0, etc.).
-2. Run `pip install -r requirements.txt` (Playwright is now pinned in `requirements.txt`).
-3. Run `python -m playwright install chromium --with-deps` to download the Chromium binary.
+**`nixpacks.toml`** (build phase)
 
-First deploy after this change takes ~2–3 minutes longer than normal (Chromium is ~170 MB).
+1. `[phases.setup]` → installs Chromium's native system libs via `apt` (libnss3, libatk1.0-0, libpango-1.0-0, …).
+2. `[variables]` → exports `PLAYWRIGHT_BROWSERS_PATH=/app/.playwright-browsers` so the Chromium binary lands under `/app` (which Railway preserves between build and runtime).
+3. `[phases.install]` → `pip install -r requirements.txt` + `PLAYWRIGHT_BROWSERS_PATH=... python -m playwright install chromium`. No `--with-deps` here — that needs sudo which the build container refuses. The apt step above already handles native libs.
+4. `[start]` → `bash start.sh` (not `python bot.py`).
+
+**`start.sh`** (runtime safety net)
+
+```bash
+#!/bin/bash
+set -e
+export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-/app/.playwright-browsers}"
+# Idempotent — Playwright skips the download if Chromium is already there
+# (~1 s warm-path). If the build phase somehow dropped the binary, this
+# re-fetches it at boot (~30 s cold-path).
+python -m playwright install chromium 2>&1 | tail -20
+exec python bot.py
+```
+
+This two-layer approach means **even if the build phase fails to land Chromium, the bot still recovers on boot**.
+
+### Expected boot log (Railway)
+
+```
+[BOOT] PLAYWRIGHT_BROWSERS_PATH=/app/.playwright-browsers
+[BOOT] Installing Chromium via start.sh (idempotent)…
+Downloading Chromium 120.0.6099.28 …
+[BOOT] Chromium install step completed.
+[BOOT] Chromium cache dir contents:
+drwxr-xr-x 2 root root 4096 …  chromium_headless_shell-1208
+[BOOT] Launching bot.py
+[BOOT] Harvester preflight: playwright=True browsers_path=/app/.playwright-browsers chromium_present=True (/app/.playwright-browsers/chromium_headless_shell-1208/chrome-linux/headless_shell)
+DCT TrueNorth Bot online as …
+[BOOT] TN_SESSION_COOKIES present; running cookie harvester…
+[Harvester] extracted tokens (access_len=2048, refresh_len=64)
+```
+
+If `chromium_present=False` or the pre-flight line reports "chromium binary missing", the harvester is automatically skipped and `!health` surfaces the exact problem — no more opaque `BrowserType.launch: Executable doesn't exist` tracebacks.
+
+First deploy takes ~2–3 minutes longer than normal (Chromium is ~170 MB). Warm redeploys are fast again.
 
 ### Memory impact — size your Railway instance accordingly
 

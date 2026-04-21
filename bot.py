@@ -1177,8 +1177,36 @@ async def _apply_harvested_creds(update: dict) -> None:
 
 
 def harvester_available() -> bool:
-    """True iff the Playwright harvester can actually run (installed + cookies set)."""
-    return bool(TN_SESSION_COOKIES) and _harvester is not None and getattr(_harvester, "HAS_PLAYWRIGHT", False)
+    """True iff the Playwright harvester can actually run (installed + cookies set + Chromium on disk)."""
+    if not TN_SESSION_COOKIES:
+        return False
+    if _harvester is None or not getattr(_harvester, "HAS_PLAYWRIGHT", False):
+        return False
+    try:
+        exists, _ = _harvester.chromium_binary_exists()
+    except Exception:
+        return False
+    return bool(exists)
+
+
+def harvester_preflight() -> dict:
+    """Proxy to harvester.preflight_status() with a safe fallback when the module is absent."""
+    if _harvester is None:
+        return {
+            "has_playwright": False,
+            "browsers_path": "",
+            "chromium_present": False,
+            "chromium_path_or_reason": "harvester module failed to import",
+        }
+    try:
+        return _harvester.preflight_status()
+    except Exception as e:
+        return {
+            "has_playwright": False,
+            "browsers_path": "",
+            "chromium_present": False,
+            "chromium_path_or_reason": f"preflight error: {type(e).__name__}: {e}",
+        }
 
 
 async def run_cookie_harvest() -> dict:
@@ -2142,9 +2170,22 @@ async def on_ready():
         await refresh_tn_token()
     exp = decode_jwt_exp(token_store.get("access", ""))
     print(f"[BOOT] TN access token exp: {exp}")
+    # Harvester pre-flight — log the Chromium install state up front so
+    # Railway logs make the situation obvious before any command runs.
+    preflight = harvester_preflight()
+    print(
+        f"[BOOT] Harvester preflight: playwright={preflight['has_playwright']} "
+        f"browsers_path={preflight['browsers_path']} "
+        f"chromium_present={preflight['chromium_present']} "
+        f"({preflight['chromium_path_or_reason']})"
+    )
     if TN_SESSION_COOKIES and _harvester is not None:
-        print("[BOOT] TN_SESSION_COOKIES present; running cookie harvester…")
-        await run_cookie_harvest()
+        if preflight["chromium_present"]:
+            print("[BOOT] TN_SESSION_COOKIES present; running cookie harvester…")
+            await run_cookie_harvest()
+        else:
+            print("[BOOT] TN_SESSION_COOKIES present but Chromium is missing — "
+                  "skipping harvest (start.sh should have installed it; check build logs)")
     elif TN_SESSION_COOKIES and _harvester is None:
         print("[BOOT] TN_SESSION_COOKIES set but harvester module missing — skipping")
     # Acquire thread (env → cache → API create). Returns None when nothing works.
@@ -2653,6 +2694,7 @@ async def manual_health(ctx: commands.Context):
         err_preview = str(tn_state["last_error"])[:400]
         e.add_field(name="Error detail", value=f"```\n{err_preview}\n```", inline=False)
     # Harvester health
+    preflight = harvester_preflight()
     e.add_field(
         name="Harvester available",
         value=("yes" if harvester_available() else "no"),
@@ -2660,6 +2702,18 @@ async def manual_health(ctx: commands.Context):
     )
     e.add_field(name="Last harvest", value=_harvest_summary(), inline=True)
     e.add_field(name="Next harvest", value=_next_harvest_summary(), inline=True)
+    # Surface the Chromium pre-flight state so a missing binary shows up in
+    # !health instead of only in a Playwright stack trace during harvest.
+    chromium_line = (
+        f"✅ `{preflight['chromium_path_or_reason']}`"
+        if preflight.get("chromium_present")
+        else f"❌ `{preflight.get('chromium_path_or_reason') or 'missing'}`"
+    )
+    e.add_field(
+        name=f"Chromium ({preflight.get('browsers_path') or '—'})",
+        value=chromium_line[:1024],
+        inline=False,
+    )
     e.set_footer(text=FOOTER)
     e.timestamp = now
     await ctx.send(embed=e)

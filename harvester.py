@@ -21,6 +21,7 @@ Design constraints:
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Awaitable, Callable
 
@@ -30,6 +31,12 @@ _UUID_RE = re.compile(
     r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 )
 
+# Pin a known path that survives Railway's build → runtime filesystem hop.
+# start.sh sets the same value before launching the bot; this default exists
+# so local dev runs without having to export the var manually.
+DEFAULT_BROWSERS_PATH = "/app/.playwright-browsers"
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", DEFAULT_BROWSERS_PATH)
+
 try:
     from playwright.async_api import async_playwright  # type: ignore
 
@@ -37,6 +44,55 @@ try:
 except Exception:
     async_playwright = None  # type: ignore
     HAS_PLAYWRIGHT = False
+
+
+def _browsers_path() -> str:
+    """Return the directory Playwright downloads Chromium into."""
+    return os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or DEFAULT_BROWSERS_PATH
+
+
+def chromium_binary_exists() -> tuple[bool, str]:
+    """Return (exists, path_or_reason).
+
+    Playwright stores Chromium at ``$PLAYWRIGHT_BROWSERS_PATH/chromium-XXXX/
+    chrome-linux/headless_shell`` (newer versions) or ``.../chrome`` (older).
+    We glob for either and return the first hit. When nothing is found we
+    return the searched path so callers can surface it cleanly in !health.
+    """
+    import glob
+    base = _browsers_path()
+    if not os.path.isdir(base):
+        return False, f"browsers dir missing: {base}"
+    candidates: list[str] = []
+    for pattern in (
+        os.path.join(base, "chromium*", "chrome-linux*", "headless_shell"),
+        os.path.join(base, "chromium*", "chrome-linux*", "chrome"),
+        os.path.join(base, "chromium_headless_shell*", "chrome-linux*", "*"),
+    ):
+        candidates.extend(glob.glob(pattern))
+    for path in candidates:
+        if os.path.exists(path):
+            return True, path
+    return False, f"no chromium binary under {base}"
+
+
+def preflight_status() -> dict:
+    """Cheap diagnostic used by !health and run_cookie_harvest before launching.
+
+    Doesn't spin up Chromium — just reports whether everything the harvester
+    needs is in place. Keys:
+      * ``has_playwright`` (bool)
+      * ``browsers_path`` (str)
+      * ``chromium_present`` (bool)
+      * ``chromium_path_or_reason`` (str)
+    """
+    exists, path_or_reason = chromium_binary_exists()
+    return {
+        "has_playwright": HAS_PLAYWRIGHT,
+        "browsers_path": _browsers_path(),
+        "chromium_present": exists,
+        "chromium_path_or_reason": path_or_reason,
+    }
 
 
 def _parse_cookies(raw: str) -> list[dict] | None:
@@ -118,6 +174,21 @@ async def harvest_session(raw_cookies: str, apply_creds: Callable[[dict], Awaita
     }
     if not HAS_PLAYWRIGHT:
         status["reason"] = "playwright not installed (pip install playwright && python -m playwright install chromium)"
+        print(f"[Harvester] skip: {status['reason']}")
+        return status
+    # Pre-flight: if the Chromium binary isn't on disk, bail with a clean
+    # reason instead of letting Playwright raise BrowserType.launch. This is
+    # the exact failure mode we saw on Railway — build phase didn't land the
+    # binary, and the raw Playwright traceback wasn't surfacing to !health.
+    exists, path_or_reason = chromium_binary_exists()
+    pw_path = _browsers_path()
+    print(f"[Harvester] PLAYWRIGHT_BROWSERS_PATH={pw_path} chromium_present={exists} ({path_or_reason})")
+    if not exists:
+        status["reason"] = (
+            f"chromium binary missing at {path_or_reason}. "
+            "Run `python -m playwright install chromium` (start.sh normally "
+            "does this at boot — check Railway build logs)."
+        )
         print(f"[Harvester] skip: {status['reason']}")
         return status
     cookies = _parse_cookies(raw_cookies)

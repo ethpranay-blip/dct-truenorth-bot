@@ -1294,6 +1294,11 @@ def _install_fake_playwright(monkeypatch, page: _FakePage):
     import harvester
     monkeypatch.setattr(harvester, "HAS_PLAYWRIGHT", True)
     monkeypatch.setattr(harvester, "async_playwright", lambda: _FakePlaywright(page))
+    # Pretend the Chromium binary is on disk so the pre-flight check passes.
+    monkeypatch.setattr(
+        harvester, "chromium_binary_exists",
+        lambda: (True, "/app/.playwright-browsers/chromium_headless_shell-1234/chrome-linux/headless_shell"),
+    )
 
 
 def test_harvest_session_happy_path_applies_creds_and_captures_thread_id(monkeypatch):
@@ -1393,10 +1398,11 @@ def test_extract_thread_id_from_post_body_string_and_dict():
 
 
 def test_harvester_available_reflects_flags(monkeypatch):
-    """harvester_available() is True only when both playwright is installed AND cookies are set."""
+    """harvester_available() requires cookies + playwright package + Chromium binary on disk."""
     import harvester
     monkeypatch.setattr(bot, "TN_SESSION_COOKIES", "[]")
     monkeypatch.setattr(harvester, "HAS_PLAYWRIGHT", True)
+    monkeypatch.setattr(harvester, "chromium_binary_exists", lambda: (True, "/fake/path"))
     monkeypatch.setattr(bot, "_harvester", harvester)
     assert bot.harvester_available() is True
 
@@ -1405,6 +1411,11 @@ def test_harvester_available_reflects_flags(monkeypatch):
 
     monkeypatch.setattr(bot, "TN_SESSION_COOKIES", "[]")
     monkeypatch.setattr(harvester, "HAS_PLAYWRIGHT", False)
+    assert bot.harvester_available() is False
+
+    # Playwright package installed but Chromium binary missing → not available.
+    monkeypatch.setattr(harvester, "HAS_PLAYWRIGHT", True)
+    monkeypatch.setattr(harvester, "chromium_binary_exists", lambda: (False, "no chromium"))
     assert bot.harvester_available() is False
 
 
@@ -1422,6 +1433,63 @@ def test_cookies_expired_message_contains_actionable_steps():
     assert "Cookie-Editor" in bot.COOKIES_EXPIRED_MESSAGE
     assert "TN_SESSION_COOKIES" in bot.COOKIES_EXPIRED_MESSAGE
     assert "Railway" in bot.COOKIES_EXPIRED_MESSAGE
+
+
+def test_harvest_session_returns_clean_reason_when_chromium_missing(monkeypatch):
+    """The exact Railway failure mode — harvester must surface a clean reason,
+    not let BrowserType.launch raise."""
+    import asyncio as _asyncio
+    import harvester
+
+    monkeypatch.setattr(harvester, "HAS_PLAYWRIGHT", True)
+    monkeypatch.setattr(
+        harvester, "chromium_binary_exists",
+        lambda: (False, "no chromium binary under /app/.playwright-browsers"),
+    )
+    # If the pre-flight is wired correctly, async_playwright should never be called.
+    def _boom():
+        raise AssertionError("async_playwright() must not be invoked when Chromium is missing")
+    monkeypatch.setattr(harvester, "async_playwright", _boom)
+
+    async def _apply(_update):
+        raise AssertionError("apply_creds must not run when Chromium is absent")
+
+    status = _asyncio.run(harvester.harvest_session(
+        '[{"name":"sid","value":"x","domain":".true-north.xyz"}]', _apply,
+    ))
+    assert status["ok"] is False
+    assert status["applied"] is False
+    assert "chromium binary missing" in status["reason"].lower()
+    assert "/app/.playwright-browsers" in status["reason"]
+
+
+def test_preflight_status_reports_binary_state(monkeypatch, tmp_path):
+    """preflight_status() returns the right fields for each environment."""
+    import harvester
+
+    # Case 1: browsers_path missing entirely.
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path / "does-not-exist"))
+    out = harvester.preflight_status()
+    assert out["chromium_present"] is False
+    assert "missing" in out["chromium_path_or_reason"].lower()
+
+    # Case 2: Chromium binary present.
+    base = tmp_path / "browsers"
+    binary = base / "chromium_headless_shell-1234" / "chrome-linux" / "headless_shell"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(base))
+    out = harvester.preflight_status()
+    assert out["chromium_present"] is True
+    assert str(binary) in out["chromium_path_or_reason"]
+
+
+def test_harvester_preflight_proxy_returns_safe_fallback_when_module_missing(monkeypatch):
+    monkeypatch.setattr(bot, "_harvester", None)
+    out = bot.harvester_preflight()
+    assert out["has_playwright"] is False
+    assert out["chromium_present"] is False
+    assert "harvester module" in out["chromium_path_or_reason"].lower()
 
 
 def test_format_failure_reason_never_says_token_may_need_refresh():
