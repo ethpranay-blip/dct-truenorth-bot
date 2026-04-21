@@ -64,6 +64,7 @@ A Discord bot that pipes real-time crypto trading intelligence from **TrueNorth 
 - **Sanitized output** — TrueNorth's internal markup (`<Token>`, `<Anchor>`, `<sp>`) is stripped before anything hits Discord; markdown tables get auto-wrapped in code fences so they render as aligned monospace
 - **Bounded retries** — max 3 attempts per TrueNorth call with 10 s / 30 s back-off; empty-200 responses short-circuit immediately (they mean the thread is invalid, retrying won't help)
 - **Owner-only `!setcreds`** — rotate all three auth values (access, refresh, thread_id) from Discord without touching Railway; the message containing the JWTs is auto-deleted for security
+- **Mac-local harvester** — optional script in `harvester_local/` reads fresh credentials from an already-logged-in Chrome profile via CDP and POSTs them to the bot's `/credentials` webhook. Cron it every 8 h to keep the bot authed with zero manual effort. See [harvester_local/README.md](harvester_local/README.md)
 
 ---
 

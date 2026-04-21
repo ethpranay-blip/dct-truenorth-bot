@@ -869,42 +869,6 @@ def test_format_failure_reason_invalid_request_mentions_setcreds():
     assert "!setcreds" in msg
 
 
-# --- Round 7: harvester module ---
-
-def test_harvester_module_imports_without_playwright():
-    """Importing harvester must succeed even if Playwright isn't installed."""
-    import harvester
-    assert hasattr(harvester, "harvest_session")
-    assert hasattr(harvester, "HAS_PLAYWRIGHT")
-
-
-def test_harvester_parse_cookies_handles_cookie_editor_format():
-    import harvester
-    raw = json.dumps([
-        {
-            "domain": ".true-north.xyz", "name": "sid", "value": "abc",
-            "path": "/", "sameSite": "no_restriction", "secure": True,
-            "expirationDate": 1900000000.0,
-        },
-        {"name": "foo", "value": "bar"},  # minimal form
-        "garbage",                          # filtered out
-    ])
-    out = harvester._parse_cookies(raw)
-    assert isinstance(out, list)
-    names = [c["name"] for c in out]
-    assert names == ["sid", "foo"]
-    assert out[0]["sameSite"] == "None"
-    assert out[0]["expires"] == 1900000000
-    assert out[0]["secure"] is True
-
-
-def test_harvester_parse_cookies_rejects_non_list_and_invalid_json():
-    import harvester
-    assert harvester._parse_cookies("") is None
-    assert harvester._parse_cookies("{not json") is None
-    assert harvester._parse_cookies('{"name":"x"}') is None  # not a list
-
-
 def test_save_cached_thread_atomic_roundtrip(tmp_path, monkeypatch):
     """save → load must return exactly the UUID that was written."""
     cache_path = tmp_path / "thread_cache.json"
@@ -1173,323 +1137,6 @@ def test_token_source_summary_when_cache_missing(monkeypatch):
     assert "env" in out
 
 
-def test_harvest_session_without_playwright_returns_skip_reason():
-    """When Playwright isn't available the harvester must not crash."""
-    import asyncio as _asyncio
-    import harvester
-
-    original_flag = harvester.HAS_PLAYWRIGHT
-    try:
-        harvester.HAS_PLAYWRIGHT = False
-
-        async def _apply(_update):
-            raise AssertionError("apply_creds should not be called when Playwright is absent")
-
-        status = _asyncio.run(harvester.harvest_session('[{"name":"a","value":"b"}]', _apply))
-        assert status["ok"] is False
-        assert status["applied"] is False
-        assert "playwright" in status["reason"].lower()
-    finally:
-        harvester.HAS_PLAYWRIGHT = original_flag
-
-
-# --- Round 10: activated harvester paths ---
-
-class _FakeResponse:
-    def __init__(self, status: int = 200):
-        self.status = status
-
-
-class _FakeRequest:
-    def __init__(self, url, method="POST", body=None):
-        self.url = url
-        self.method = method
-        self.post_data_json = body
-        self.post_data = json.dumps(body) if body is not None else None
-
-
-class _FakePage:
-    """Mimics the handful of playwright.Page methods used by harvester.harvest_session."""
-    def __init__(self, *, final_url="https://app.true-north.xyz/", status=200,
-                 access="eyJheHA.body.sig", refresh="rt_opaque_string_plenty_long",
-                 streams_body=None):
-        self.url = final_url
-        self._status = status
-        self._access = access
-        self._refresh = refresh
-        self._streams_body = streams_body
-        self._request_handlers: list = []
-
-    def on(self, event: str, handler):
-        if event == "request":
-            self._request_handlers.append(handler)
-
-    async def goto(self, url, **_kwargs):
-        return _FakeResponse(self._status)
-
-    async def wait_for_timeout(self, _ms):
-        # Trigger the captured streams request (simulating TN's front-end firing it on load).
-        if self._streams_body is not None:
-            req = _FakeRequest(
-                "https://api.adventai.io/api/discovery-agents/sse/v2/streams",
-                method="POST",
-                body=self._streams_body,
-            )
-            for h in self._request_handlers:
-                h(req)
-
-    async def evaluate(self, expr: str):
-        if "privy:token" in expr:
-            return self._access
-        if "privy:refresh_token" in expr:
-            return self._refresh
-        return None
-
-
-class _FakeContext:
-    def __init__(self, page: _FakePage):
-        self._page = page
-        self.added_cookies = None
-
-    async def add_cookies(self, cookies):
-        self.added_cookies = cookies
-
-    async def new_page(self):
-        return self._page
-
-
-class _FakeBrowser:
-    def __init__(self, page: _FakePage):
-        self._page = page
-        self.closed = False
-
-    async def new_context(self):
-        return _FakeContext(self._page)
-
-    async def close(self):
-        self.closed = True
-
-
-class _FakeChromiumLauncher:
-    def __init__(self, page: _FakePage):
-        self._page = page
-
-    async def launch(self, **_kwargs):
-        return _FakeBrowser(self._page)
-
-
-class _FakePlaywright:
-    def __init__(self, page: _FakePage):
-        self.chromium = _FakeChromiumLauncher(page)
-        self.stopped = False
-
-    async def start(self):
-        return self
-
-    async def stop(self):
-        self.stopped = True
-
-
-def _install_fake_playwright(monkeypatch, page: _FakePage):
-    import harvester
-    monkeypatch.setattr(harvester, "HAS_PLAYWRIGHT", True)
-    monkeypatch.setattr(harvester, "async_playwright", lambda: _FakePlaywright(page))
-    # Pretend the Chromium binary is on disk so the pre-flight check passes.
-    monkeypatch.setattr(
-        harvester, "chromium_binary_exists",
-        lambda: (True, "/app/.playwright-browsers/chromium_headless_shell-1234/chrome-linux/headless_shell"),
-    )
-
-
-def test_harvest_session_happy_path_applies_creds_and_captures_thread_id(monkeypatch):
-    """Full flow: restore cookies → read localStorage → capture thread_id → apply creds."""
-    import asyncio as _asyncio
-    import harvester
-
-    captured_thread = "78536e88-e440-43dd-a61d-584640f8792b"
-    page = _FakePage(
-        access="access_token_from_localstorage",
-        refresh="refresh_token_from_localstorage_xxxxx",
-        streams_body={"query": "ping", "thread_id": captured_thread},
-    )
-    _install_fake_playwright(monkeypatch, page)
-
-    applied: dict = {}
-
-    async def _apply(update):
-        applied.update(update)
-
-    raw_cookies = '[{"name":"sid","value":"abc","domain":".true-north.xyz"}]'
-    status = _asyncio.run(harvester.harvest_session(raw_cookies, _apply))
-    assert status["ok"] is True
-    assert status["applied"] is True
-    assert status["cookies_expired"] is False
-    assert status["thread_id"] == captured_thread
-    assert applied["access_token"] == "access_token_from_localstorage"
-    assert applied["refresh_token"] == "refresh_token_from_localstorage_xxxxx"
-    assert applied["thread_id"] == captured_thread
-
-
-def test_harvest_session_expired_cookies_redirected_to_login(monkeypatch):
-    """Redirect to /login → cookies_expired=True, applied=False, no apply_creds call."""
-    import asyncio as _asyncio
-    import harvester
-
-    page = _FakePage(final_url="https://app.true-north.xyz/login", status=200)
-    _install_fake_playwright(monkeypatch, page)
-
-    async def _apply(_update):
-        raise AssertionError("apply_creds must not be called when cookies are expired")
-
-    status = _asyncio.run(harvester.harvest_session(
-        '[{"name":"sid","value":"x","domain":".true-north.xyz"}]', _apply,
-    ))
-    assert status["ok"] is False
-    assert status["applied"] is False
-    assert status["cookies_expired"] is True
-    assert "login" in status["reason"].lower()
-
-
-def test_harvest_session_localstorage_empty_marks_cookies_expired(monkeypatch):
-    """Page loaded but privy:token missing → treat as expired, don't apply nothing."""
-    import asyncio as _asyncio
-    import harvester
-
-    page = _FakePage(access=None, refresh=None)
-    _install_fake_playwright(monkeypatch, page)
-
-    async def _apply(_update):
-        raise AssertionError("apply_creds must not be called when tokens are missing")
-
-    status = _asyncio.run(harvester.harvest_session(
-        '[{"name":"sid","value":"x","domain":".true-north.xyz"}]', _apply,
-    ))
-    assert status["ok"] is False
-    assert status["applied"] is False
-    assert status["cookies_expired"] is True
-    assert "localstorage" in status["reason"].lower()
-
-
-def test_harvest_session_skips_when_cookies_env_not_set(monkeypatch):
-    """Even with Playwright installed, empty TN_SESSION_COOKIES must short-circuit."""
-    import asyncio as _asyncio
-    import harvester
-
-    monkeypatch.setattr(harvester, "HAS_PLAYWRIGHT", True)
-
-    async def _apply(_update):
-        raise AssertionError("apply_creds must not be called when cookies env is empty")
-
-    status = _asyncio.run(harvester.harvest_session("", _apply))
-    assert status["ok"] is False
-    assert status["applied"] is False
-    assert "missing" in status["reason"].lower() or "unparseable" in status["reason"].lower()
-
-
-def test_extract_thread_id_from_post_body_string_and_dict():
-    import harvester
-    uuid_str = "78536e88-e440-43dd-a61d-584640f8792b"
-    assert harvester._extract_thread_id_from_post_body({"thread_id": uuid_str}) == uuid_str
-    assert harvester._extract_thread_id_from_post_body(json.dumps({"thread_id": uuid_str})) == uuid_str
-    assert harvester._extract_thread_id_from_post_body({"thread_id": "not-a-uuid"}) is None
-    assert harvester._extract_thread_id_from_post_body(None) is None
-    assert harvester._extract_thread_id_from_post_body("not json") is None
-    assert harvester._extract_thread_id_from_post_body({}) is None
-
-
-def test_harvester_available_reflects_flags(monkeypatch):
-    """harvester_available() requires cookies + playwright package + Chromium binary on disk."""
-    import harvester
-    monkeypatch.setattr(bot, "TN_SESSION_COOKIES", "[]")
-    monkeypatch.setattr(harvester, "HAS_PLAYWRIGHT", True)
-    monkeypatch.setattr(harvester, "chromium_binary_exists", lambda: (True, "/fake/path"))
-    monkeypatch.setattr(bot, "_harvester", harvester)
-    assert bot.harvester_available() is True
-
-    monkeypatch.setattr(bot, "TN_SESSION_COOKIES", "")
-    assert bot.harvester_available() is False
-
-    monkeypatch.setattr(bot, "TN_SESSION_COOKIES", "[]")
-    monkeypatch.setattr(harvester, "HAS_PLAYWRIGHT", False)
-    assert bot.harvester_available() is False
-
-    # Playwright package installed but Chromium binary missing → not available.
-    monkeypatch.setattr(harvester, "HAS_PLAYWRIGHT", True)
-    monkeypatch.setattr(harvester, "chromium_binary_exists", lambda: (False, "no chromium"))
-    assert bot.harvester_available() is False
-
-
-def test_failure_embed_uses_honest_reason_from_tn_state(monkeypatch):
-    """_failure_embed must render tn_state['last_error'], not a hardcoded 'token may need refresh'."""
-    monkeypatch.setitem(bot.tn_state, "last_error", "TrueNorth timed out after 360s. Try again.")
-    embed = bot._failure_embed("Test Title")
-    assert embed.title == "Test Title"
-    assert "timed out" in (embed.description or "").lower()
-    assert "token may need refresh" not in (embed.description or "").lower()
-
-
-def test_cookies_expired_message_contains_actionable_steps():
-    assert "app.true-north.xyz" in bot.COOKIES_EXPIRED_MESSAGE
-    assert "Cookie-Editor" in bot.COOKIES_EXPIRED_MESSAGE
-    assert "TN_SESSION_COOKIES" in bot.COOKIES_EXPIRED_MESSAGE
-    assert "Railway" in bot.COOKIES_EXPIRED_MESSAGE
-
-
-def test_harvest_session_returns_clean_reason_when_chromium_missing(monkeypatch):
-    """The exact Railway failure mode — harvester must surface a clean reason,
-    not let BrowserType.launch raise."""
-    import asyncio as _asyncio
-    import harvester
-
-    monkeypatch.setattr(harvester, "HAS_PLAYWRIGHT", True)
-    monkeypatch.setattr(
-        harvester, "chromium_binary_exists",
-        lambda: (False, "no chromium binary under /app/.playwright-browsers"),
-    )
-    # If the pre-flight is wired correctly, async_playwright should never be called.
-    def _boom():
-        raise AssertionError("async_playwright() must not be invoked when Chromium is missing")
-    monkeypatch.setattr(harvester, "async_playwright", _boom)
-
-    async def _apply(_update):
-        raise AssertionError("apply_creds must not run when Chromium is absent")
-
-    status = _asyncio.run(harvester.harvest_session(
-        '[{"name":"sid","value":"x","domain":".true-north.xyz"}]', _apply,
-    ))
-    assert status["ok"] is False
-    assert status["applied"] is False
-    assert "chromium binary missing" in status["reason"].lower()
-    assert "/app/.playwright-browsers" in status["reason"]
-
-
-def test_preflight_status_reports_binary_state(monkeypatch, tmp_path):
-    """preflight_status() returns the right fields for each environment."""
-    import harvester
-
-    # Case 1: browsers_path missing entirely.
-    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path / "does-not-exist"))
-    out = harvester.preflight_status()
-    assert out["chromium_present"] is False
-    assert "missing" in out["chromium_path_or_reason"].lower()
-
-    # Case 2: Chromium binary present.
-    base = tmp_path / "browsers"
-    binary = base / "chromium_headless_shell-1234" / "chrome-linux" / "headless_shell"
-    binary.parent.mkdir(parents=True)
-    binary.write_text("#!/bin/sh\nexit 0\n")
-    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(base))
-    out = harvester.preflight_status()
-    assert out["chromium_present"] is True
-    assert str(binary) in out["chromium_path_or_reason"]
-
-
-def test_harvester_preflight_proxy_returns_safe_fallback_when_module_missing(monkeypatch):
-    monkeypatch.setattr(bot, "_harvester", None)
-    out = bot.harvester_preflight()
-    assert out["has_playwright"] is False
-    assert out["chromium_present"] is False
-    assert "harvester module" in out["chromium_path_or_reason"].lower()
 
 
 def test_format_failure_reason_never_says_token_may_need_refresh():
@@ -1518,6 +1165,203 @@ def test_extract_risk_flag_preserves_inner_table_rows():
     assert body is not None
     assert "| Catalyst" in body
     assert body.endswith("Reduce size.")
+
+
+# --- Round 11: webhook + Mac-local harvester ---
+
+def _make_jwt(payload=None):
+    """Build a shape-valid JWT for tests."""
+    import base64
+    import json as _json
+    hdr = base64.urlsafe_b64encode(b'{"alg":"HS256"}').decode().rstrip("=")
+    body = base64.urlsafe_b64encode(_json.dumps(payload or {"exp": 2000000000}).encode()).decode().rstrip("=")
+    return f"{hdr}.{body}.sig"
+
+
+VALID_UUID = "78536e88-e440-43dd-a61d-584640f8792b"
+
+
+def test_apply_pushed_creds_validates_inputs(monkeypatch, tmp_path):
+    """_apply_pushed_creds rejects bad shapes and accepts good ones."""
+    import asyncio as _asyncio
+    monkeypatch.setattr(bot, "TOKEN_CACHE_PATH", str(tmp_path / "tok.json"))
+    monkeypatch.setattr(bot, "THREAD_CACHE_PATH", str(tmp_path / "thr.json"))
+    monkeypatch.setattr(bot, "_tn_thread_current", None)
+
+    # Bad JWT
+    ok, err = _asyncio.run(bot._apply_pushed_creds({
+        "access_token": "not.a.jwt_payload",  # payload not valid base64-JSON
+        "refresh_token": "rt-" + "x" * 30,
+        "thread_id": VALID_UUID,
+    }))
+    assert ok is False
+    assert "access_token" in err
+
+    # Short refresh
+    ok, err = _asyncio.run(bot._apply_pushed_creds({
+        "access_token": _make_jwt(),
+        "refresh_token": "short",
+        "thread_id": VALID_UUID,
+    }))
+    assert ok is False
+    assert "refresh_token" in err
+
+    # Bad UUID
+    ok, err = _asyncio.run(bot._apply_pushed_creds({
+        "access_token": _make_jwt(),
+        "refresh_token": "rt-" + "x" * 30,
+        "thread_id": "not-a-uuid",
+    }))
+    assert ok is False
+    assert "thread_id" in err
+
+    # Happy path — caches written, in-memory state updated, flags cleared.
+    bot.tn_state["thread_invalid"] = True
+    bot.tn_state["thread_invalid_reason"] = "stale"
+    ok, err = _asyncio.run(bot._apply_pushed_creds({
+        "access_token": _make_jwt(),
+        "refresh_token": "rt-" + "x" * 30,
+        "thread_id": VALID_UUID,
+    }))
+    assert ok is True and err == ""
+    assert bot.token_store["access"] == _make_jwt()
+    assert bot._tn_thread_current == VALID_UUID
+    assert bot.tn_state["thread_invalid"] is False
+    assert bot.tn_state["token_source"] == "webhook"
+    assert bot.tn_state["thread_source"] == "webhook"
+    assert bot.tn_state["last_webhook_at"] is not None
+
+
+class _MockRequest:
+    """Lightweight stand-in for aiohttp.web.Request supporting .headers + .json()."""
+    def __init__(self, body=None, raw_body=None, headers=None):
+        self.headers = {"Content-Type": "application/json"}
+        if headers:
+            self.headers.update(headers)
+        self._body = body
+        self._raw = raw_body
+
+    async def json(self):
+        if self._raw is not None:
+            import json as _json
+            return _json.loads(self._raw)
+        return self._body
+
+
+def _resp_body_json(resp):
+    """Extract and parse the JSON body from an aiohttp Response for test assertions."""
+    import json as _json
+    raw = resp.body if isinstance(resp.body, (bytes, bytearray)) else resp.text.encode()
+    return _json.loads(raw.decode())
+
+
+def test_handle_credentials_rejects_missing_secret(monkeypatch):
+    """Bot with HARVESTER_SECRET unset must refuse every POST with 503."""
+    import asyncio as _asyncio
+    monkeypatch.setattr(bot, "HARVESTER_SECRET", "")
+    req = _MockRequest(body={}, headers={"X-Harvester-Secret": "anything"})
+    resp = _asyncio.run(bot._handle_credentials(req))
+    assert resp.status == 503
+
+
+def test_handle_credentials_rejects_wrong_secret(monkeypatch):
+    import asyncio as _asyncio
+    monkeypatch.setattr(bot, "HARVESTER_SECRET", "expected-secret")
+    req = _MockRequest(body={}, headers={"X-Harvester-Secret": "wrong"})
+    resp = _asyncio.run(bot._handle_credentials(req))
+    assert resp.status == 401
+
+
+def test_handle_credentials_rejects_invalid_json(monkeypatch):
+    import asyncio as _asyncio
+    monkeypatch.setattr(bot, "HARVESTER_SECRET", "s3cret")
+    req = _MockRequest(raw_body=b"{bad json", headers={"X-Harvester-Secret": "s3cret"})
+    resp = _asyncio.run(bot._handle_credentials(req))
+    assert resp.status == 400
+
+
+def test_handle_credentials_happy_path_applies_and_returns_exp(monkeypatch, tmp_path):
+    import asyncio as _asyncio
+    monkeypatch.setattr(bot, "HARVESTER_SECRET", "s3cret")
+    monkeypatch.setattr(bot, "TOKEN_CACHE_PATH", str(tmp_path / "tok.json"))
+    monkeypatch.setattr(bot, "THREAD_CACHE_PATH", str(tmp_path / "thr.json"))
+    monkeypatch.setattr(bot, "_tn_thread_current", None)
+    jwt = _make_jwt({"exp": 2000000000})
+    body = {
+        "access_token": jwt,
+        "refresh_token": "rt-" + "x" * 30,
+        "thread_id": VALID_UUID,
+    }
+    req = _MockRequest(body=body, headers={"X-Harvester-Secret": "s3cret"})
+    resp = _asyncio.run(bot._handle_credentials(req))
+    assert resp.status == 200
+    data = _resp_body_json(resp)
+    assert data["ok"] is True
+    assert data["thread_id"] == VALID_UUID
+    assert data["access_token_exp"] is not None
+    assert bot.token_store["access"] == jwt
+
+
+def test_handle_credentials_rejects_bad_payload_shape(monkeypatch):
+    import asyncio as _asyncio
+    monkeypatch.setattr(bot, "HARVESTER_SECRET", "s3cret")
+    # Missing thread_id
+    req = _MockRequest(
+        body={"access_token": _make_jwt(), "refresh_token": "rt-" + "x" * 30},
+        headers={"X-Harvester-Secret": "s3cret"},
+    )
+    resp = _asyncio.run(bot._handle_credentials(req))
+    assert resp.status == 400
+    # Non-object body
+    req = _MockRequest(body=["not", "a", "dict"], headers={"X-Harvester-Secret": "s3cret"})
+    resp = _asyncio.run(bot._handle_credentials(req))
+    assert resp.status == 400
+
+
+def test_handle_healthz_returns_ok_without_auth():
+    """GET /healthz is public (Railway uses it as a liveness probe)."""
+    import asyncio as _asyncio
+    req = _MockRequest()
+    resp = _asyncio.run(bot._handle_healthz(req))
+    assert resp.status == 200
+    data = _resp_body_json(resp)
+    assert data["ok"] is True
+
+
+def test_webhook_summary_shows_when_never_and_when_recent(monkeypatch):
+    monkeypatch.setitem(bot.tn_state, "last_webhook_at", None)
+    assert bot._webhook_summary() == "never"
+    monkeypatch.setitem(
+        bot.tn_state, "last_webhook_at",
+        (datetime.now(bot.IST) - timedelta(minutes=7))
+    )
+    out = bot._webhook_summary()
+    assert "m" in out and "ago" in out
+
+
+def test_harvester_pychrome_paths_have_no_import_side_effects():
+    """The Mac-local harvester module imports cleanly even without pychrome."""
+    import importlib.util
+    import pathlib
+    mod_path = pathlib.Path(__file__).resolve().parent.parent / "harvester_local" / "harvester.py"
+    spec = importlib.util.spec_from_file_location("dct_local_harvester", mod_path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    # These helpers must not require pychrome or a running Chrome to import.
+    assert module.strip_json_quotes('"abc"') == "abc"
+    assert module.strip_json_quotes("abc") == "abc"
+    assert module.UUID_RE.search(
+        "https://app.true-north.xyz/thread/78536e88-e440-43dd-a61d-584640f8792b"
+    ).group(0) == "78536e88-e440-43dd-a61d-584640f8792b"
+    # find_tn_tab picks the right tab.
+    tabs = [
+        {"type": "page", "url": "https://example.com", "id": "x"},
+        {"type": "page", "url": "https://app.true-north.xyz/thread/abc", "id": "y"},
+    ]
+    assert module.find_tn_tab(tabs)["id"] == "y"
+    # Empty list / no matching tab returns None.
+    assert module.find_tn_tab([]) is None
 
 
 # re needs to be accessible in the test module for regex-based assertions above.

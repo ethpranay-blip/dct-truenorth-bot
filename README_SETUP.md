@@ -145,110 +145,16 @@ Without the **Manage Messages** permission in `#claude-integration`, the bot can
 
 ---
 
-## `TN_SESSION_COOKIES` — the automatic backup
+## Mac-local harvester → `/credentials` webhook
 
-If you export your browser cookies once and paste them into Railway, the bot can re-harvest tokens on boot and every 20 h without you touching anything. This is optional but saves you a lot of `!setcreds` runs.
+If you want the bot to stay authed with zero manual `!setcreds` calls, run the Mac-local harvester (see [harvester_local/README.md](harvester_local/README.md) for full setup):
 
-### Export cookies
+1. Set `HARVESTER_SECRET` in Railway env (random 32+ char string).
+2. On Railway, the bot exposes `POST /credentials` at your public Railway URL. Railway auto-binds `$PORT`.
+3. On your Mac, launch Chrome with `--remote-debugging-port=9222`, open `app.true-north.xyz`, and run `harvester_local/setup.sh` to install pychrome + write your config.
+4. Cron `harvester_local/harvester.py` every 8 h. The script reads `privy:token` / `privy:refresh_token` from the Chrome tab's localStorage + captures `thread_id` from a `/sse/v2/streams` request, then POSTs all three to the bot with the `X-Harvester-Secret` header.
 
-1. Install [Cookie-Editor](https://cookie-editor.cgagnier.ca/) in Chrome.
-2. Visit [`app.true-north.xyz`](https://app.true-north.xyz) while logged in.
-3. Click the Cookie-Editor extension icon → **Export** → **Export as JSON**.
-4. You get a JSON array like:
-
-```json
-[
-  {
-    "domain": ".true-north.xyz",
-    "name": "sid",
-    "value": "…",
-    "path": "/",
-    "secure": true,
-    "sameSite": "no_restriction",
-    "expirationDate": 1766000000.0
-  }
-  // …more cookies
-]
-```
-
-5. Paste the **entire array** into Railway env var `TN_SESSION_COOKIES`. One-line JSON is fine.
-
-![Screenshot: Cookie-Editor extension popup with the Export button highlighted](docs/screenshots/cookie-editor-export.png)
-
-### Railway env setup
-
-![Screenshot: Railway Variables panel with TN_SESSION_COOKIES, TN_TOKEN, TN_REFRESH_TOKEN, TN_THREAD_ID rows](docs/screenshots/railway-variables.png)
-
-### What the bot does with it
-
-- On boot and every 20 h, launches headless Chromium, restores the cookies, visits `app.true-north.xyz`.
-- If the session is still authenticated, reads `privy:token` + `privy:refresh_token` from `localStorage` and updates the bot state.
-- If the session has expired (redirect to login), posts a warning to `#claude-integration` asking you to `!setcreds` or re-export cookies.
-
-### Railway install flow (nixpacks.toml + start.sh)
-
-Two-layer setup because Railway's build → runtime filesystem copy has been observed to drop the default Chromium cache:
-
-**`nixpacks.toml`** (build phase)
-
-1. `[phases.setup]` → installs Chromium's native system libs via `apt` (libnss3, libatk1.0-0, libpango-1.0-0, …).
-2. `[variables]` → exports `PLAYWRIGHT_BROWSERS_PATH=/app/.playwright-browsers` so the Chromium binary lands under `/app` (which Railway preserves between build and runtime).
-3. `[phases.install]` → `pip install -r requirements.txt` + `PLAYWRIGHT_BROWSERS_PATH=... python -m playwright install chromium`. No `--with-deps` here — that needs sudo which the build container refuses. The apt step above already handles native libs.
-4. `[start]` → `bash start.sh` (not `python bot.py`).
-
-**`start.sh`** (runtime safety net)
-
-```bash
-#!/bin/bash
-set -e
-export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-/app/.playwright-browsers}"
-# Idempotent — Playwright skips the download if Chromium is already there
-# (~1 s warm-path). If the build phase somehow dropped the binary, this
-# re-fetches it at boot (~30 s cold-path).
-python -m playwright install chromium 2>&1 | tail -20
-exec python bot.py
-```
-
-This two-layer approach means **even if the build phase fails to land Chromium, the bot still recovers on boot**.
-
-### Expected boot log (Railway)
-
-```
-[BOOT] PLAYWRIGHT_BROWSERS_PATH=/app/.playwright-browsers
-[BOOT] Installing Chromium via start.sh (idempotent)…
-Downloading Chromium 120.0.6099.28 …
-[BOOT] Chromium install step completed.
-[BOOT] Chromium cache dir contents:
-drwxr-xr-x 2 root root 4096 …  chromium_headless_shell-1208
-[BOOT] Launching bot.py
-[BOOT] Harvester preflight: playwright=True browsers_path=/app/.playwright-browsers chromium_present=True (/app/.playwright-browsers/chromium_headless_shell-1208/chrome-linux/headless_shell)
-DCT TrueNorth Bot online as …
-[BOOT] TN_SESSION_COOKIES present; running cookie harvester…
-[Harvester] extracted tokens (access_len=2048, refresh_len=64)
-```
-
-If `chromium_present=False` or the pre-flight line reports "chromium binary missing", the harvester is automatically skipped and `!health` surfaces the exact problem — no more opaque `BrowserType.launch: Executable doesn't exist` tracebacks.
-
-First deploy takes ~2–3 minutes longer than normal (Chromium is ~170 MB). Warm redeploys are fast again.
-
-### Memory impact — size your Railway instance accordingly
-
-- Idle bot (Python + discord.py + deps): **~120 MB RAM**
-- While the harvester runs (Chromium spawned, ~25–30 s): **+180–220 MB**, so ~320 MB peak
-- After harvest completes and Chromium exits: back to ~120 MB
-
-**Plan for at least 512 MB on Railway.** The free tier (256 MB) is too tight once Chromium launches and will OOM. Bump to Starter ($5/mo) or higher.
-
-### Running it manually (dev / debugging)
-
-On your local machine:
-
-```bash
-pip install playwright
-python -m playwright install chromium
-```
-
-If Playwright isn't installed the harvester is a clean no-op — `run_cookie_harvest()` returns `{"ok": False, "reason": "playwright not installed …"}`, `!health` shows `Harvester available: no`, and nothing else in the bot is affected. You still have `!setcreds` + env vars as the fallback paths.
+No Playwright, no Chromium on Railway, no cookie exports.
 
 ---
 
@@ -263,7 +169,8 @@ If Playwright isn't installed the harvester is a clean no-op — `run_cookie_har
 | `TN_REFRESH_TOKEN` | ⚠️ fallback | Initial refresh token |
 | `TN_THREAD_ID` | ⚠️ fallback | Initial thread UUID |
 | `PRANAY_DISCORD_ID` | ✅ for `!setcreds` | Discord user ID allowed to run `!setcreds` |
-| `TN_SESSION_COOKIES` | optional | JSON array of browser cookies (Cookie-Editor format) |
+| `HARVESTER_SECRET` | ✅ for webhook | Shared secret for `POST /credentials`. Mac-local harvester sends it as `X-Harvester-Secret`. Use any 32+ char random string. |
+| `PORT` | auto | Railway-managed. aiohttp binds to `0.0.0.0:$PORT`. |
 | `TN_APP_ORIGIN` | optional | Override `Origin` header on Privy refresh (defaults to `https://app.true-north.xyz`) |
 | `PRIVY_APP_ID` | optional | Defaults to TrueNorth's current Privy app id |
 | `TN_DEBUG` | optional | `1` enables per-SSE-chunk logging (noisy; turn off after use) |

@@ -44,15 +44,12 @@ import httpx
 import anthropic
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.interval import IntervalTrigger  # noqa: F401 — retained for future scheduler jobs
 from zoneinfo import ZoneInfo
 
-# Optional harvester — imports playwright internally with graceful degradation.
-try:
-    import harvester as _harvester
-except Exception as _harvester_import_err:  # pragma: no cover — defensive
-    _harvester = None
-    print(f"[BOOT] harvester module unavailable: {_harvester_import_err}")
+# aiohttp webhook server for credential updates pushed from the local Mac
+# harvester (see harvester_local/). Nothing Chromium-related runs on Railway.
+from aiohttp import web
 
 # --- Config ---
 DISCORD_TOKEN    = os.environ["DISCORD_BOT_TOKEN"]
@@ -61,7 +58,8 @@ TN_TOKEN         = os.environ.get("TN_TOKEN", "")
 TN_REFRESH       = os.environ.get("TN_REFRESH_TOKEN", "")
 PRIVY_APP_ID     = os.environ.get("PRIVY_APP_ID", "cm6afcumv0688a6x3r78jkx7v")
 PRANAY_DISCORD_ID = os.environ.get("PRANAY_DISCORD_ID", "").strip()
-TN_SESSION_COOKIES = os.environ.get("TN_SESSION_COOKIES", "").strip()
+HARVESTER_SECRET = os.environ.get("HARVESTER_SECRET", "").strip()
+WEBHOOK_PORT = int(os.environ.get("PORT", "8080"))
 
 TN_ENDPOINT      = "https://api.adventai.io/api/discovery-agents/sse/v2/streams"
 TN_THREAD_ENV    = os.environ.get("TN_THREAD_ID", "").strip()
@@ -263,13 +261,9 @@ tn_state: dict = {
     "boot_warning_posted": False,   # bool — guard against double-posting the boot warning
     "token_source": _initial_token_source,          # "cache" | "env" | "refresh"
     "token_cache_updated_at": _initial_cache_updated_at,  # ISO string or ""
-    "thread_source": "unset",                        # "cache" | "env" | "api" | "unset"
+    "thread_source": "unset",                        # "cache" | "env" | "api" | "unset" | "webhook"
     "thread_cache_updated_at": "",                   # ISO string or ""
-    "last_harvest_at": None,                         # datetime | None
-    "last_harvest_ok": None,                         # bool | None
-    "last_harvest_reason": "",                       # str
-    "last_cookies_alert_at": 0.0,                    # time.time() float, separate cooldown
-    "next_harvest_at": None,                         # datetime | None — scheduled
+    "last_webhook_at": None,                         # datetime | None — last successful /credentials POST
 }
 ALERT_COOLDOWN_SEC = 3600
 
@@ -795,14 +789,11 @@ async def query_truenorth(
             cleaned = dedupe_tn_text(sanitize_tn_text(text))
             return cleaned
 
-        # Empty 200 or InvalidRequestError: shared thread is stale. Try the
-        # cookie harvester first — it might yield a fresh thread_id from
-        # localStorage + /streams interception. If harvest+retry succeeds,
-        # return that text. Otherwise fall through to the actionable warning.
+        # Empty 200 or InvalidRequestError: shared thread is stale. No
+        # Railway-side recovery is possible; the Mac-local harvester will
+        # push fresh creds via POST /credentials within its next cron run,
+        # or the operator can !setcreds manually.
         if tag in ("empty_200", "invalid_request"):
-            recovered = await _try_harvest_recovery(prompt, timeout_read)
-            if recovered:
-                return recovered
             if tag == "empty_200":
                 invalidate_thread("TN returned HTTP 200 with zero stream chunks (unknown thread)")
             else:
@@ -923,49 +914,13 @@ def _token_source_summary() -> str:
     return f"{source} ({age})" if age else source
 
 
-def _harvest_summary() -> str:
-    """One-liner for !health describing the most recent harvest attempt."""
-    dt = tn_state.get("last_harvest_at")
-    ok = tn_state.get("last_harvest_ok")
-    reason = tn_state.get("last_harvest_reason") or ""
+def _webhook_summary() -> str:
+    """One-liner for !health describing the last successful /credentials POST."""
+    dt = tn_state.get("last_webhook_at")
     if dt is None:
         return "never"
     age = _age_summary(dt.isoformat()) or "just now"
-    if ok:
-        tid_suffix = ""
-        return f"✅ {age.replace('saved ', '')}"
-    # Truncate noisy reasons for the embed.
-    short = reason[:120].replace("`", "'")
-    return f"❌ {age.replace('saved ', '')} — {short}" if short else f"❌ {age.replace('saved ', '')}"
-
-
-def _next_harvest_summary() -> str:
-    """Describe when the next scheduled harvest will fire."""
-    if not harvester_available():
-        return "— (disabled)"
-    dt = tn_state.get("next_harvest_at")
-    if dt is None:
-        try:
-            job = scheduler.get_job("cookie_harvest")
-        except Exception:
-            job = None
-        if job is not None and job.next_run_time is not None:
-            dt = job.next_run_time
-            tn_state["next_harvest_at"] = dt
-    if dt is None:
-        return "not scheduled"
-    now = datetime.now(IST)
-    try:
-        delta = int((dt - now).total_seconds())
-    except Exception:
-        return str(dt)[:40]
-    if delta <= 0:
-        return "imminent"
-    if delta < 3600:
-        return f"in {delta // 60}m"
-    if delta < 86400:
-        return f"in {delta // 3600}h {(delta % 3600) // 60}m"
-    return f"in {delta // 86400}d"
+    return age.replace("saved ", "") + " ago" if not age.endswith("ago") else age.replace("saved ", "")
 
 
 def _thread_source_summary() -> str:
@@ -1151,164 +1106,110 @@ async def _privy_attempt(client: httpx.AsyncClient, body: dict, headers: dict) -
     return status, body_preview, parsed
 
 
-async def _apply_harvested_creds(update: dict) -> None:
-    """Callback for harvester.harvest_session. Persists new creds to memory + caches."""
+async def _apply_pushed_creds(update: dict) -> tuple[bool, str]:
+    """Apply creds pushed from the Mac-local harvester webhook.
+
+    Returns (ok, error_message). Writes to both caches atomically. Also clears
+    the thread-invalid flag and resets the one-shot boot-warning guard.
+    """
     global _tn_thread_current
-    access = update.get("access_token") or ""
-    refresh = update.get("refresh_token") or ""
-    thread_id = update.get("thread_id") or ""
-    if access:
-        token_store["access"] = access
-    if refresh:
-        token_store["refresh"] = refresh
-    if access or refresh:
-        if _save_token_cache(token_store["access"], token_store["refresh"]):
-            tn_state["token_source"] = "cache"
-            tn_state["token_cache_updated_at"] = datetime.now(IST).isoformat()
-    if thread_id:
-        _tn_thread_current = thread_id
-        if save_cached_thread(thread_id):
-            tn_state["thread_source"] = "cache"
-            tn_state["thread_cache_updated_at"] = datetime.now(IST).isoformat()
+    access = (update.get("access_token") or "").strip()
+    refresh = (update.get("refresh_token") or "").strip()
+    thread_id = (update.get("thread_id") or "").strip()
+
+    ok, err = _is_jwt_shape(access)
+    if not ok:
+        return False, f"access_token: {err}"
+    if len(refresh) < 20:
+        return False, f"refresh_token too short (len={len(refresh)})"
+    if not _is_valid_thread_id(thread_id):
+        return False, f"thread_id not a valid UUID: {thread_id[:40]!r}"
+
+    # Persist thread first — if the disk write fails, we don't want the
+    # in-memory state to drift from what's on disk.
+    if not save_cached_thread(thread_id):
+        return False, "could not write thread_cache.json"
+    tn_state["thread_source"] = "webhook"
+    tn_state["thread_cache_updated_at"] = datetime.now(IST).isoformat()
+
+    token_store["access"] = access
+    token_store["refresh"] = refresh
+    if _save_token_cache(access, refresh):
+        tn_state["token_source"] = "webhook"
+        tn_state["token_cache_updated_at"] = datetime.now(IST).isoformat()
+
+    _tn_thread_current = thread_id
     tn_state["thread_invalid"] = False
     tn_state["thread_invalid_reason"] = ""
     tn_state["boot_warning_posted"] = False
-    print("[Harvester] applied harvested credentials to in-memory state")
+    tn_state["last_webhook_at"] = datetime.now(IST)
+
+    exp = decode_jwt_exp(access)
+    print(
+        f"[Webhook] credentials updated from harvester — "
+        f"thread={thread_id}, access_exp={exp.isoformat() if exp else 'unknown'}"
+    )
+    return True, ""
 
 
-def harvester_available() -> bool:
-    """True iff the Playwright harvester can actually run (installed + cookies set + Chromium on disk)."""
-    if not TN_SESSION_COOKIES:
-        return False
-    if _harvester is None or not getattr(_harvester, "HAS_PLAYWRIGHT", False):
-        return False
-    try:
-        exists, _ = _harvester.chromium_binary_exists()
-    except Exception:
-        return False
-    return bool(exists)
+# --- Webhook server (/credentials endpoint) ---
+_web_runner: web.AppRunner | None = None
 
 
-def harvester_preflight() -> dict:
-    """Proxy to harvester.preflight_status() with a safe fallback when the module is absent."""
-    if _harvester is None:
-        return {
-            "has_playwright": False,
-            "browsers_path": "",
-            "chromium_present": False,
-            "chromium_path_or_reason": "harvester module failed to import",
-        }
-    try:
-        return _harvester.preflight_status()
-    except Exception as e:
-        return {
-            "has_playwright": False,
-            "browsers_path": "",
-            "chromium_present": False,
-            "chromium_path_or_reason": f"preflight error: {type(e).__name__}: {e}",
-        }
-
-
-async def run_cookie_harvest() -> dict:
-    """Run the Playwright harvester once. Tracks last attempt in tn_state and
-    posts a rate-limited Discord alert when cookies have expired.
-
-    Returns the raw status dict from harvester.harvest_session (plus a
-    no-op fast-path when prerequisites aren't met).
-    """
-    tn_state["last_harvest_at"] = datetime.now(IST)
-    if not TN_SESSION_COOKIES:
-        status = {"ok": False, "reason": "TN_SESSION_COOKIES not set", "applied": False, "cookies_expired": False}
-    elif _harvester is None:
-        status = {"ok": False, "reason": "harvester module failed to import", "applied": False, "cookies_expired": False}
-    elif not getattr(_harvester, "HAS_PLAYWRIGHT", False):
-        status = {
-            "ok": False,
-            "reason": "playwright not installed — run `pip install playwright && python -m playwright install chromium`",
-            "applied": False,
-            "cookies_expired": False,
-        }
-    else:
-        status = await _harvester.harvest_session(TN_SESSION_COOKIES, _apply_harvested_creds)
-    tn_state["last_harvest_ok"] = bool(status.get("ok"))
-    tn_state["last_harvest_reason"] = status.get("reason") or ("ok" if status.get("ok") else "unknown")
-    if status.get("cookies_expired"):
-        await _alert_cookies_expired()
-    return status
-
-
-COOKIES_EXPIRED_MESSAGE = (
-    "⚠️ **TrueNorth session cookies expired.** "
-    "Re-export from `app.true-north.xyz` using Cookie-Editor and update "
-    "`TN_SESSION_COOKIES` in Railway."
-)
-
-
-async def _alert_cookies_expired() -> None:
-    """Rate-limited (once per hour) cookies-expired alert to #claude-integration.
-
-    Uses its own cooldown bucket (``last_cookies_alert_at``) so it doesn't
-    compete with the generic TN-failure alerts.
-    """
-    now = time.time()
-    if now - tn_state.get("last_cookies_alert_at", 0.0) < ALERT_COOLDOWN_SEC:
-        return
-    tn_state["last_cookies_alert_at"] = now
-    try:
-        channel = bot.get_channel(CH["claude"])
-        if not channel:
-            return
-        e = discord.Embed(
-            title="⚠️ TrueNorth session cookies expired",
-            description=COOKIES_EXPIRED_MESSAGE,
-            color=COLOR_RISK,
+async def _handle_credentials(request: web.Request) -> web.Response:
+    """POST /credentials — apply fresh creds pushed from the Mac-local harvester."""
+    if not HARVESTER_SECRET:
+        return web.json_response(
+            {"error": "HARVESTER_SECRET not configured on the bot"}, status=503,
         )
-        reason = tn_state.get("last_harvest_reason") or ""
-        if reason:
-            e.add_field(name="Detail", value=f"```\n{reason[:400]}\n```", inline=False)
-        e.set_footer(text=f"{FOOTER} · alert rate-limited 1/hr")
-        e.timestamp = datetime.now(IST)
-        await channel.send(embed=e)
-    except Exception as e:
-        print(f"[Alert] cookies-expired send failed: {type(e).__name__}: {e}")
-
-
-async def _try_harvest_recovery(prompt: str, timeout_read: float) -> str | None:
-    """Last-ditch recovery: run the harvester, then retry the original call once.
-
-    Called from query_truenorth on ``empty_200`` and ``invalid_request`` before
-    falling through to the invalidate-and-alert path. Returns the cleaned text
-    on recovery, or None to indicate "recovery didn't work — give up".
-
-    Only attempts the full harvest+retry when the harvester is actually
-    runnable (Playwright installed + cookies configured). Otherwise returns
-    None immediately so the caller proceeds to the actionable "!setcreds"
-    warning with no added latency.
-    """
-    if not harvester_available():
-        return None
-    print("[TN] runtime recovery — attempting cookie harvester")
-    status = await run_cookie_harvest()
-    if not status.get("ok"):
-        print(f"[TN] harvester recovery failed: {status.get('reason')}")
-        return None
-    # Retry the original prompt on the (possibly updated) shared thread.
-    tid = _tn_thread_current
-    if tid is None:
-        print("[TN] harvester succeeded but thread still unset — no retry possible")
-        return None
+    if request.headers.get("X-Harvester-Secret") != HARVESTER_SECRET:
+        return web.json_response({"error": "unauthorized"}, status=401)
     try:
-        text, status_code, err, sse_error, completed = await _tn_call_once(prompt, tid, timeout_read)
+        body = await request.json()
     except Exception as e:
-        print(f"[TN] post-harvest retry raised {type(e).__name__}: {e}")
-        return None
-    if text and status_code == 200 and not sse_error:
-        tn_state["last_success_at"] = datetime.now(IST)
-        cleaned = dedupe_tn_text(sanitize_tn_text(text))
-        print(f"[TN] harvester recovery succeeded — returning {len(cleaned)} chars")
-        return cleaned
-    print(f"[TN] post-harvest retry still failed (status={status_code}, text_len={len(text)}, sse_error={sse_error})")
-    return None
+        return web.json_response(
+            {"error": f"invalid JSON: {type(e).__name__}"}, status=400,
+        )
+    if not isinstance(body, dict):
+        return web.json_response({"error": "body must be a JSON object"}, status=400)
+    ok, err = await _apply_pushed_creds(body)
+    if not ok:
+        return web.json_response({"error": err}, status=400)
+    exp = decode_jwt_exp(token_store.get("access", ""))
+    return web.json_response({
+        "ok": True,
+        "access_token_exp": exp.isoformat() if exp else None,
+        "thread_id": _tn_thread_current,
+    })
+
+
+async def _handle_healthz(_request: web.Request) -> web.Response:
+    """GET /healthz — liveness probe. No auth required."""
+    return web.json_response({
+        "ok": True,
+        "thread_id": _tn_thread_current,
+        "thread_invalid": bool(tn_state.get("thread_invalid")),
+        "last_tn_success_at": (
+            tn_state["last_success_at"].isoformat() if tn_state.get("last_success_at") else None
+        ),
+    })
+
+
+async def start_webhook_server() -> None:
+    """Bring up the aiohttp server on $PORT. Idempotent."""
+    global _web_runner
+    if _web_runner is not None:
+        return
+    app = web.Application()
+    app.router.add_post("/credentials", _handle_credentials)
+    app.router.add_get("/healthz", _handle_healthz)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
+    await site.start()
+    _web_runner = runner
+    secret_state = "set" if HARVESTER_SECRET else "UNSET (every POST /credentials will 503)"
+    print(f"[Webhook] listening on 0.0.0.0:{WEBHOOK_PORT} (HARVESTER_SECRET={secret_state})")
 
 
 async def refresh_tn_token() -> bool:
@@ -2146,15 +2047,6 @@ def setup_scheduler():
         id="token_refresh",
         replace_existing=True,
     )
-    if TN_SESSION_COOKIES and _harvester is not None:
-        # Run the cookie harvester preemptively before Privy's 24h expiry.
-        scheduler.add_job(
-            run_cookie_harvest,
-            IntervalTrigger(hours=20),
-            id="cookie_harvest",
-            replace_existing=True,
-            next_run_time=None,  # don't double-run on boot; on_ready already handles boot.
-        )
 
 # --- Bot events ---
 @bot.event
@@ -2170,24 +2062,8 @@ async def on_ready():
         await refresh_tn_token()
     exp = decode_jwt_exp(token_store.get("access", ""))
     print(f"[BOOT] TN access token exp: {exp}")
-    # Harvester pre-flight — log the Chromium install state up front so
-    # Railway logs make the situation obvious before any command runs.
-    preflight = harvester_preflight()
-    print(
-        f"[BOOT] Harvester preflight: playwright={preflight['has_playwright']} "
-        f"browsers_path={preflight['browsers_path']} "
-        f"chromium_present={preflight['chromium_present']} "
-        f"({preflight['chromium_path_or_reason']})"
-    )
-    if TN_SESSION_COOKIES and _harvester is not None:
-        if preflight["chromium_present"]:
-            print("[BOOT] TN_SESSION_COOKIES present; running cookie harvester…")
-            await run_cookie_harvest()
-        else:
-            print("[BOOT] TN_SESSION_COOKIES present but Chromium is missing — "
-                  "skipping harvest (start.sh should have installed it; check build logs)")
-    elif TN_SESSION_COOKIES and _harvester is None:
-        print("[BOOT] TN_SESSION_COOKIES set but harvester module missing — skipping")
+    # Webhook server for credential pushes from the Mac-local harvester.
+    await start_webhook_server()
     # Acquire thread (env → cache → API create). Returns None when nothing works.
     boot_tid = await ensure_thread_id_async()
     if boot_tid:
@@ -2693,27 +2569,13 @@ async def manual_health(ctx: commands.Context):
     if tn_state["last_error"]:
         err_preview = str(tn_state["last_error"])[:400]
         e.add_field(name="Error detail", value=f"```\n{err_preview}\n```", inline=False)
-    # Harvester health
-    preflight = harvester_preflight()
+    # Webhook push status (credentials from the Mac-local harvester)
     e.add_field(
-        name="Harvester available",
-        value=("yes" if harvester_available() else "no"),
-        inline=True,
-    )
-    e.add_field(name="Last harvest", value=_harvest_summary(), inline=True)
-    e.add_field(name="Next harvest", value=_next_harvest_summary(), inline=True)
-    # Surface the Chromium pre-flight state so a missing binary shows up in
-    # !health instead of only in a Playwright stack trace during harvest.
-    chromium_line = (
-        f"✅ `{preflight['chromium_path_or_reason']}`"
-        if preflight.get("chromium_present")
-        else f"❌ `{preflight.get('chromium_path_or_reason') or 'missing'}`"
-    )
-    e.add_field(
-        name=f"Chromium ({preflight.get('browsers_path') or '—'})",
-        value=chromium_line[:1024],
+        name="Webhook endpoint",
+        value=(f"listening on :{WEBHOOK_PORT}" + (" (secret set)" if HARVESTER_SECRET else " (⚠️ secret UNSET)")),
         inline=False,
     )
+    e.add_field(name="Last creds push", value=_webhook_summary(), inline=True)
     e.set_footer(text=FOOTER)
     e.timestamp = now
     await ctx.send(embed=e)
