@@ -152,80 +152,146 @@ def strip_json_quotes(value: str) -> str:
     return v
 
 
-def capture_thread_id(tab: dict, timeout_s: int = STREAMS_WAIT_SECONDS) -> str | None:
-    """Enable the Network domain and wait for a /sse/v2/streams POST, extract thread_id.
+def extract_thread_id_from_url(url: str) -> str | None:
+    """Pull a UUID out of the tab URL (e.g. .../chat/<uuid>). Returns None if absent."""
+    if not url:
+        return None
+    m = UUID_RE.search(url)
+    return m.group(0) if m else None
 
-    Falls back to the last known value in ~/.dct-harvester-thread, or — if the
-    tab URL itself contains a UUID — to that. Returns None only when everything
-    fails.
+
+def _read_thread_id_from_cache() -> str | None:
+    """Read a previously-saved thread_id from ~/.dct-harvester-thread, if valid."""
+    if not THREAD_CACHE_PATH.exists():
+        return None
+    try:
+        cached = THREAD_CACHE_PATH.read_text().strip()
+    except OSError:
+        return None
+    return cached if UUID_RE.fullmatch(cached) else None
+
+
+def capture_thread_id_via_cdp(tab: dict, timeout_s: int = STREAMS_WAIT_SECONDS) -> str | None:
+    """Enable the Network CDP domain and intercept the next /sse/v2/streams POST.
+
+    This used to be the primary path but is now the fallback — we hit it only
+    when the tab URL doesn't contain a thread UUID. Pychrome's internal
+    _recv_loop has been observed to crash with JSONDecodeError on certain
+    empty WebSocket frames; we wrap every call defensively so a failure here
+    can never bring down the whole harvest.
     """
-    import pychrome  # imported lazily so the earlier SystemExit covers the
-    # missing-dep case uniformly
+    try:
+        import pychrome  # type: ignore
+    except ImportError:
+        logging.warning("pychrome not installed — skipping CDP-based capture")
+        return None
 
-    browser = pychrome.Browser(url=CDP_ENDPOINT)
     target_tab = None
-    for t in browser.list_tab():
-        if t.id == tab["id"]:
-            target_tab = t
-            break
+    try:
+        browser = pychrome.Browser(url=CDP_ENDPOINT)
+        for t in browser.list_tab():
+            if t.id == tab["id"]:
+                target_tab = t
+                break
+    except Exception as e:
+        logging.warning("CDP attach failed (%s: %s)", type(e).__name__, e)
+        return None
     if target_tab is None:
-        return _fallback_thread_id(tab)
+        logging.warning("CDP could not find tab id=%s", tab.get("id"))
+        return None
 
     captured: dict[str, str] = {}
 
     def _on_request_will_be_sent(**kwargs):
         if captured.get("tid"):
             return
-        request = kwargs.get("request") or {}
-        url = request.get("url", "")
-        method = request.get("method", "")
-        if STREAMS_URL_FRAGMENT not in url or method.upper() != "POST":
-            return
-        body = request.get("postData")
-        if not body:
-            return
         try:
-            obj = json.loads(body)
-        except Exception:
-            return
-        tid = obj.get("thread_id") if isinstance(obj, dict) else None
-        if isinstance(tid, str) and UUID_RE.fullmatch(tid.strip()):
-            captured["tid"] = tid.strip()
+            request = kwargs.get("request") or {}
+            url = request.get("url", "")
+            method = request.get("method", "")
+            if STREAMS_URL_FRAGMENT not in url or method.upper() != "POST":
+                return
+            body = request.get("postData")
+            if not body:
+                return
+            try:
+                obj = json.loads(body)
+            except Exception:
+                return
+            tid = obj.get("thread_id") if isinstance(obj, dict) else None
+            if isinstance(tid, str) and UUID_RE.fullmatch(tid.strip()):
+                captured["tid"] = tid.strip()
+        except Exception as listener_err:
+            logging.warning("CDP request listener error: %s", listener_err)
 
-    target_tab.start()
     try:
-        target_tab.Network.enable()
-        target_tab.set_listener("Network.requestWillBeSent", _on_request_will_be_sent)
+        target_tab.start()
+    except Exception as e:
+        logging.warning("CDP target_tab.start() failed (%s: %s)", type(e).__name__, e)
+        return None
+
+    try:
+        try:
+            target_tab.Network.enable()
+            target_tab.set_listener("Network.requestWillBeSent", _on_request_will_be_sent)
+        except Exception as e:
+            logging.warning("CDP Network.enable() / set_listener failed (%s: %s)",
+                            type(e).__name__, e)
+            return None
         deadline = time.time() + timeout_s
         while time.time() < deadline and not captured.get("tid"):
-            target_tab.wait(1)
-        tid = captured.get("tid")
+            try:
+                target_tab.wait(1)
+            except json.JSONDecodeError as e:
+                logging.warning("pychrome _recv_loop JSON decode error (ignored): %s", e)
+                # The recv-loop runs on a daemon thread; we can't restart it,
+                # but we can stop polling and surrender gracefully.
+                break
+            except Exception as e:
+                logging.warning("pychrome wait() raised %s: %s — aborting capture",
+                                type(e).__name__, e)
+                break
     finally:
         try:
             target_tab.stop()
         except Exception:
             pass
 
-    if tid:
-        _save_thread_cache(tid)
-        return tid
-    return _fallback_thread_id(tab)
+    return captured.get("tid")
 
 
-def _fallback_thread_id(tab: dict) -> str | None:
-    """Recover a thread_id from the tab URL or the last-seen cache file."""
-    url = tab.get("url", "")
-    m = UUID_RE.search(url)
-    if m:
-        return m.group(0)
-    if THREAD_CACHE_PATH.exists():
-        try:
-            cached = THREAD_CACHE_PATH.read_text().strip()
-            if UUID_RE.fullmatch(cached):
-                return cached
-        except OSError:
-            pass
-    return None
+def resolve_thread_id(tab: dict) -> tuple[str | None, str]:
+    """Resolve thread_id, preferring the cheapest source.
+
+    Order:
+      1. UUID embedded in the tab URL (no CDP traffic at all)
+      2. CDP /sse/v2/streams interception (up to STREAMS_WAIT_SECONDS)
+      3. Last-known value in ~/.dct-harvester-thread
+
+    Returns (thread_id_or_None, source_label). The source label is
+    "url" / "network" / "cache" / "missing" so the caller can log which
+    path won.
+    """
+    url_tid = extract_thread_id_from_url(tab.get("url", ""))
+    if url_tid:
+        _save_thread_cache(url_tid)
+        return url_tid, "url"
+
+    logging.info(
+        "no UUID in tab URL — falling back to CDP /streams interception "
+        "(up to %ss)",
+        STREAMS_WAIT_SECONDS,
+    )
+    cdp_tid = capture_thread_id_via_cdp(tab)
+    if cdp_tid:
+        _save_thread_cache(cdp_tid)
+        return cdp_tid, "network"
+
+    cached = _read_thread_id_from_cache()
+    if cached:
+        return cached, "cache"
+
+    return None, "missing"
 
 
 def _save_thread_cache(tid: str) -> None:
@@ -292,20 +358,25 @@ def run_once(dry_run: bool = False) -> int:
             len(access), len(refresh),
         )
         return 4
-    logging.info(
-        "pulled tokens (access_len=%d, refresh_len=%d); waiting up to %ss "
-        "for /streams request to extract thread_id…",
-        len(access), len(refresh), STREAMS_WAIT_SECONDS,
-    )
-    tid = capture_thread_id(tab)
+    if len(access) < 500:
+        logging.warning(
+            "access_token is short (len=%d) — may not be a full JWT (real "
+            "Privy access tokens are typically 1500+ chars). Proceeding anyway.",
+            len(access),
+        )
+    logging.info("pulled tokens (access_len=%d, refresh_len=%d)",
+                 len(access), len(refresh))
+
+    tid, tid_source = resolve_thread_id(tab)
     if not tid:
         logging.error(
-            "no thread_id available. Send any chat message in the TrueNorth "
-            "tab while this script runs, or update %s manually.",
+            "no thread_id available — tab URL has no UUID and CDP fallback "
+            "did not capture one. Open a chat in the TrueNorth tab (the URL "
+            "should become .../chat/<uuid>) and re-run, or write a UUID to %s.",
             THREAD_CACHE_PATH,
         )
         return 5
-    logging.info("thread_id=%s", tid)
+    logging.info("thread_id: %s (from %s)", tid, tid_source)
 
     payload = {
         "access_token": access,
@@ -313,9 +384,14 @@ def run_once(dry_run: bool = False) -> int:
         "thread_id": tid,
     }
     if dry_run:
-        logging.info("--verify set; skipping POST. Payload would be: %s",
-                     {**payload, "access_token": f"<jwt len={len(access)}>",
-                      "refresh_token": f"<opaque len={len(refresh)}>"})
+        logging.info(
+            "--verify set; skipping POST. Payload would be: %s",
+            {
+                **payload,
+                "access_token": f"<jwt len={len(access)}>",
+                "refresh_token": f"<opaque len={len(refresh)}>",
+            },
+        )
         return 0
 
     resp = post_credentials(config["bot_url"], config["harvester_secret"], payload)

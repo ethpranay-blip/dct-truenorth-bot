@@ -1339,29 +1339,112 @@ def test_webhook_summary_shows_when_never_and_when_recent(monkeypatch):
     assert "m" in out and "ago" in out
 
 
-def test_harvester_pychrome_paths_have_no_import_side_effects():
-    """The Mac-local harvester module imports cleanly even without pychrome."""
+def _load_local_harvester():
+    """Load harvester_local/harvester.py as a module for direct testing."""
     import importlib.util
     import pathlib
     mod_path = pathlib.Path(__file__).resolve().parent.parent / "harvester_local" / "harvester.py"
     spec = importlib.util.spec_from_file_location("dct_local_harvester", mod_path)
-    assert spec is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def test_harvester_pychrome_paths_have_no_import_side_effects():
+    """The Mac-local harvester module imports cleanly even without pychrome."""
+    module = _load_local_harvester()
     # These helpers must not require pychrome or a running Chrome to import.
     assert module.strip_json_quotes('"abc"') == "abc"
     assert module.strip_json_quotes("abc") == "abc"
     assert module.UUID_RE.search(
         "https://app.true-north.xyz/thread/78536e88-e440-43dd-a61d-584640f8792b"
     ).group(0) == "78536e88-e440-43dd-a61d-584640f8792b"
-    # find_tn_tab picks the right tab.
     tabs = [
         {"type": "page", "url": "https://example.com", "id": "x"},
         {"type": "page", "url": "https://app.true-north.xyz/thread/abc", "id": "y"},
     ]
     assert module.find_tn_tab(tabs)["id"] == "y"
-    # Empty list / no matching tab returns None.
     assert module.find_tn_tab([]) is None
+
+
+def test_harvester_extract_thread_id_from_url():
+    """Primary path: URL like .../chat/<uuid> resolves directly without CDP."""
+    module = _load_local_harvester()
+    uuid_str = "b921275e-d0c4-4e90-a21f-70c96fb3f543"
+    assert module.extract_thread_id_from_url(
+        f"https://app.true-north.xyz/chat/{uuid_str}"
+    ) == uuid_str
+    # Trailing path / query params don't trip it up.
+    assert module.extract_thread_id_from_url(
+        f"https://app.true-north.xyz/chat/{uuid_str}?x=1#frag"
+    ) == uuid_str
+    # No UUID → None.
+    assert module.extract_thread_id_from_url("https://app.true-north.xyz/") is None
+    assert module.extract_thread_id_from_url("") is None
+
+
+def test_harvester_resolve_thread_id_prefers_url_over_cdp(monkeypatch):
+    """resolve_thread_id() must short-circuit on URL match and skip pychrome entirely."""
+    module = _load_local_harvester()
+    uuid_str = "b921275e-d0c4-4e90-a21f-70c96fb3f543"
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("CDP fallback must NOT run when URL contains a UUID")
+
+    monkeypatch.setattr(module, "capture_thread_id_via_cdp", _boom)
+    # Save_thread_cache writes to ~/.dct-harvester-thread; redirect to tmp so
+    # the test is hermetic.
+    import pathlib
+    tmp_cache = pathlib.Path("/tmp") / f"dct-harvester-thread-{uuid_str}"
+    monkeypatch.setattr(module, "THREAD_CACHE_PATH", tmp_cache)
+    try:
+        tid, source = module.resolve_thread_id(
+            {"url": f"https://app.true-north.xyz/chat/{uuid_str}", "id": "x"}
+        )
+        assert tid == uuid_str
+        assert source == "url"
+    finally:
+        try:
+            tmp_cache.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def test_harvester_resolve_thread_id_falls_through_to_cdp_then_cache(monkeypatch, tmp_path):
+    """When URL has no UUID, resolve_thread_id calls CDP. When CDP returns None, falls back to cache."""
+    module = _load_local_harvester()
+    uuid_str = "78536e88-e440-43dd-a61d-584640f8792b"
+    cache_path = tmp_path / "dct-harvester-thread"
+    cache_path.write_text(uuid_str)
+    monkeypatch.setattr(module, "THREAD_CACHE_PATH", cache_path)
+    monkeypatch.setattr(module, "capture_thread_id_via_cdp", lambda _tab: None)
+
+    tid, source = module.resolve_thread_id(
+        {"url": "https://app.true-north.xyz/", "id": "x"}
+    )
+    assert tid == uuid_str
+    assert source == "cache"
+
+    # When cache is also empty, returns ("missing").
+    cache_path.unlink()
+    tid, source = module.resolve_thread_id(
+        {"url": "https://app.true-north.xyz/", "id": "x"}
+    )
+    assert tid is None
+    assert source == "missing"
+
+
+def test_harvester_capture_thread_id_via_cdp_is_safe_without_pychrome(monkeypatch):
+    """If pychrome can't be imported, the CDP path returns None instead of raising."""
+    module = _load_local_harvester()
+    # Force the lazy import to fail by stuffing a sentinel into sys.modules.
+    import sys
+    monkeypatch.setitem(sys.modules, "pychrome", None)
+    try:
+        result = module.capture_thread_id_via_cdp({"id": "x", "url": "..."}, timeout_s=0)
+        assert result is None
+    finally:
+        sys.modules.pop("pychrome", None)
 
 
 # re needs to be accessible in the test module for regex-based assertions above.
