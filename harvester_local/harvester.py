@@ -52,6 +52,35 @@ CDP_ENDPOINT = "http://localhost:9222"
 STREAMS_WAIT_SECONDS = 30
 
 
+def _silence_pychrome_recv_noise() -> None:
+    """Filter out pychrome's harmless _recv_loop JSONDecodeError tracebacks.
+
+    pychrome runs a daemon thread that decodes incoming WebSocket frames as
+    JSON. Chrome occasionally sends an empty / non-JSON frame after the tab
+    is detached, which raises ``json.JSONDecodeError`` and prints a noisy
+    traceback to stderr. The main thread already has its data by then, so
+    the crash is purely cosmetic.
+
+    Filter is deliberately narrow: only swallows JSONDecodeError raised from
+    a stack that includes a pychrome frame. Any other unexpected exception
+    in any other thread still surfaces.
+    """
+    import threading
+    default_hook = threading.excepthook
+
+    def _hook(args):
+        if isinstance(args.exc_value, json.JSONDecodeError):
+            tb = args.exc_traceback
+            while tb is not None:
+                filename = tb.tb_frame.f_code.co_filename or ""
+                if "pychrome" in filename:
+                    return  # swallow silently — daemon thread is dying anyway
+                tb = tb.tb_next
+        default_hook(args)
+
+    threading.excepthook = _hook
+
+
 def _configure_logging() -> None:
     """Write timestamped entries to both stderr and ~/.dct-harvester.log."""
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
@@ -66,6 +95,7 @@ def _configure_logging() -> None:
         handlers=handlers,
         force=True,
     )
+    _silence_pychrome_recv_noise()
 
 
 def load_config() -> dict[str, str]:

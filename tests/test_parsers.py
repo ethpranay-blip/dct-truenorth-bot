@@ -1434,6 +1434,62 @@ def test_harvester_resolve_thread_id_falls_through_to_cdp_then_cache(monkeypatch
     assert source == "missing"
 
 
+def test_harvester_silences_pychrome_recv_loop_jsondecodeerror(monkeypatch):
+    """The threading.excepthook installed by _silence_pychrome_recv_noise must
+    swallow JSONDecodeError raised from a stack containing a pychrome frame."""
+    import threading
+    module = _load_local_harvester()
+    saved_hook = threading.excepthook
+    seen_default_hook_calls: list = []
+
+    def _fake_default(args):
+        seen_default_hook_calls.append(args)
+
+    # Install our default-hook spy first so the wrapper falls through to it
+    # for non-matching exceptions.
+    monkeypatch.setattr(threading, "excepthook", _fake_default)
+    try:
+        module._silence_pychrome_recv_noise()
+        # Build a fake traceback whose top frame's filename mentions pychrome.
+        import types
+        fake_code = types.SimpleNamespace(co_filename="/site-packages/pychrome/tab.py")
+        fake_frame = types.SimpleNamespace(f_code=fake_code)
+        fake_tb = types.SimpleNamespace(tb_frame=fake_frame, tb_next=None)
+        args = types.SimpleNamespace(
+            exc_type=json.JSONDecodeError,
+            exc_value=json.JSONDecodeError("Expecting value", "", 0),
+            exc_traceback=fake_tb,
+            thread=threading.current_thread(),
+        )
+        threading.excepthook(args)
+        assert seen_default_hook_calls == [], "pychrome JSONDecodeError must be swallowed"
+
+        # Non-pychrome JSONDecodeError should fall through to the default hook.
+        fake_code2 = types.SimpleNamespace(co_filename="/usr/lib/python/foo.py")
+        fake_frame2 = types.SimpleNamespace(f_code=fake_code2)
+        fake_tb2 = types.SimpleNamespace(tb_frame=fake_frame2, tb_next=None)
+        args2 = types.SimpleNamespace(
+            exc_type=json.JSONDecodeError,
+            exc_value=json.JSONDecodeError("nope", "", 0),
+            exc_traceback=fake_tb2,
+            thread=threading.current_thread(),
+        )
+        threading.excepthook(args2)
+        assert len(seen_default_hook_calls) == 1, "non-pychrome errors must surface"
+
+        # Other exception types from pychrome should also surface (we only swallow JSONDecodeError).
+        args3 = types.SimpleNamespace(
+            exc_type=RuntimeError,
+            exc_value=RuntimeError("oops"),
+            exc_traceback=fake_tb,
+            thread=threading.current_thread(),
+        )
+        threading.excepthook(args3)
+        assert len(seen_default_hook_calls) == 2, "non-JSON errors from pychrome must surface"
+    finally:
+        threading.excepthook = saved_hook
+
+
 def test_harvester_capture_thread_id_via_cdp_is_safe_without_pychrome(monkeypatch):
     """If pychrome can't be imported, the CDP path returns None instead of raising."""
     module = _load_local_harvester()
