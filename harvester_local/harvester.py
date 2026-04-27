@@ -358,10 +358,14 @@ def run_once(dry_run: bool = False) -> int:
             len(access), len(refresh),
         )
         return 4
-    if len(access) < 500:
+    # Empirically, TN's Privy JWTs land around 410 chars. Anything markedly
+    # below that almost certainly means we read the wrong key from
+    # localStorage (e.g. an id_token fragment or a stale value).
+    if len(access) < 200:
         logging.warning(
-            "access_token is short (len=%d) — may not be a full JWT (real "
-            "Privy access tokens are typically 1500+ chars). Proceeding anyway.",
+            "access_token is suspiciously short (len=%d) — almost certainly "
+            "not a Privy JWT (TN tokens are typically ~410 chars). Proceeding "
+            "anyway, but expect the bot to reject it.",
             len(access),
         )
     logging.info("pulled tokens (access_len=%d, refresh_len=%d)",
