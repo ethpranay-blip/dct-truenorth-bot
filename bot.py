@@ -2006,23 +2006,20 @@ async def run_regime_update():
     print("[SCHED] Regime outlook posted")
 
 # --- Scheduled jobs ---
+# Trimmed for the 150/wk TrueNorth credit budget. We keep ONLY one pre-open
+# brief per session (3 briefs/day × 7 = 21/wk) plus a Mon/Wed/Fri regime
+# outlook (3/wk) = 24 scheduled TN calls/wk. The post-open / pre-close /
+# post-close briefs were removed entirely; trades remain visible inside the
+# brief embeds, so a separate aggregate call is unnecessary. Manual !brief
+# can still trigger any phase on demand.
 SCHEDULE = [
     ("asia",   "Pre-Open Brief",   5,  15),
-    ("asia",   "Post-Open Brief",  5,  45),
-    ("asia",   "Pre-Close Brief",  13, 15),
-    ("asia",   "Post-Close Brief", 13, 45),
     ("london", "Pre-Open Brief",   13, 15),
-    ("london", "Post-Open Brief",  13, 45),
-    ("london", "Pre-Close Brief",  21, 15),
-    ("london", "Post-Close Brief", 21, 45),
     ("us",     "Pre-Open Brief",   18, 15),
-    ("us",     "Post-Open Brief",  18, 45),
-    ("us",     "Pre-Close Brief",  2,  15),
-    ("us",     "Post-Close Brief", 2,  45),
 ]
 
 def setup_scheduler():
-    """Register every recurring job (12 session briefs + regime + refresh + harvester).
+    """Register every recurring job (3 pre-open briefs + Mon/Wed/Fri regime + token refresh).
 
     All cron triggers run on the ``Asia/Kolkata`` timezone. Idempotent — safe to
     call again (``replace_existing=True``) if the bot reconnects.
@@ -2035,10 +2032,12 @@ def setup_scheduler():
             id=f"{session}_{phase.replace(' ', '_').lower()}",
             replace_existing=True,
         )
+    # Regime outlook runs Mon/Wed/Fri only — was daily, dropped to 3/wk to
+    # stay under the 150/wk TrueNorth credit budget.
     scheduler.add_job(
         run_regime_update,
-        CronTrigger(hour=5, minute=0, timezone=IST),
-        id="daily_regime",
+        CronTrigger(day_of_week="mon,wed,fri", hour=5, minute=0, timezone=IST),
+        id="regime_mwf",
         replace_existing=True,
     )
     scheduler.add_job(
@@ -2138,6 +2137,19 @@ async def on_message(message: discord.Message):
     if not content:
         return
     if any(content.lower().startswith(c) for c in KNOWN_COMMANDS):
+        return
+
+    # Owner-only gate: free-form chat in #claude-integration burns TN credits
+    # against the 150/wk budget, so it's restricted to the operator until the
+    # budget is loosened. Manual ! commands are unaffected — they have their
+    # own owner checks where needed.
+    if not _is_owner(message):
+        await message.reply(
+            "💤 Free-form chat is temporarily owner-only while we manage the "
+            "TrueNorth credit budget. Manual commands (`!brief`, `!trades`, "
+            "`!regime`, `!health`) still work for everyone.",
+            mention_author=False,
+        )
         return
 
     if content.startswith("!"):
