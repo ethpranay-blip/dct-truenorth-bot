@@ -2036,10 +2036,12 @@ def setup_scheduler():
             replace_existing=True,
         )
     # Regime outlook runs Mon/Wed/Fri only — was daily, dropped to 3/wk to
-    # stay under the 150/wk TrueNorth credit budget.
+    # stay under the 150/wk TrueNorth credit budget. Fires at 06:00 IST so
+    # the Monday call lands AFTER the weekly 05:30 IST credit reset; other
+    # days it's harmless but consistency is cleaner.
     scheduler.add_job(
         run_regime_update,
-        CronTrigger(day_of_week="mon,wed,fri", hour=5, minute=0, timezone=IST),
+        CronTrigger(day_of_week="mon,wed,fri", hour=6, minute=0, timezone=IST),
         id="regime_mwf",
         replace_existing=True,
     )
