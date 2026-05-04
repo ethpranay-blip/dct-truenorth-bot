@@ -2013,7 +2013,10 @@ async def run_regime_update():
 # brief embeds, so a separate aggregate call is unnecessary. Manual !brief
 # can still trigger any phase on demand.
 SCHEDULE = [
-    ("asia",   "Pre-Open Brief",   5,  15),
+    # Asia fires at 05:45 IST so it lands AFTER the weekly credit reset at
+    # 05:30 IST every Monday — the prior 05:15 slot would burn against an
+    # almost-exhausted budget right before reset.
+    ("asia",   "Pre-Open Brief",   5,  45),
     ("london", "Pre-Open Brief",   13, 15),
     ("us",     "Pre-Open Brief",   18, 15),
 ]
