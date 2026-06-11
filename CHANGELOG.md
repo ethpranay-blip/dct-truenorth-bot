@@ -2,6 +2,10 @@
 
 History of notable changes to `dct-truenorth-bot`. Grouped by week, with key commit hashes for reference.
 
+## v2 pivot — 2026-06-12
+
+- **2026-06-12 · `a9eb804`** — **Pivot to TrueNorth v2 agent-tools engine.** TrueNorth v2 retired the conversational SSE endpoint (`/sse/v2/streams` rejects the v1 request shape), killing scheduled briefs. Rebuilt on the keyless agent-tools REST API (the `@truenorth-ai/cli` backend): parallel tool calls (TA, derivatives, scanner, events, market info) build a JSON snapshot; `claude-opus-4-8` synthesizes the narrative. Briefs now fire 15 min before each market's local open with per-market-timezone crons (Tokyo 08:45 JST, London 07:45 UK, NY 09:15 ET — DST-proof); regime stays MWF 06:00 IST. Channel layout simplified: `#claude-integration` chat (+ Sonnet middleman) and `#trades` posting removed — briefs link to the setups dashboard (`DASHBOARD_URL`) instead. Deleted the entire v1 credential stack: Privy refresh, token/thread caches, `/credentials` webhook, Mac-local harvester (`harvester_local/`), `README_SETUP.md`. New test suite: 54 passing.
+
 ## Week 3 — 2026-04-18 through 2026-04-20
 
 Auth hardening + durability. Most of this week was spent turning a "working on a happy path" bot into one that survives Railway restarts, Privy token rotation, and stale thread ids without manual intervention.

@@ -1,6 +1,23 @@
 # dct-truenorth-bot — Context Handoff
 
-_Last updated: 2026-06-11. Use this to bootstrap a new Claude chat (or hand to a human collaborator) without re-explaining anything._
+> ## ⚠️ SUPERSEDED BY THE v2 PIVOT (2026-06-12)
+>
+> Everything below describes the **v1** bot, which died when TrueNorth upgraded to v2
+> (the `/sse/v2/streams` agent endpoint rejects the v1 request shape). The bot was
+> rebuilt on TrueNorth's keyless **agent-tools REST API** + Claude synthesis — see
+> [README.md](README.md) and [ARCHITECTURE.md](ARCHITECTURE.md) for current truth,
+> and the `v2 pivot` entry in [CHANGELOG.md](CHANGELOG.md) for what changed.
+>
+> Now obsolete: the entire credential model (§6–§8: Privy refresh, token/thread
+> caches, Mac harvester, `/credentials` webhook), the error taxonomy (§10), the
+> credit-budget schedule (§5 — the keyless API has no credit metering), the
+> `!setcreds`/`!refreshtoken`/`!trades` commands (§9), and §13's auth-related
+> don'ts. Still true: the Railway deploy model, the embed/test conventions, and
+> the operating rules (tests green before commit, never push main unapproved).
+>
+> Kept for history — the decisions log (§12) and build narrative remain useful context.
+
+_Last updated: 2026-06-11 (v1 — superseded, see banner). Use this to bootstrap a new Claude chat (or hand to a human collaborator) without re-explaining anything._
 
 ---
 
