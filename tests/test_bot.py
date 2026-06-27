@@ -525,3 +525,147 @@ def test_channels_required_set():
 
 def test_synth_model_default():
     assert bot.SYNTH_MODEL == "claude-opus-4-8"
+
+
+# =============================================================================
+# !setup — ticker resolution, JSON parsing, embed, channel gate
+# =============================================================================
+
+def test_resolve_token_maps_common_tickers():
+    assert bot._resolve_token("BTC") == "bitcoin"
+    assert bot._resolve_token("eth") == "ethereum"
+    assert bot._resolve_token("  Sol ") == "solana"
+    assert bot._resolve_token("CRV") == "curve-dao-token"
+
+
+def test_resolve_token_passthrough_for_unknown():
+    # Unknown tickers / full ids fall through lowercased so the API can try.
+    assert bot._resolve_token("bitcoin") == "bitcoin"
+    assert bot._resolve_token("curve-dao-token") == "curve-dao-token"
+    assert bot._resolve_token("WEIRDCOIN") == "weirdcoin"
+
+
+def test_ticker_map_values_look_like_coingecko_ids():
+    for ticker, tid in bot.TICKER_TO_ID.items():
+        assert ticker == ticker.upper(), f"key {ticker} not uppercase"
+        assert tid == tid.lower() and " " not in tid, f"bad id {tid}"
+
+
+def test_parse_setup_json_plain():
+    out = bot._parse_setup_json('{"has_setup": true, "direction": "LONG"}')
+    assert out["has_setup"] is True and out["direction"] == "LONG"
+
+
+def test_parse_setup_json_strips_code_fence():
+    fenced = '```json\n{"direction": "SHORT", "rr_ratio": "2.1"}\n```'
+    out = bot._parse_setup_json(fenced)
+    assert out["direction"] == "SHORT" and out["rr_ratio"] == "2.1"
+
+
+def test_parse_setup_json_extracts_from_surrounding_prose():
+    messy = 'Here is the setup: {"direction": "NONE", "has_setup": false} — done.'
+    out = bot._parse_setup_json(messy)
+    assert out["direction"] == "NONE" and out["has_setup"] is False
+
+
+def test_parse_setup_json_raises_on_garbage():
+    with pytest.raises(Exception):
+        bot._parse_setup_json("not json at all")
+
+
+def test_setup_system_prompt_has_required_rules():
+    p = bot.SETUP_SYSTEM
+    assert "trade setup generator" in p
+    assert "Never invent numbers" in p
+    assert "No clear setup — ranging/choppy conditions." in p
+    # It is a .format template — must accept {ticker} and survive formatting.
+    assert "{ticker}" in p
+    filled = p.format(ticker="BTC")
+    assert "BTC" in filled and "{ticker}" not in filled
+
+
+def test_setup_system_prompt_format_does_not_break_on_json_braces():
+    # The literal JSON example uses {{ }} so .format() must not choke.
+    filled = bot.SETUP_SYSTEM.format(ticker="ETH")
+    assert '"has_setup"' in filled
+
+
+LONG_SETUP = {
+    "has_setup": True, "direction": "LONG", "entry_zone": "$62,400 – $62,900",
+    "stop_loss": "$61,200", "take_profit_1": "$64,500", "take_profit_2": "$66,000",
+    "rr_ratio": "2.8", "conviction": "High", "reasoning": "Reclaimed weekly VWAP with rising funding.",
+}
+SHORT_SETUP = {**LONG_SETUP, "direction": "SHORT"}
+NO_SETUP = {
+    "has_setup": False, "direction": "NONE", "entry_zone": "—", "stop_loss": "—",
+    "take_profit_1": "—", "take_profit_2": "—", "rr_ratio": "—", "conviction": "None",
+    "reasoning": "No clear setup — ranging/choppy conditions.",
+}
+
+
+def test_setup_embed_long_is_green_with_levels():
+    e = bot.build_setup_embed("BTC", 62594.85, LONG_SETUP)
+    assert e.color.value == bot.COLOR_LONG
+    assert "BTC Trade Setup" in e.title
+    assert "LONG" in e.description and "$62,594.85" in e.description
+    names = {f.name for f in e.fields}
+    assert {"Entry Zone", "Stop Loss", "Take Profit 1", "Take Profit 2", "R : R", "Conviction"} <= names
+
+
+def test_setup_embed_short_is_red():
+    e = bot.build_setup_embed("ETH", 2500.0, SHORT_SETUP)
+    assert e.color.value == bot.COLOR_SHORT
+    assert "SHORT" in e.description
+
+
+def test_setup_embed_no_setup_is_amber_with_no_level_fields():
+    e = bot.build_setup_embed("DOGE", 0.1663, NO_SETUP)
+    assert e.color.value == bot.COLOR_RISK
+    assert len(e.fields) == 0  # no level fields when there's no setup
+    assert "ranging/choppy" in e.description
+    assert "$0.1663" in e.description  # sub-$1 precision
+
+
+def test_setup_embed_tolerates_missing_keys():
+    # A malformed model response must not crash the embed builder.
+    e = bot.build_setup_embed("SOL", 65.0, {"direction": "LONG", "has_setup": True})
+    assert e.color.value == bot.COLOR_LONG
+    assert any(f.value == "—" for f in e.fields)
+
+
+def test_setup_embed_footer_flags_not_advice():
+    e = bot.build_setup_embed("BTC", 62000.0, NO_SETUP)
+    assert "not financial advice" in e.footer.text
+
+
+def test_fmt_spot_precision():
+    assert bot._fmt_spot(62594.85) == "$62,594.85"
+    assert bot._fmt_spot(0.1663).startswith("$0.166")
+
+
+def test_setup_channel_gate_empty_allows_all():
+    saved = bot.SETUP_ALLOWED_CHANNELS
+    try:
+        bot.SETUP_ALLOWED_CHANNELS = set()
+        assert bot._setup_channel_allowed(123) is True
+        assert bot._setup_channel_allowed(999) is True
+    finally:
+        bot.SETUP_ALLOWED_CHANNELS = saved
+
+
+def test_setup_channel_gate_restricts_when_set():
+    saved = bot.SETUP_ALLOWED_CHANNELS
+    try:
+        bot.SETUP_ALLOWED_CHANNELS = {111, 222}
+        assert bot._setup_channel_allowed(111) is True
+        assert bot._setup_channel_allowed(333) is False
+    finally:
+        bot.SETUP_ALLOWED_CHANNELS = saved
+
+
+def test_setup_command_registered_with_cooldown():
+    cmd = bot.bot.get_command("setup")
+    assert cmd is not None
+    bucket = cmd._buckets
+    assert bucket._cooldown.per == 60.0
+    assert bucket._cooldown.rate == 1

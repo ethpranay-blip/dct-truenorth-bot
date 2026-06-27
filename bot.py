@@ -82,6 +82,13 @@ WEBHOOK_PORT = int(os.environ.get("PORT", "8080"))
 
 SYNTH_MODEL = os.environ.get("SYNTH_MODEL", "claude-opus-4-8")
 
+# Channels where !setup is allowed (comma-separated IDs). Empty ⇒ allowed in
+# every channel; the 60s/user cooldown is the spam guard either way. Gating
+# exists because each !setup is a paid Claude call.
+SETUP_ALLOWED_CHANNELS: set[int] = {
+    int(c) for c in os.environ.get("SETUP_ALLOWED_CHANNELS", "").replace(" ", "").split(",") if c
+}
+
 # --- Embed colors ---
 COLOR_RISK   = 0xFFAA00
 COLOR_ASIA   = 0x00BFFF
@@ -89,6 +96,8 @@ COLOR_LONDON = 0xFF8C00
 COLOR_US     = 0x7B68EE
 COLOR_REGIME = 0x9B59B6
 COLOR_INFO   = 0x2F3136
+COLOR_LONG   = 0x2ECC71
+COLOR_SHORT  = 0xE74C3C
 
 FOOTER = "DCT TrueNorth Bot · Powered by TrueNorth AI"
 
@@ -340,6 +349,86 @@ async def synthesize(prompt: str) -> str:
 
 
 # =============================================================================
+# Trade setup engine (!setup) — single-asset variant of the brief pipeline
+# =============================================================================
+
+# TrueNorth tools key off CoinGecko-style ids ("bitcoin"), not tickers ("BTC").
+# A bare ticker returns an empty-but-"success" payload, so map the common ones
+# and pass anything unrecognized through lowercased (lets power users type a
+# full id like "curve-dao-token"). Unresolved input is caught downstream when
+# basic_market_info returns without a price.
+TICKER_TO_ID = {
+    "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "BNB": "binancecoin",
+    "XRP": "ripple", "ADA": "cardano", "DOGE": "dogecoin", "AVAX": "avalanche-2",
+    "LINK": "chainlink", "DOT": "polkadot", "MATIC": "matic-network", "POL": "matic-network",
+    "TON": "the-open-network", "TRX": "tron", "SUI": "sui", "APT": "aptos",
+    "ARB": "arbitrum", "OP": "optimism", "INJ": "injective-protocol", "SEI": "sei-network",
+    "LTC": "litecoin", "BCH": "bitcoin-cash", "ATOM": "cosmos", "NEAR": "near",
+    "UNI": "uniswap", "AAVE": "aave", "CRV": "curve-dao-token", "MKR": "maker",
+    "LDO": "lido-dao", "PENDLE": "pendle", "ENA": "ethena", "HYPE": "hyperliquid",
+    "TAO": "bittensor", "FET": "fetch-ai", "RENDER": "render-token", "WLD": "worldcoin-wld",
+    "FIL": "filecoin", "STX": "blockstack", "XLM": "stellar", "XMR": "monero",
+    "ZEC": "zcash", "ONDO": "ondo-finance", "PAXG": "pax-gold", "JUP": "jupiter-exchange-solana",
+    "PEPE": "pepe", "WIF": "dogwifcoin", "BONK": "bonk", "FARTCOIN": "fartcoin",
+    "PUMP": "pump-fun", "SPX": "spx6900", "TRUMP": "official-trump",
+}
+
+
+def _resolve_token(arg: str) -> str:
+    """Map a user ticker to a TrueNorth token id; pass ids through lowercased."""
+    return TICKER_TO_ID.get(arg.strip().upper(), arg.strip().lower())
+
+
+SETUP_SYSTEM = """You are a trade setup generator. Given the following market data for {ticker}, produce a structured trade setup with: Direction (LONG/SHORT), Entry Zone, Stop Loss, Take Profit 1, Take Profit 2, R:R ratio, Conviction (Low/Medium/High), and a 1-2 sentence reasoning. Use only the data provided. Never invent numbers. If the data doesn't support a clean setup, say 'No clear setup — ranging/choppy conditions.'
+
+Output ONLY a single JSON object — no prose, no markdown fences — with exactly these keys:
+{{"has_setup": boolean, "direction": "LONG" | "SHORT" | "NONE", "entry_zone": string, "stop_loss": string, "take_profit_1": string, "take_profit_2": string, "rr_ratio": string, "conviction": "Low" | "Medium" | "High" | "None", "reasoning": string}}
+
+Price levels are strings in the asset's own price precision (e.g. "$62,400 – $62,900" or "$0.1840"). When there is no clean setup: set has_setup=false, direction="NONE", every price level and rr_ratio to "—", conviction="None", and put the ranging/choppy message in reasoning."""
+
+
+def _parse_setup_json(text: str) -> dict:
+    """Parse the model's JSON, tolerating ``` fences or stray prose around it."""
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.IGNORECASE).strip()
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        start, end = t.find("{"), t.rfind("}")
+        if start != -1 and end > start:
+            return json.loads(t[start : end + 1])
+        raise
+
+
+async def synthesize_setup(ticker: str, snapshot: dict[str, str]) -> dict:
+    """One Claude call: single-asset snapshot → structured trade setup dict."""
+    sections = "\n".join(f"### {k}\n{v}" for k, v in snapshot.items())
+    prompt = f"Market data for {ticker}:\n{sections}"
+    try:
+        resp = await claude_client.messages.create(
+            model=SYNTH_MODEL,
+            max_tokens=2000,
+            thinking={"type": "adaptive"},
+            system=SETUP_SYSTEM.format(ticker=ticker),
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except anthropic.APIError as e:
+        tn_state["last_synth_error"] = f"{type(e).__name__}: {e}"
+        raise
+    text = response_text(resp.content)
+    if not text:
+        tn_state["last_synth_error"] = f"empty setup response (stop_reason={resp.stop_reason})"
+        raise RuntimeError(tn_state["last_synth_error"])
+    return _parse_setup_json(text)
+
+
+def _setup_channel_allowed(channel_id: int) -> bool:
+    """Gate !setup by SETUP_ALLOWED_CHANNELS; empty set ⇒ allowed everywhere."""
+    return not SETUP_ALLOWED_CHANNELS or channel_id in SETUP_ALLOWED_CHANNELS
+
+
+# =============================================================================
 # Embed builders
 # =============================================================================
 
@@ -431,6 +520,35 @@ def build_regime_embed(text: str) -> discord.Embed:
 def _failure_embed(title: str, reason: str) -> discord.Embed:
     e = discord.Embed(title=title, description=f"⚠️ {reason[:1500]}", color=COLOR_RISK)
     e.set_footer(text=FOOTER)
+    e.timestamp = datetime.now(IST)
+    return e
+
+
+def _fmt_spot(price: float) -> str:
+    return f"${price:,.2f}" if price >= 1 else f"${price:.6g}"
+
+
+def build_setup_embed(ticker: str, price: float, s: dict) -> discord.Embed:
+    """Trade-setup embed: green LONG / red SHORT / amber no-setup, levels in fields."""
+    direction = str(s.get("direction") or "NONE").upper()
+    has_setup = bool(s.get("has_setup")) and direction in ("LONG", "SHORT")
+    if direction == "LONG":
+        color, tag = COLOR_LONG, "🟢 LONG"
+    elif direction == "SHORT":
+        color, tag = COLOR_SHORT, "🔴 SHORT"
+    else:
+        color, tag = COLOR_RISK, "🟡 No clear setup"
+    e = discord.Embed(title=f"🎯 {ticker} Trade Setup", color=color)
+    reasoning = str(s.get("reasoning") or "").strip()[:600]
+    e.description = f"**{tag}** · Spot {_fmt_spot(price)}\n\n{reasoning}"
+    if has_setup:
+        e.add_field(name="Entry Zone", value=str(s.get("entry_zone", "—"))[:200], inline=True)
+        e.add_field(name="Stop Loss", value=str(s.get("stop_loss", "—"))[:200], inline=True)
+        e.add_field(name="R : R", value=str(s.get("rr_ratio", "—"))[:200], inline=True)
+        e.add_field(name="Take Profit 1", value=str(s.get("take_profit_1", "—"))[:200], inline=True)
+        e.add_field(name="Take Profit 2", value=str(s.get("take_profit_2", "—"))[:200], inline=True)
+        e.add_field(name="Conviction", value=str(s.get("conviction", "—"))[:200], inline=True)
+    e.set_footer(text=FOOTER + " · not financial advice")
     e.timestamp = datetime.now(IST)
     return e
 
@@ -635,6 +753,52 @@ async def manual_regime(ctx: commands.Context):
     await ctx.send("✅ Posted to the regime channel." if ok else "⚠️ Failed — run `!health`.")
 
 
+@bot.command(name="setup")
+@commands.cooldown(1, 60, commands.BucketType.user)
+async def trade_setup(ctx: commands.Context, ticker: str = ""):
+    """Generate a trade setup for one asset. Usage: !setup BTC"""
+    if not _setup_channel_allowed(ctx.channel.id):
+        ctx.command.reset_cooldown(ctx)  # don't burn the user's cooldown on a wrong-channel try
+        await ctx.send("❌ `!setup` isn't enabled in this channel.")
+        return
+    ticker = (ticker or "").strip().upper()
+    if not ticker or len(ticker) > 24 or not re.match(r"^[A-Z0-9\-]+$", ticker):
+        ctx.command.reset_cooldown(ctx)
+        await ctx.send("Usage: `!setup BTC` — a ticker (BTC, ETH, SOL…) or a CoinGecko id.")
+        return
+
+    token_id = _resolve_token(ticker)
+    status = await ctx.send(f"⏳ Building **{ticker}** setup…")
+
+    # Same TN pattern as the brief engine, scoped to one asset.
+    info, ta, derivs = await asyncio.gather(
+        tn_call_safe("basic_market_info", {"token_address": token_id}),
+        tn_call_safe("technical_analysis", {"token_address": token_id, "timeframe": "4h,1d"}),
+        tn_call_safe("derivatives_analysis", {"token_address": token_id}),
+    )
+    price = (info or {}).get("market_data", {}).get("current_price")
+    if price is None:
+        await status.edit(content=(
+            f"⚠️ Couldn't find market data for `{ticker}`. "
+            f"Try `BTC`/`ETH`/`SOL`, or a CoinGecko id (e.g. `!setup bitcoin`)."
+        ))
+        return
+
+    snapshot = {
+        "basic_market_info": compact_json(info, 1500),
+        "technical_analysis": compact_json(ta, 8000),
+        "derivatives_analysis": compact_json(derivs, 5000),
+    }
+    try:
+        setup = await synthesize_setup(ticker, snapshot)
+    except Exception as e:
+        print(f"[SETUP] {ticker} failed: {type(e).__name__}: {e}")
+        await status.edit(content=f"⚠️ Setup generation failed ({type(e).__name__}). Run `!health`.")
+        return
+
+    await status.edit(content=None, embed=build_setup_embed(ticker, float(price), setup))
+
+
 def _format_delta(dt: datetime | None) -> str:
     if dt is None:
         return "—"
@@ -675,6 +839,11 @@ async def manual_health(ctx: commands.Context):
     e.add_field(name="Last briefs", value=briefs, inline=False)
     e.add_field(name="Last regime", value=_format_delta(tn_state["last_regime_at"]), inline=True)
     e.add_field(name="Dashboard link", value=(DASHBOARD_URL or "unset"), inline=True)
+    e.add_field(
+        name="!setup allowed",
+        value=(f"{len(SETUP_ALLOWED_CHANNELS)} channel(s)" if SETUP_ALLOWED_CHANNELS else "all channels"),
+        inline=True,
+    )
     if scheduler.running:
         nxt = "\n".join(
             f"`{j.id}` → {j.next_run_time.astimezone(IST).strftime('%a %H:%M IST')}"
