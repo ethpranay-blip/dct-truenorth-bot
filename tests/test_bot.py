@@ -669,3 +669,91 @@ def test_setup_command_registered_with_cooldown():
     bucket = cmd._buckets
     assert bucket._cooldown.per == 60.0
     assert bucket._cooldown.rate == 1
+
+
+# =============================================================================
+# !scan — pure data formatting, no Claude
+# =============================================================================
+
+def test_clean_ticker_strips_quote_currency():
+    assert bot._clean_ticker("CRVUSDT") == "CRV"
+    assert bot._clean_ticker("btcusd") == "BTC"
+    assert bot._clean_ticker("ETHPERP") == "ETH"
+    assert bot._clean_ticker("AAVE") == "AAVE"
+    assert bot._clean_ticker(None) == "?"
+    # Must not eat a token that *is* the suffix-length edge.
+    assert bot._clean_ticker("USDT") == "USDT"
+
+
+def test_scan_cell_colors_by_sign():
+    pos = bot._scan_cell(25.5, 9)
+    neg = bot._scan_cell(-1.2, 9)
+    assert "\x1b[32m" in pos and "+25.5%" in pos      # green
+    assert "\x1b[31m" in neg and "-1.2%" in neg       # red
+    assert pos.endswith("\x1b[0m")                    # reset
+
+
+def test_scan_cell_none_is_dash_uncolored():
+    out = bot._scan_cell(None, 9)
+    assert "\x1b[" not in out and "—" in out
+
+
+def test_scan_cell_padding_is_consistent_after_stripping_codes():
+    import re
+    for val in (25.5, -1.2, 0.0, 130.7, None):
+        cell = bot._scan_cell(val, 9)
+        stripped = re.sub(r"\x1b\[[0-9;]*m", "", cell)
+        assert len(stripped) == 9, f"{val!r} -> {stripped!r}"
+
+
+def _fake_scanner(n):
+    return {
+        "leaderboard": [
+            {"rank": i + 1, "ticker": f"TKN{i}USDT", "momentum1D": (i - 2) * 1.5,
+             "momentum7D": (10 - i) * 2.0, "rsVsBenchmark": (10 - i) * 3.0}
+            for i in range(n)
+        ]
+    }
+
+
+def test_scan_embed_title_footer_and_block():
+    e = bot.build_scan_embed(_fake_scanner(10), 10)
+    assert e.title == "🔍 Market Scanner — Top 10 by Relative Strength"
+    assert "Data from TrueNorth | Refreshed" in e.footer.text
+    assert "IST" in e.footer.text
+    assert e.description.count("```ansi") == 1 and e.description.rstrip().endswith("```")
+    assert e.color.value == bot.COLOR_SCAN
+
+
+def test_scan_embed_respects_count():
+    e5 = bot.build_scan_embed(_fake_scanner(20), 5)
+    # 5 data rows + 1 header line inside the ansi block
+    body = e5.description.split("```ansi\n", 1)[1].rsplit("\n```", 1)[0]
+    assert len(body.splitlines()) == 6
+    assert "Top 5" in e5.title
+
+
+def test_scan_embed_handles_empty_leaderboard():
+    e = bot.build_scan_embed({"leaderboard": []}, 10)
+    assert "Top 0" in e.title  # header only, no crash
+
+
+def test_scan_embed_tolerates_missing_momentum():
+    scanner = {"leaderboard": [{"rank": 1, "ticker": "BTCUSDT",
+                                "momentum1D": None, "momentum7D": None, "rsVsBenchmark": None}]}
+    e = bot.build_scan_embed(scanner, 10)
+    assert "—" in e.description and "BTC" in e.description
+
+
+def test_scan_command_registered_with_cooldown_and_gate():
+    cmd = bot.bot.get_command("scan")
+    assert cmd is not None
+    assert cmd._buckets._cooldown.per == 60.0
+    # Shares the !setup channel gate.
+    saved = bot.SETUP_ALLOWED_CHANNELS
+    try:
+        bot.SETUP_ALLOWED_CHANNELS = {42}
+        assert bot._setup_channel_allowed(42) is True
+        assert bot._setup_channel_allowed(7) is False
+    finally:
+        bot.SETUP_ALLOWED_CHANNELS = saved

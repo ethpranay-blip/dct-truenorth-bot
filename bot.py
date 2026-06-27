@@ -98,6 +98,7 @@ COLOR_REGIME = 0x9B59B6
 COLOR_INFO   = 0x2F3136
 COLOR_LONG   = 0x2ECC71
 COLOR_SHORT  = 0xE74C3C
+COLOR_SCAN   = 0x3498DB
 
 FOOTER = "DCT TrueNorth Bot · Powered by TrueNorth AI"
 
@@ -553,6 +554,56 @@ def build_setup_embed(ticker: str, price: float, s: dict) -> discord.Embed:
     return e
 
 
+def _clean_ticker(t: str | None) -> str:
+    """'CRVUSDT' → 'CRV'. Strips the quote-currency / perp suffix."""
+    t = (t or "?").upper()
+    for suffix in ("USDT", "USD", "PERP"):
+        if t.endswith(suffix) and len(t) > len(suffix):
+            return t[: -len(suffix)]
+    return t
+
+
+def _scan_cell(val, width: int, pct: bool = True) -> str:
+    """Right-aligned ANSI-colored number (green ≥0, red <0) for the scan table.
+
+    Padding is applied before the color codes so the visible columns stay aligned
+    (the escape sequences are zero-width when Discord renders the ansi block).
+    """
+    if val is None:
+        return "—".rjust(width)
+    s = (f"{val:+.1f}%" if pct else f"{val:+.1f}").rjust(width)
+    code = "32" if val >= 0 else "31"
+    return f"\x1b[{code}m{s}\x1b[0m"
+
+
+def build_scan_embed(scanner: dict, count: int) -> discord.Embed:
+    """Top-N relative-strength table (ANSI-colored) from performance_scanner.
+
+    No Claude call — pure formatting of one TrueNorth tool result.
+    """
+    lb = (scanner or {}).get("leaderboard", [])[:count]
+    header = f"{'#':>3}  {'Asset':<9}{'24h':>9}{'7d':>9}{'RS':>8}"
+    lines = [header]
+    for row in lb:
+        tk = _clean_ticker(row.get("ticker") or row.get("token"))[:9]
+        lines.append(
+            f"{row.get('rank', 0):>3}  {tk:<9}"
+            + _scan_cell(row.get("momentum1D"), 9)
+            + _scan_cell(row.get("momentum7D"), 9)
+            + _scan_cell(row.get("rsVsBenchmark"), 8, pct=False)
+        )
+    table = "```ansi\n" + "\n".join(lines) + "\n```"
+    now = datetime.now(IST)
+    e = discord.Embed(
+        title=f"🔍 Market Scanner — Top {len(lb)} by Relative Strength",
+        description="Top movers by 7-day strength vs BTC · 30 HL perps\n" + table,
+        color=COLOR_SCAN,
+    )
+    e.set_footer(text=f"Data from TrueNorth | Refreshed {now:%b %d, %H:%M IST}")
+    e.timestamp = now
+    return e
+
+
 async def alert_ops(title: str, detail: str) -> None:
     """Failure alert: CH_OPS channel if configured, Railway logs always."""
     print(f"[ALERT] {title}: {detail}")
@@ -797,6 +848,31 @@ async def trade_setup(ctx: commands.Context, ticker: str = ""):
         return
 
     await status.edit(content=None, embed=build_setup_embed(ticker, float(price), setup))
+
+
+@bot.command(name="scan")
+@commands.cooldown(1, 60, commands.BucketType.user)
+async def market_scan(ctx: commands.Context, count: str = "10"):
+    """Top movers by 7-day relative strength vs BTC. Usage: !scan [1-25]"""
+    if not _setup_channel_allowed(ctx.channel.id):
+        ctx.command.reset_cooldown(ctx)
+        await ctx.send("❌ `!scan` isn't enabled in this channel.")
+        return
+    try:
+        n = max(1, min(25, int(count)))
+    except (TypeError, ValueError):
+        ctx.command.reset_cooldown(ctx)
+        await ctx.send("Usage: `!scan` or `!scan 20` (1–25).")
+        return
+    status = await ctx.send("🔍 Scanning the market…")
+    # One keyless TN call, no Claude — the cheapest command in the bot.
+    scanner = await tn_call_safe(
+        "performance_scanner", {"top": n, "lookback_days": 7, "universe_size": 100}
+    )
+    if not scanner or not scanner.get("leaderboard"):
+        await status.edit(content="⚠️ Scanner returned no data — run `!health`.")
+        return
+    await status.edit(content=None, embed=build_scan_embed(scanner, n))
 
 
 def _format_delta(dt: datetime | None) -> str:
