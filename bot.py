@@ -95,6 +95,8 @@ SETUP_ALLOWED_CHANNELS: set[int] = {
 # truthy AND a key is set. Failures here never affect the brief.
 AUTO_DRAFT_ENABLED = os.environ.get("AUTO_DRAFT_ENABLED", "").lower() in ("1", "true", "yes")
 TYPEFULLY_API_KEY = os.environ.get("TYPEFULLY_API_KEY", "").strip()
+# Typefully v2 social set (default = @Corgil_). Override via env if it changes.
+TYPEFULLY_SOCIAL_SET_ID = os.environ.get("TYPEFULLY_SOCIAL_SET_ID", "208154").strip()
 
 # Outcome tracking: !setup trades are logged to {CACHE_PATH}/setups.json and a
 # background job resolves them to WIN/LOSS/EXPIRED for a public track record.
@@ -467,7 +469,8 @@ TWEET_SYSTEM = (
     "started. anyone else seeing this?'"
 )
 
-TYPEFULLY_DRAFTS_URL = "https://api.typefully.com/v1/drafts/"
+def _typefully_drafts_url() -> str:
+    return f"https://api.typefully.com/v2/social-sets/{TYPEFULLY_SOCIAL_SET_ID}/drafts"
 
 
 def _clean_tweet(text: str) -> str:
@@ -501,43 +504,40 @@ async def synthesize_tweet(brief_text: str) -> str:
 
 
 async def create_typefully_draft(text: str) -> str | None:
-    """POST a Typefully v1 draft. Returns a share URL/id, or None on any failure.
+    """POST a Typefully v2 draft for the configured social set. Returns a share
+    URL/id, or None on any failure.
 
-    Never raises and never schedules/publishes — the brief is the deliverable,
-    the draft is a bonus. v1 auth is `X-API-KEY: Bearer <key>`; a few keys want
-    the raw value, so on an auth rejection we retry once without the prefix.
+    Never raises and never publishes/schedules — no `publish_at` ⇒ it stays a
+    draft. Auth is a plain `Authorization: Bearer <key>` (a key pasted with the
+    'Bearer ' prefix already is de-duplicated, not double-prefixed).
     """
-    raw = TYPEFULLY_API_KEY
-    if raw.lower().startswith("bearer "):
-        raw = raw[len("bearer "):].strip()
-    body = {"content": text, "threadify": False}  # no schedule-date/share ⇒ stays a draft
-    last_err = None
-    for header_value in (f"Bearer {raw}", raw):
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
-                resp = await client.post(
-                    TYPEFULLY_DRAFTS_URL,
-                    headers={"X-API-KEY": header_value, "Content-Type": "application/json"},
-                    json=body,
-                )
-            if resp.status_code in (200, 201):
-                data = resp.json() if resp.content else {}
-                draft_id = data.get("id")
-                return (
-                    data.get("share_url")
-                    or data.get("url")
-                    or (f"https://typefully.com/?d={draft_id}" if draft_id else "draft created")
-                )
-            if resp.status_code in (401, 403):
-                last_err = f"HTTP {resp.status_code} (auth)"
-                continue  # try the other X-API-KEY format
-            last_err = f"HTTP {resp.status_code}: {resp.text[:160]}"
-            break  # non-auth error — don't retry
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-            break
-    tn_state["last_draft_error"] = last_err
-    print(f"[AUTODRAFT] Typefully draft failed: {last_err}")
+    key = TYPEFULLY_API_KEY
+    if key.lower().startswith("bearer "):
+        key = key[len("bearer "):].strip()
+    body = {
+        "platforms": {"x": {"enabled": True, "posts": [{"text": text}]}},
+        "draft_title": "Auto-draft from brief",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+            resp = await client.post(
+                _typefully_drafts_url(),
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=body,
+            )
+        if resp.status_code in (200, 201):
+            data = resp.json() if resp.content else {}
+            draft = data.get("draft") if isinstance(data.get("draft"), dict) else data
+            draft_id = draft.get("id") if isinstance(draft, dict) else None
+            return (
+                (draft.get("share_url") if isinstance(draft, dict) else None)
+                or (draft.get("url") if isinstance(draft, dict) else None)
+                or (f"https://typefully.com/?d={draft_id}" if draft_id else "draft created")
+            )
+        tn_state["last_draft_error"] = f"HTTP {resp.status_code}: {resp.text[:160]}"
+    except Exception as e:
+        tn_state["last_draft_error"] = f"{type(e).__name__}: {e}"
+    print(f"[AUTODRAFT] Typefully draft failed: {tn_state['last_draft_error']}")
     return None
 
 

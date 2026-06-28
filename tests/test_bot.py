@@ -866,40 +866,41 @@ def _draft_transport(monkeypatch, handler):
     monkeypatch.setattr(bot.httpx, "AsyncClient", lambda **kw: real(transport=transport, **kw))
 
 
-def test_create_draft_success_uses_bearer_and_draft_body(monkeypatch):
+def test_create_draft_v2_endpoint_auth_and_body(monkeypatch):
     import asyncio, httpx, json as _json
     seen = {}
 
     def handler(req):
-        seen["auth"] = req.headers.get("X-API-KEY")
+        seen["url"] = str(req.url)
+        seen["auth"] = req.headers.get("Authorization")
         seen["body"] = _json.loads(req.content)
         return httpx.Response(200, json={"id": 123, "share_url": "https://typefully.com/t/xyz"})
 
     _draft_transport(monkeypatch, handler)
     monkeypatch.setattr(bot, "TYPEFULLY_API_KEY", "mykey")
+    monkeypatch.setattr(bot, "TYPEFULLY_SOCIAL_SET_ID", "208154")
     url = asyncio.run(bot.create_typefully_draft("hello world"))
     assert url == "https://typefully.com/t/xyz"
-    assert seen["auth"] == "Bearer mykey"           # v1 Bearer-prefixed X-API-KEY
-    assert seen["body"] == {"content": "hello world", "threadify": False}
-    assert "schedule-date" not in seen["body"]      # stays a draft, never scheduled
+    assert seen["url"] == "https://api.typefully.com/v2/social-sets/208154/drafts"
+    assert seen["auth"] == "Bearer mykey"           # v2: plain Authorization Bearer
+    assert seen["body"]["platforms"]["x"] == {"enabled": True, "posts": [{"text": "hello world"}]}
+    assert seen["body"]["draft_title"] == "Auto-draft from brief"
+    assert "publish_at" not in seen["body"]         # stays a draft, never published
 
 
-def test_create_draft_retries_raw_key_on_auth_failure(monkeypatch):
+def test_create_draft_uses_social_set_env(monkeypatch):
     import asyncio, httpx
-    seen = []
+    seen = {}
 
     def handler(req):
-        hv = req.headers.get("X-API-KEY")
-        seen.append(hv)
-        if hv.startswith("Bearer "):
-            return httpx.Response(401, text="unauthorized")
-        return httpx.Response(200, json={"id": 9, "share_url": "https://typefully.com/t/raw"})
+        seen["url"] = str(req.url)
+        return httpx.Response(201, json={"id": 9})
 
     _draft_transport(monkeypatch, handler)
-    monkeypatch.setattr(bot, "TYPEFULLY_API_KEY", "mykey")
-    url = asyncio.run(bot.create_typefully_draft("hi"))
-    assert url == "https://typefully.com/t/raw"
-    assert seen == ["Bearer mykey", "mykey"]        # tried Bearer, fell back to raw
+    monkeypatch.setattr(bot, "TYPEFULLY_API_KEY", "k")
+    monkeypatch.setattr(bot, "TYPEFULLY_SOCIAL_SET_ID", "999777")
+    asyncio.run(bot.create_typefully_draft("hi"))
+    assert "/v2/social-sets/999777/drafts" in seen["url"]
 
 
 def test_create_draft_strips_existing_bearer_prefix(monkeypatch):
@@ -907,13 +908,24 @@ def test_create_draft_strips_existing_bearer_prefix(monkeypatch):
     seen = {}
 
     def handler(req):
-        seen["auth"] = req.headers.get("X-API-KEY")
+        seen["auth"] = req.headers.get("Authorization")
         return httpx.Response(200, json={"id": 1, "share_url": "u"})
 
     _draft_transport(monkeypatch, handler)
     monkeypatch.setattr(bot, "TYPEFULLY_API_KEY", "Bearer abc123")  # user already included prefix
     asyncio.run(bot.create_typefully_draft("hi"))
     assert seen["auth"] == "Bearer abc123"          # not double-prefixed
+
+
+def test_create_draft_403_returns_none_and_records(monkeypatch):
+    import asyncio, httpx
+
+    _draft_transport(monkeypatch, lambda req: httpx.Response(403, text="forbidden"))
+    monkeypatch.setattr(bot, "TYPEFULLY_API_KEY", "k")
+    bot.tn_state["last_draft_error"] = None
+    url = asyncio.run(bot.create_typefully_draft("hi"))
+    assert url is None
+    assert "403" in bot.tn_state["last_draft_error"]   # the v1 failure mode, now handled cleanly
 
 
 def test_create_draft_server_error_returns_none_and_records(monkeypatch):
