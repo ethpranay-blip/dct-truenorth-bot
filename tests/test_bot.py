@@ -757,3 +757,189 @@ def test_scan_command_registered_with_cooldown_and_gate():
         assert bot._setup_channel_allowed(7) is False
     finally:
         bot.SETUP_ALLOWED_CHANNELS = saved
+
+
+# =============================================================================
+# Typefully auto-draft
+# =============================================================================
+
+def test_tweet_system_has_style_rules():
+    p = bot.TWEET_SYSTEM
+    assert "@corgil_" in p
+    assert "lowercase" in p and "260 chars" in p
+    assert "No hashtags" in p and "No links" in p
+    assert "ghostwriter" in p
+
+
+def test_clean_tweet_strips_quotes_and_fences():
+    assert bot._clean_tweet('"hello world"') == "hello world"
+    assert bot._clean_tweet("'gm'") == "gm"
+    assert bot._clean_tweet("```\nbtc up\n```") == "btc up"
+    assert bot._clean_tweet("```json\nplain\n```") == "plain"
+    assert bot._clean_tweet("  no wrapping  ") == "no wrapping"
+
+
+def test_clean_tweet_caps_at_280():
+    assert len(bot._clean_tweet("x" * 400)) == 280
+
+
+def test_autodraft_state_keys_present():
+    assert "drafts_created" in bot.tn_state
+    assert "last_draft_error" in bot.tn_state
+
+
+def test_autodraft_skips_when_disabled(monkeypatch):
+    import asyncio
+    called = {"synth": False}
+
+    async def fake_synth(_t):
+        called["synth"] = True
+        return "x"
+
+    monkeypatch.setattr(bot, "AUTO_DRAFT_ENABLED", False)
+    monkeypatch.setattr(bot, "TYPEFULLY_API_KEY", "k")
+    monkeypatch.setattr(bot, "synthesize_tweet", fake_synth)
+    asyncio.run(bot.maybe_autodraft("brief text", "US"))
+    assert called["synth"] is False  # no Claude call when disabled
+
+
+def test_autodraft_skips_when_key_missing(monkeypatch):
+    import asyncio
+    called = {"synth": False}
+
+    async def fake_synth(_t):
+        called["synth"] = True
+        return "x"
+
+    monkeypatch.setattr(bot, "AUTO_DRAFT_ENABLED", True)
+    monkeypatch.setattr(bot, "TYPEFULLY_API_KEY", "")
+    monkeypatch.setattr(bot, "synthesize_tweet", fake_synth)
+    asyncio.run(bot.maybe_autodraft("brief text", "US"))
+    assert called["synth"] is False
+
+
+def test_autodraft_creates_and_increments_counter(monkeypatch):
+    import asyncio
+
+    async def fake_synth(_t):
+        return "gm tweet"
+
+    async def fake_create(t):
+        assert t == "gm tweet"
+        return "https://typefully.com/t/abc"
+
+    monkeypatch.setattr(bot, "AUTO_DRAFT_ENABLED", True)
+    monkeypatch.setattr(bot, "TYPEFULLY_API_KEY", "k")
+    monkeypatch.setattr(bot, "synthesize_tweet", fake_synth)
+    monkeypatch.setattr(bot, "create_typefully_draft", fake_create)
+    bot.tn_state["drafts_created"] = 0
+    asyncio.run(bot.maybe_autodraft("brief", "US"))
+    assert bot.tn_state["drafts_created"] == 1
+
+
+def test_autodraft_tweet_gen_failure_does_not_raise(monkeypatch):
+    import asyncio
+
+    async def boom(_t):
+        raise RuntimeError("claude down")
+
+    create_called = {"hit": False}
+
+    async def fake_create(_t):
+        create_called["hit"] = True
+        return "x"
+
+    monkeypatch.setattr(bot, "AUTO_DRAFT_ENABLED", True)
+    monkeypatch.setattr(bot, "TYPEFULLY_API_KEY", "k")
+    monkeypatch.setattr(bot, "synthesize_tweet", boom)
+    monkeypatch.setattr(bot, "create_typefully_draft", fake_create)
+    bot.tn_state["drafts_created"] = 0
+    asyncio.run(bot.maybe_autodraft("brief", "US"))  # must not raise
+    assert create_called["hit"] is False
+    assert bot.tn_state["drafts_created"] == 0
+
+
+def _draft_transport(monkeypatch, handler):
+    import httpx
+    transport = httpx.MockTransport(handler)
+    real = httpx.AsyncClient
+    monkeypatch.setattr(bot.httpx, "AsyncClient", lambda **kw: real(transport=transport, **kw))
+
+
+def test_create_draft_success_uses_bearer_and_draft_body(monkeypatch):
+    import asyncio, httpx, json as _json
+    seen = {}
+
+    def handler(req):
+        seen["auth"] = req.headers.get("X-API-KEY")
+        seen["body"] = _json.loads(req.content)
+        return httpx.Response(200, json={"id": 123, "share_url": "https://typefully.com/t/xyz"})
+
+    _draft_transport(monkeypatch, handler)
+    monkeypatch.setattr(bot, "TYPEFULLY_API_KEY", "mykey")
+    url = asyncio.run(bot.create_typefully_draft("hello world"))
+    assert url == "https://typefully.com/t/xyz"
+    assert seen["auth"] == "Bearer mykey"           # v1 Bearer-prefixed X-API-KEY
+    assert seen["body"] == {"content": "hello world", "threadify": False}
+    assert "schedule-date" not in seen["body"]      # stays a draft, never scheduled
+
+
+def test_create_draft_retries_raw_key_on_auth_failure(monkeypatch):
+    import asyncio, httpx
+    seen = []
+
+    def handler(req):
+        hv = req.headers.get("X-API-KEY")
+        seen.append(hv)
+        if hv.startswith("Bearer "):
+            return httpx.Response(401, text="unauthorized")
+        return httpx.Response(200, json={"id": 9, "share_url": "https://typefully.com/t/raw"})
+
+    _draft_transport(monkeypatch, handler)
+    monkeypatch.setattr(bot, "TYPEFULLY_API_KEY", "mykey")
+    url = asyncio.run(bot.create_typefully_draft("hi"))
+    assert url == "https://typefully.com/t/raw"
+    assert seen == ["Bearer mykey", "mykey"]        # tried Bearer, fell back to raw
+
+
+def test_create_draft_strips_existing_bearer_prefix(monkeypatch):
+    import asyncio, httpx
+    seen = {}
+
+    def handler(req):
+        seen["auth"] = req.headers.get("X-API-KEY")
+        return httpx.Response(200, json={"id": 1, "share_url": "u"})
+
+    _draft_transport(monkeypatch, handler)
+    monkeypatch.setattr(bot, "TYPEFULLY_API_KEY", "Bearer abc123")  # user already included prefix
+    asyncio.run(bot.create_typefully_draft("hi"))
+    assert seen["auth"] == "Bearer abc123"          # not double-prefixed
+
+
+def test_create_draft_server_error_returns_none_and_records(monkeypatch):
+    import asyncio, httpx
+    calls = {"n": 0}
+
+    def handler(req):
+        calls["n"] += 1
+        return httpx.Response(500, text="boom")
+
+    _draft_transport(monkeypatch, handler)
+    monkeypatch.setattr(bot, "TYPEFULLY_API_KEY", "mykey")
+    bot.tn_state["last_draft_error"] = None
+    url = asyncio.run(bot.create_typefully_draft("hi"))
+    assert url is None
+    assert calls["n"] == 1  # 5xx is not an auth error → no retry
+    assert "500" in bot.tn_state["last_draft_error"]
+
+
+def test_create_draft_network_error_returns_none(monkeypatch):
+    import asyncio, httpx
+
+    def handler(req):
+        raise httpx.ConnectError("no route")
+
+    _draft_transport(monkeypatch, handler)
+    monkeypatch.setattr(bot, "TYPEFULLY_API_KEY", "mykey")
+    url = asyncio.run(bot.create_typefully_draft("hi"))
+    assert url is None

@@ -89,6 +89,12 @@ SETUP_ALLOWED_CHANNELS: set[int] = {
     int(c) for c in os.environ.get("SETUP_ALLOWED_CHANNELS", "").replace(" ", "").split(",") if c
 }
 
+# Optional: after a brief posts to Discord, ghostwrite a tweet and save it as a
+# Typefully DRAFT (never published/scheduled). Off unless AUTO_DRAFT_ENABLED is
+# truthy AND a key is set. Failures here never affect the brief.
+AUTO_DRAFT_ENABLED = os.environ.get("AUTO_DRAFT_ENABLED", "").lower() in ("1", "true", "yes")
+TYPEFULLY_API_KEY = os.environ.get("TYPEFULLY_API_KEY", "").strip()
+
 # --- Embed colors ---
 COLOR_RISK   = 0xFFAA00
 COLOR_ASIA   = 0x00BFFF
@@ -118,6 +124,8 @@ tn_state: dict = {
     "last_synth_error": None,       # str | None — Claude-side failure
     "last_brief_at": {},            # {"asia"|"london"|"us": datetime}
     "last_regime_at": None,         # datetime | None
+    "drafts_created": 0,            # int — Typefully drafts made this process
+    "last_draft_error": None,       # str | None — Typefully/ghostwriter failure
 }
 
 
@@ -430,6 +438,115 @@ def _setup_channel_allowed(channel_id: int) -> bool:
 
 
 # =============================================================================
+# Typefully auto-draft (optional) — a posted brief → a tweet draft to review
+# =============================================================================
+
+TWEET_SYSTEM = (
+    "You are @corgil_'s tweet ghostwriter. Given this market brief data, write a "
+    "single standalone tweet (under 260 chars). Style: lowercase, casual, crypto-native. "
+    "Lead with the most interesting data point. End with a question to drive replies. "
+    "No hashtags. No links. No emojis except sparingly. Example tone: 'btc holding 96k "
+    "into US open but funding is starting to heat up. this is where the last 3 squeezes "
+    "started. anyone else seeing this?'"
+)
+
+TYPEFULLY_DRAFTS_URL = "https://api.typefully.com/v1/drafts/"
+
+
+def _clean_tweet(text: str) -> str:
+    """Strip a model's stray quotes / code fences and cap to the platform limit."""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", t).strip()
+    if len(t) >= 2 and t[0] in "\"'" and t[-1] == t[0]:
+        t = t[1:-1].strip()
+    return t[:280]
+
+
+async def synthesize_tweet(brief_text: str) -> str:
+    """Ghostwrite one tweet from an already-synthesized brief (same model/key).
+
+    The brief narrative already contains the regime read, BTC level, funding and
+    the standout mover, so we hand it straight to the ghostwriter and let it pick
+    the most interesting point — no brittle re-parsing of free text.
+    """
+    try:
+        resp = await claude_client.messages.create(
+            model=SYNTH_MODEL,
+            max_tokens=600,
+            system=TWEET_SYSTEM,
+            messages=[{"role": "user", "content": f"Market brief data:\n{brief_text[:2000]}"}],
+        )
+    except anthropic.APIError as e:
+        tn_state["last_synth_error"] = f"{type(e).__name__}: {e}"
+        raise
+    return _clean_tweet(response_text(resp.content))
+
+
+async def create_typefully_draft(text: str) -> str | None:
+    """POST a Typefully v1 draft. Returns a share URL/id, or None on any failure.
+
+    Never raises and never schedules/publishes — the brief is the deliverable,
+    the draft is a bonus. v1 auth is `X-API-KEY: Bearer <key>`; a few keys want
+    the raw value, so on an auth rejection we retry once without the prefix.
+    """
+    raw = TYPEFULLY_API_KEY
+    if raw.lower().startswith("bearer "):
+        raw = raw[len("bearer "):].strip()
+    body = {"content": text, "threadify": False}  # no schedule-date/share ⇒ stays a draft
+    last_err = None
+    for header_value in (f"Bearer {raw}", raw):
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+                resp = await client.post(
+                    TYPEFULLY_DRAFTS_URL,
+                    headers={"X-API-KEY": header_value, "Content-Type": "application/json"},
+                    json=body,
+                )
+            if resp.status_code in (200, 201):
+                data = resp.json() if resp.content else {}
+                draft_id = data.get("id")
+                return (
+                    data.get("share_url")
+                    or data.get("url")
+                    or (f"https://typefully.com/?d={draft_id}" if draft_id else "draft created")
+                )
+            if resp.status_code in (401, 403):
+                last_err = f"HTTP {resp.status_code} (auth)"
+                continue  # try the other X-API-KEY format
+            last_err = f"HTTP {resp.status_code}: {resp.text[:160]}"
+            break  # non-auth error — don't retry
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            break
+    tn_state["last_draft_error"] = last_err
+    print(f"[AUTODRAFT] Typefully draft failed: {last_err}")
+    return None
+
+
+async def maybe_autodraft(brief_text: str, label: str) -> None:
+    """Best-effort: brief → ghostwritten tweet → Typefully draft. Fully gated and
+    self-contained; any failure is logged and swallowed so the brief is unaffected."""
+    if not AUTO_DRAFT_ENABLED:
+        return
+    if not TYPEFULLY_API_KEY:
+        print("[AUTODRAFT] AUTO_DRAFT_ENABLED set but TYPEFULLY_API_KEY missing — skipping")
+        return
+    try:
+        tweet = await synthesize_tweet(brief_text)
+    except Exception as e:
+        tn_state["last_draft_error"] = f"tweet gen: {type(e).__name__}"
+        print(f"[AUTODRAFT] {label} tweet generation failed: {type(e).__name__}: {e}")
+        return
+    if not tweet:
+        return
+    url = await create_typefully_draft(tweet)
+    if url:
+        tn_state["drafts_created"] += 1
+        print(f"[AUTODRAFT] {label} → draft created: {url}")
+
+
+# =============================================================================
 # Embed builders
 # =============================================================================
 
@@ -647,6 +764,7 @@ async def run_session_brief(session: str, phase: str = "Pre-Open Brief") -> bool
     await channel.send(embed=build_brief_embed(text, session, phase))
     tn_state["last_brief_at"][session] = datetime.now(IST)
     print(f"[SCHED] {label} {phase} posted ({available}/{len(BRIEF_SOURCES)} sources)")
+    await maybe_autodraft(text, f"{label} {phase}")  # bonus tweet draft; never fails the brief
     return True
 
 
@@ -674,6 +792,7 @@ async def run_regime_update() -> bool:
     await channel.send(embed=build_regime_embed(text))
     tn_state["last_regime_at"] = datetime.now(IST)
     print("[SCHED] regime outlook posted")
+    await maybe_autodraft(text, "Regime")  # bonus tweet draft; never fails the post
     return True
 
 
@@ -920,6 +1039,13 @@ async def manual_health(ctx: commands.Context):
         value=(f"{len(SETUP_ALLOWED_CHANNELS)} channel(s)" if SETUP_ALLOWED_CHANNELS else "all channels"),
         inline=True,
     )
+    e.add_field(
+        name="Auto-draft",
+        value=(f"enabled · {tn_state['drafts_created']} this session" if AUTO_DRAFT_ENABLED else "disabled"),
+        inline=True,
+    )
+    if tn_state["last_draft_error"]:
+        e.add_field(name="Last draft error", value=f"```\n{str(tn_state['last_draft_error'])[:300]}\n```", inline=False)
     if scheduler.running:
         nxt = "\n".join(
             f"`{j.id}` → {j.next_run_time.astimezone(IST).strftime('%a %H:%M IST')}"
