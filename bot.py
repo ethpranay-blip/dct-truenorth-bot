@@ -48,6 +48,7 @@ import httpx
 import anthropic
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 # aiohttp serves GET /healthz so Railway's web-service health check passes.
 from aiohttp import web
@@ -95,6 +96,15 @@ SETUP_ALLOWED_CHANNELS: set[int] = {
 AUTO_DRAFT_ENABLED = os.environ.get("AUTO_DRAFT_ENABLED", "").lower() in ("1", "true", "yes")
 TYPEFULLY_API_KEY = os.environ.get("TYPEFULLY_API_KEY", "").strip()
 
+# Outcome tracking: !setup trades are logged to {CACHE_PATH}/setups.json and a
+# background job resolves them to WIN/LOSS/EXPIRED for a public track record.
+# Point CACHE_PATH at a mounted Railway volume to persist across restarts; if it
+# isn't mounted, the file is ephemeral and history resets on redeploy (handled
+# gracefully at startup with a warning).
+CACHE_PATH = (os.environ.get("CACHE_PATH", ".").rstrip("/") or ".")
+SETUPS_PATH = os.path.join(CACHE_PATH, "setups.json")
+SETUP_EXPIRY_HOURS = 48
+
 # --- Embed colors ---
 COLOR_RISK   = 0xFFAA00
 COLOR_ASIA   = 0x00BFFF
@@ -127,6 +137,9 @@ tn_state: dict = {
     "drafts_created": 0,            # int — Typefully drafts made this process
     "last_draft_error": None,       # str | None — Typefully/ghostwriter failure
 }
+
+# In-memory authoritative list of tracked setups (mirrors setups.json on disk).
+_SETUPS: list[dict] = []
 
 
 # =============================================================================
@@ -735,6 +748,288 @@ async def alert_ops(title: str, detail: str) -> None:
 
 
 # =============================================================================
+# Setup outcome tracking — public win/loss track record for !setup trades
+# =============================================================================
+
+def _extract_numbers(s: str) -> list[float]:
+    """Pull numeric values out of a level string like '$62,400 – $62,900'."""
+    out = []
+    for tok in re.findall(r"\d[\d,]*(?:\.\d+)?", s or ""):
+        try:
+            out.append(float(tok.replace(",", "")))
+        except ValueError:
+            pass
+    return out
+
+
+def _parse_price(s: str) -> float | None:
+    nums = _extract_numbers(s)
+    return nums[0] if nums else None
+
+
+def _parse_zone_midpoint(s: str) -> float | None:
+    """Entry zones are ranges ('$62,400 – $62,900') → midpoint; singles → value."""
+    nums = _extract_numbers(s)
+    if not nums:
+        return None
+    return (nums[0] + nums[1]) / 2 if len(nums) >= 2 else nums[0]
+
+
+def _levels_coherent(direction: str, entry: float, stop: float, tp1: float) -> bool:
+    """Reject incoherent levels that would resolve instantly (e.g. LONG tp1<entry)."""
+    if direction == "LONG":
+        return stop < entry < tp1
+    if direction == "SHORT":
+        return tp1 < entry < stop
+    return False
+
+
+def _money(x: float | None) -> str:
+    if x is None:
+        return "—"
+    if x >= 1000:
+        return f"${x:,.0f}"
+    if x >= 1:
+        return f"${x:,.2f}"
+    return f"${x:.4g}"
+
+
+def _signed_pct(p: float | None) -> str:
+    return "—" if p is None else f"{p:+.1f}%"
+
+
+def _trade_pct(setup: dict, price: float | None) -> float | None:
+    """Direction-adjusted P&L %: positive = trade in profit, negative = loss."""
+    if price is None:
+        return None
+    raw = (price - setup["entry_price"]) / setup["entry_price"] * 100
+    return raw if setup["direction"] == "LONG" else -raw
+
+
+def _elapsed_str(start_iso: str, end_iso: str | None = None) -> str:
+    try:
+        start = datetime.fromisoformat(start_iso)
+        end = datetime.fromisoformat(end_iso) if end_iso else datetime.now(IST)
+    except (TypeError, ValueError):
+        return "—"
+    secs = int((end - start).total_seconds())
+    if secs < 3600:
+        return f"{max(secs, 0) // 60}m"
+    if secs < 86400:
+        return f"{secs // 3600}h {(secs % 3600) // 60}m"
+    return f"{secs // 86400}d {(secs % 86400) // 3600}h"
+
+
+def _persist_setups() -> None:
+    """Atomic write of _SETUPS to disk (.tmp + fsync + os.replace). Best-effort."""
+    try:
+        os.makedirs(CACHE_PATH, exist_ok=True)
+        tmp = SETUPS_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"version": 1, "setups": _SETUPS}, f, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, SETUPS_PATH)
+    except Exception as e:
+        print(f"[TRACK] WARNING: failed to persist setups: {type(e).__name__}: {e}")
+
+
+def init_setups() -> None:
+    """Load setups.json at startup. Missing file ⇒ start fresh + warn (covers an
+    unmounted Railway volume where the file doesn't survive restarts)."""
+    global _SETUPS
+    try:
+        if os.path.exists(SETUPS_PATH):
+            with open(SETUPS_PATH) as f:
+                data = json.load(f)
+            _SETUPS = data.get("setups", []) if isinstance(data, dict) else (data or [])
+            open_n = sum(1 for s in _SETUPS if s.get("status") == "OPEN")
+            print(f"[TRACK] loaded {len(_SETUPS)} setups ({open_n} open) from {SETUPS_PATH}")
+        else:
+            _SETUPS = []
+            print(f"[TRACK] WARNING: {SETUPS_PATH} not found — starting fresh. If CACHE_PATH "
+                  f"is not a mounted volume, track record will reset on each restart.")
+            _persist_setups()
+    except Exception as e:
+        _SETUPS = []
+        print(f"[TRACK] WARNING: could not load setups ({type(e).__name__}: {e}) — starting fresh.")
+
+
+def log_setup(setup: dict, ticker: str, coingecko_id: str, message) -> None:
+    """Record a LONG/SHORT !setup for outcome tracking. No-ops on 'no clear setup'
+    or unparseable/incoherent levels (the embed still posts; it's just not tracked)."""
+    direction = str(setup.get("direction") or "NONE").upper()
+    if not setup.get("has_setup") or direction not in ("LONG", "SHORT"):
+        return
+    entry = _parse_zone_midpoint(setup.get("entry_zone"))
+    stop = _parse_price(setup.get("stop_loss"))
+    tp1 = _parse_price(setup.get("take_profit_1"))
+    tp2 = _parse_price(setup.get("take_profit_2"))
+    if entry is None or stop is None or tp1 is None:
+        print(f"[TRACK] {ticker}: levels unparseable — not tracking")
+        return
+    if not _levels_coherent(direction, entry, stop, tp1):
+        print(f"[TRACK] {ticker}: incoherent {direction} levels (entry={entry} stop={stop} tp1={tp1}) — not tracking")
+        return
+    _SETUPS.append({
+        "ticker": ticker, "coingecko_id": coingecko_id, "direction": direction,
+        "entry_price": entry, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
+        "rr_ratio": str(setup.get("rr_ratio", "")), "conviction": str(setup.get("conviction", "")),
+        "timestamp": datetime.now(IST).isoformat(),
+        "discord_message_id": message.id, "discord_channel_id": message.channel.id,
+        "status": "OPEN", "resolution_price": None, "resolved_at": None,
+        "result_pct": None, "outcome_label": None,
+    })
+    _persist_setups()
+    print(f"[TRACK] logged {ticker} {direction} entry={_money(entry)} stop={_money(stop)} tp1={_money(tp1)}")
+
+
+def evaluate_setup(setup: dict, price: float | None):
+    """Return (status, label) if an OPEN setup resolved, else None.
+    WIN/LOSS need a price; EXPIRED is purely time-based (48h)."""
+    if price is not None:
+        if setup["direction"] == "LONG":
+            if price >= setup["tp1"]:
+                return ("WIN", "TP1")
+            if price <= setup["stop_loss"]:
+                return ("LOSS", "SL")
+        else:  # SHORT
+            if price <= setup["tp1"]:
+                return ("WIN", "TP1")
+            if price >= setup["stop_loss"]:
+                return ("LOSS", "SL")
+    try:
+        age_h = (datetime.now(IST) - datetime.fromisoformat(setup["timestamp"])).total_seconds() / 3600
+    except (TypeError, ValueError):
+        age_h = 0
+    if age_h >= SETUP_EXPIRY_HOURS:
+        return ("EXPIRED", "EXPIRED")
+    return None
+
+
+COLOR_EXPIRED = 0x808080
+
+
+def build_resolution_embed(s: dict) -> discord.Embed:
+    """Follow-up embed posted as a reply when a tracked setup resolves."""
+    d = s["direction"].title()  # Long / Short
+    entry, res, pct = s["entry_price"], s.get("resolution_price"), s.get("result_pct")
+    elapsed = _elapsed_str(s["timestamp"], s.get("resolved_at"))
+    if s["status"] == "WIN":
+        title = "✅ TP1 HIT"
+        desc = f"**{s['ticker']} {d}** from {_money(entry)} → {_money(res)} ({_signed_pct(pct)})\n⏱ {elapsed} since entry"
+        color = COLOR_LONG
+    elif s["status"] == "LOSS":
+        title = "❌ STOPPED"
+        desc = f"**{s['ticker']} {d}** from {_money(entry)} → SL {_money(s['stop_loss'])} hit ({_signed_pct(pct)})\n⏱ {elapsed} since entry"
+        color = COLOR_SHORT
+    else:  # EXPIRED
+        title = "⏰ EXPIRED"
+        tail = f" (last {_signed_pct(pct)})" if pct is not None else ""
+        desc = f"**{s['ticker']} {d}** from {_money(entry)} → no trigger in {SETUP_EXPIRY_HOURS}h{tail}"
+        color = COLOR_EXPIRED
+    e = discord.Embed(title=title, description=desc, color=color)
+    e.set_footer(text=FOOTER + " · tracked setup · not financial advice")
+    e.timestamp = datetime.now(IST)
+    return e
+
+
+async def _post_resolution(s: dict) -> None:
+    """Reply to the original !setup message with the resolution; fall back to a
+    plain channel post if the original message is gone."""
+    embed = build_resolution_embed(s)
+    channel = bot.get_channel(s["discord_channel_id"])
+    if channel is None:
+        print(f"[TRACK] channel {s['discord_channel_id']} not found — can't post {s['ticker']} resolution")
+        return
+    try:
+        original = await channel.fetch_message(s["discord_message_id"])
+        await original.reply(embed=embed)
+    except Exception as ex:
+        print(f"[TRACK] reply failed ({type(ex).__name__}) — posting unthreaded")
+        try:
+            await channel.send(embed=embed)
+        except Exception as ex2:
+            print(f"[TRACK] channel send also failed: {type(ex2).__name__}: {ex2}")
+
+
+async def track_setups() -> None:
+    """Every 15 min: price-check OPEN setups, resolve + announce any that hit."""
+    open_setups = [s for s in _SETUPS if s.get("status") == "OPEN"]
+    if not open_setups:
+        return
+    changed = False
+    for s in open_setups:
+        info = await tn_call_safe("basic_market_info", {"token_address": s["coingecko_id"]})
+        price = (info or {}).get("market_data", {}).get("current_price")
+        outcome = evaluate_setup(s, price)
+        if outcome is None:
+            continue
+        status, label = outcome
+        s["status"] = status
+        s["outcome_label"] = label
+        s["resolution_price"] = price
+        s["resolved_at"] = datetime.now(IST).isoformat()
+        s["result_pct"] = _trade_pct(s, price)
+        changed = True
+        print(f"[TRACK] {s['ticker']} {s['direction']} → {status} ({label}) at {_money(price)}")
+        await _post_resolution(s)
+    if changed:
+        _persist_setups()
+
+
+def compute_winrate(setups: list[dict]) -> dict:
+    """Pure stats over the tracked setups for !winrate."""
+    wins = [s for s in setups if s.get("status") == "WIN"]
+    losses = [s for s in setups if s.get("status") == "LOSS"]
+    expired = [s for s in setups if s.get("status") == "EXPIRED"]
+    open_n = sum(1 for s in setups if s.get("status") == "OPEN")
+    decided = len(wins) + len(losses)
+    pcts = [s["result_pct"] for s in setups if s.get("result_pct") is not None]
+    realized_rr = []
+    for s in wins:
+        risk = abs(s["entry_price"] - s["stop_loss"])
+        if risk > 0 and s.get("resolution_price") is not None:
+            realized_rr.append(abs(s["resolution_price"] - s["entry_price"]) / risk)
+    return {
+        "total": len(setups),
+        "open": open_n,
+        "wins": len(wins),
+        "losses": len(losses),
+        "expired": len(expired),
+        "win_rate": (len(wins) / decided * 100) if decided else None,
+        "best": max(pcts) if pcts else None,
+        "worst": min(pcts) if pcts else None,
+        "avg_rr": (sum(realized_rr) / len(realized_rr)) if realized_rr else None,
+    }
+
+
+def build_winrate_embed(stats: dict) -> discord.Embed:
+    e = discord.Embed(title="📈 Setup Track Record", color=COLOR_SCAN)
+    e.add_field(name="Tracked", value=str(stats["total"]), inline=True)
+    e.add_field(name="Open", value=str(stats["open"]), inline=True)
+    e.add_field(
+        name="Win rate",
+        value=(f"{stats['win_rate']:.0f}%  ({stats['wins']}W / {stats['losses']}L)"
+               if stats["win_rate"] is not None else "— (no resolved trades yet)"),
+        inline=True,
+    )
+    e.add_field(name="Wins", value=str(stats["wins"]), inline=True)
+    e.add_field(name="Losses", value=str(stats["losses"]), inline=True)
+    e.add_field(name="Expired", value=str(stats["expired"]), inline=True)
+    e.add_field(name="Best trade", value=_signed_pct(stats["best"]), inline=True)
+    e.add_field(name="Worst trade", value=_signed_pct(stats["worst"]), inline=True)
+    e.add_field(
+        name="Avg R:R realized",
+        value=(f"{stats['avg_rr']:.2f}" if stats["avg_rr"] is not None else "—"),
+        inline=True,
+    )
+    e.set_footer(text=FOOTER + " · win rate excludes expired")
+    e.timestamp = datetime.now(IST)
+    return e
+
+
+# =============================================================================
 # Scheduled jobs
 # =============================================================================
 
@@ -822,6 +1117,12 @@ def setup_scheduler() -> None:
         id="regime_mwf",
         replace_existing=True,
     )
+    scheduler.add_job(
+        track_setups,
+        IntervalTrigger(minutes=15),
+        id="setup_tracker",
+        replace_existing=True,
+    )
 
 
 # =============================================================================
@@ -867,6 +1168,7 @@ async def start_webhook_server() -> None:
 async def on_ready():
     print(f"DCT TrueNorth Bot online as {bot.user}")
     await start_webhook_server()
+    init_setups()  # load tracked setups before the tracker job can fire
     setup_scheduler()
     if not scheduler.running:
         scheduler.start()
@@ -967,6 +1269,7 @@ async def trade_setup(ctx: commands.Context, ticker: str = ""):
         return
 
     await status.edit(content=None, embed=build_setup_embed(ticker, float(price), setup))
+    log_setup(setup, ticker, token_id, status)  # track LONG/SHORT outcomes (no-ops otherwise)
 
 
 @bot.command(name="scan")
@@ -992,6 +1295,18 @@ async def market_scan(ctx: commands.Context, count: str = "10"):
         await status.edit(content="⚠️ Scanner returned no data — run `!health`.")
         return
     await status.edit(content=None, embed=build_scan_embed(scanner, n))
+
+
+@bot.command(name="winrate")
+async def winrate(ctx: commands.Context):
+    """Public track record of !setup trades. Usage: !winrate"""
+    if not _setup_channel_allowed(ctx.channel.id):
+        await ctx.send("❌ `!winrate` isn't enabled in this channel.")
+        return
+    if not _SETUPS:
+        await ctx.send("No setups tracked yet — use !setup to generate one.")
+        return
+    await ctx.send(embed=build_winrate_embed(compute_winrate(_SETUPS)))
 
 
 def _format_delta(dt: datetime | None) -> str:
@@ -1046,6 +1361,13 @@ async def manual_health(ctx: commands.Context):
     )
     if tn_state["last_draft_error"]:
         e.add_field(name="Last draft error", value=f"```\n{str(tn_state['last_draft_error'])[:300]}\n```", inline=False)
+    _ts = compute_winrate(_SETUPS)
+    e.add_field(
+        name="Tracked setups",
+        value=(f"{_ts['open']} open / {_ts['total'] - _ts['open']} resolved "
+               f"({_ts['wins']} wins, {_ts['losses']} losses, {_ts['expired']} expired)"),
+        inline=False,
+    )
     if scheduler.running:
         nxt = "\n".join(
             f"`{j.id}` → {j.next_run_time.astimezone(IST).strftime('%a %H:%M IST')}"

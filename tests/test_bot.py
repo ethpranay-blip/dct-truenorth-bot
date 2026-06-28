@@ -343,10 +343,10 @@ def test_schedule_sessions_have_channels():
         assert session in bot.CH
 
 
-def test_setup_scheduler_registers_four_jobs():
+def test_setup_scheduler_registers_jobs():
     bot.setup_scheduler()
     job_ids = {j.id for j in bot.scheduler.get_jobs()}
-    assert job_ids == {"asia_pre_open", "london_pre_open", "us_pre_open", "regime_mwf"}
+    assert job_ids == {"asia_pre_open", "london_pre_open", "us_pre_open", "regime_mwf", "setup_tracker"}
     # Re-running must not introduce new job ids. (Exact-count idempotency only
     # holds on a *running* scheduler — replace_existing dedupes at start() —
     # and on_ready always starts the scheduler right after the first setup.)
@@ -943,3 +943,284 @@ def test_create_draft_network_error_returns_none(monkeypatch):
     monkeypatch.setattr(bot, "TYPEFULLY_API_KEY", "mykey")
     url = asyncio.run(bot.create_typefully_draft("hi"))
     assert url is None
+
+
+# =============================================================================
+# Setup outcome tracking
+# =============================================================================
+
+def test_extract_numbers_and_price_parsing():
+    assert bot._extract_numbers("$62,400 – $62,900") == [62400.0, 62900.0]
+    assert bot._extract_numbers("$0.1840") == [0.1840]
+    assert bot._extract_numbers("—") == []
+    assert bot._parse_price("$61,200") == 61200.0
+    assert bot._parse_price("nope") is None
+
+
+def test_parse_zone_midpoint():
+    assert bot._parse_zone_midpoint("$62,400 – $62,900") == 62650.0
+    assert bot._parse_zone_midpoint("$95,800") == 95800.0   # single value
+    assert bot._parse_zone_midpoint("") is None
+
+
+def test_levels_coherent():
+    assert bot._levels_coherent("LONG", 100, 95, 110) is True
+    assert bot._levels_coherent("LONG", 100, 110, 90) is False   # stop above entry
+    assert bot._levels_coherent("SHORT", 100, 110, 90) is True
+    assert bot._levels_coherent("SHORT", 100, 95, 110) is False
+    assert bot._levels_coherent("NONE", 100, 95, 110) is False
+
+
+def test_money_formatting():
+    assert bot._money(95800) == "$95,800"
+    assert bot._money(65.5) == "$65.50"
+    assert bot._money(0.1663).startswith("$0.166")
+    assert bot._money(None) == "—"
+
+
+def test_trade_pct_direction_adjusted():
+    long_win = {"entry_price": 95800, "direction": "LONG"}
+    assert round(bot._trade_pct(long_win, 99400), 1) == 3.8   # (99400-95800)/95800
+    long_loss = {"entry_price": 95800, "direction": "LONG"}
+    assert bot._trade_pct(long_loss, 94200) < 0
+    short_win = {"entry_price": 2500, "direction": "SHORT"}
+    assert bot._trade_pct(short_win, 2400) > 0                # price fell → short profits
+    short_loss = {"entry_price": 2500, "direction": "SHORT"}
+    assert bot._trade_pct(short_loss, 2600) < 0
+    assert bot._trade_pct(long_win, None) is None
+
+
+def test_evaluate_setup_long():
+    s = {"direction": "LONG", "entry_price": 100, "stop_loss": 95, "tp1": 110,
+         "timestamp": bot.datetime.now(bot.IST).isoformat()}
+    assert bot.evaluate_setup(s, 111) == ("WIN", "TP1")
+    assert bot.evaluate_setup(s, 94) == ("LOSS", "SL")
+    assert bot.evaluate_setup(s, 102) is None                # mid-range, still open
+
+
+def test_evaluate_setup_short():
+    s = {"direction": "SHORT", "entry_price": 100, "stop_loss": 110, "tp1": 90,
+         "timestamp": bot.datetime.now(bot.IST).isoformat()}
+    assert bot.evaluate_setup(s, 89) == ("WIN", "TP1")
+    assert bot.evaluate_setup(s, 111) == ("LOSS", "SL")
+    assert bot.evaluate_setup(s, 100) is None
+
+
+def test_evaluate_setup_expiry_time_based():
+    from datetime import timedelta
+    old = (bot.datetime.now(bot.IST) - timedelta(hours=49)).isoformat()
+    s = {"direction": "LONG", "entry_price": 100, "stop_loss": 95, "tp1": 110, "timestamp": old}
+    assert bot.evaluate_setup(s, 102) == ("EXPIRED", "EXPIRED")   # no trigger, aged out
+    # Price trigger still wins over expiry.
+    assert bot.evaluate_setup(s, 111) == ("WIN", "TP1")
+    # No price + expired ⇒ still expires (price fetch failed).
+    assert bot.evaluate_setup(s, None) == ("EXPIRED", "EXPIRED")
+
+
+def test_evaluate_setup_no_price_not_expired_is_none():
+    s = {"direction": "LONG", "entry_price": 100, "stop_loss": 95, "tp1": 110,
+         "timestamp": bot.datetime.now(bot.IST).isoformat()}
+    assert bot.evaluate_setup(s, None) is None
+
+
+def _resolved(status, **kw):
+    base = {"ticker": "BTC", "direction": "LONG", "entry_price": 95800.0,
+            "stop_loss": 94200.0, "tp1": 99400.0, "tp2": 101000.0,
+            "timestamp": bot.datetime.now(bot.IST).isoformat(),
+            "resolved_at": bot.datetime.now(bot.IST).isoformat(),
+            "status": status, "resolution_price": None, "result_pct": None, "outcome_label": None}
+    base.update(kw)
+    return base
+
+
+def test_resolution_embed_win_green():
+    s = _resolved("WIN", resolution_price=99400.0, result_pct=3.8, outcome_label="TP1")
+    e = bot.build_resolution_embed(s)
+    assert e.color.value == bot.COLOR_LONG
+    assert "TP1 HIT" in e.title
+    assert "$95,800" in e.description and "$99,400" in e.description and "+3.8%" in e.description
+
+
+def test_resolution_embed_loss_red():
+    s = _resolved("LOSS", resolution_price=94200.0, result_pct=-1.7, outcome_label="SL")
+    e = bot.build_resolution_embed(s)
+    assert e.color.value == bot.COLOR_SHORT
+    assert "STOPPED" in e.title and "SL $94,200" in e.description and "-1.7%" in e.description
+
+
+def test_resolution_embed_expired_grey():
+    s = _resolved("EXPIRED", resolution_price=96000.0, result_pct=0.2, outcome_label="EXPIRED")
+    e = bot.build_resolution_embed(s)
+    assert e.color.value == bot.COLOR_EXPIRED
+    assert "EXPIRED" in e.title and "no trigger in 48h" in e.description
+
+
+def test_compute_winrate_math():
+    setups = [
+        _resolved("WIN", entry_price=100, stop_loss=90, resolution_price=110, result_pct=10.0),
+        _resolved("WIN", entry_price=100, stop_loss=95, resolution_price=108, result_pct=8.0),
+        _resolved("LOSS", entry_price=100, stop_loss=96, resolution_price=96, result_pct=-4.0),
+        _resolved("EXPIRED", resolution_price=101, result_pct=1.0),
+        {"status": "OPEN", "entry_price": 100, "stop_loss": 95, "tp1": 110,
+         "timestamp": bot.datetime.now(bot.IST).isoformat()},
+    ]
+    st = bot.compute_winrate(setups)
+    assert st["total"] == 5 and st["open"] == 1
+    assert st["wins"] == 2 and st["losses"] == 1 and st["expired"] == 1
+    assert round(st["win_rate"], 1) == 66.7          # 2 / (2+1)
+    assert st["best"] == 10.0 and st["worst"] == -4.0
+    # realized R:R: win1 = |110-100|/|100-90| = 1.0 ; win2 = |108-100|/|100-95| = 1.6 → avg 1.3
+    assert round(st["avg_rr"], 2) == 1.30
+
+
+def test_compute_winrate_empty():
+    st = bot.compute_winrate([])
+    assert st["total"] == 0 and st["win_rate"] is None
+    assert st["best"] is None and st["avg_rr"] is None
+
+
+def test_winrate_embed_shape():
+    e = bot.build_winrate_embed(bot.compute_winrate([
+        _resolved("WIN", entry_price=100, stop_loss=90, resolution_price=110, result_pct=10.0),
+    ]))
+    names = {f.name for f in e.fields}
+    assert {"Tracked", "Win rate", "Wins", "Losses", "Expired",
+            "Best trade", "Worst trade", "Avg R:R realized"} <= names
+
+
+class _FakeMsg:
+    def __init__(self, mid=111, cid=222):
+        self.id = mid
+
+        class _Ch:
+            id = cid
+        self.channel = _Ch()
+
+
+def test_log_setup_persists_long(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "CACHE_PATH", str(tmp_path))
+    monkeypatch.setattr(bot, "SETUPS_PATH", str(tmp_path / "setups.json"))
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    setup = {"has_setup": True, "direction": "LONG", "entry_zone": "$95,600 – $96,000",
+             "stop_loss": "$94,200", "take_profit_1": "$99,400", "take_profit_2": "$101,000",
+             "rr_ratio": "2.8", "conviction": "High"}
+    bot.log_setup(setup, "BTC", "bitcoin", _FakeMsg(mid=555, cid=777))
+    assert len(bot._SETUPS) == 1
+    rec = bot._SETUPS[0]
+    assert rec["entry_price"] == 95800.0 and rec["stop_loss"] == 94200.0 and rec["tp1"] == 99400.0
+    assert rec["discord_message_id"] == 555 and rec["discord_channel_id"] == 777
+    assert rec["status"] == "OPEN"
+    # round-trips through disk
+    import json
+    saved = json.loads((tmp_path / "setups.json").read_text())
+    assert saved["setups"][0]["coingecko_id"] == "bitcoin"
+
+
+def test_log_setup_skips_no_clear_setup(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "CACHE_PATH", str(tmp_path))
+    monkeypatch.setattr(bot, "SETUPS_PATH", str(tmp_path / "setups.json"))
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    bot.log_setup({"has_setup": False, "direction": "NONE"}, "BTC", "bitcoin", _FakeMsg())
+    assert bot._SETUPS == []
+
+
+def test_log_setup_skips_incoherent_levels(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "CACHE_PATH", str(tmp_path))
+    monkeypatch.setattr(bot, "SETUPS_PATH", str(tmp_path / "setups.json"))
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    # LONG but tp1 below entry → would resolve instantly; must be rejected.
+    bad = {"has_setup": True, "direction": "LONG", "entry_zone": "$100",
+           "stop_loss": "$95", "take_profit_1": "$90", "take_profit_2": "$80"}
+    bot.log_setup(bad, "BTC", "bitcoin", _FakeMsg())
+    assert bot._SETUPS == []
+
+
+def test_init_setups_missing_file_starts_fresh(tmp_path, monkeypatch):
+    path = tmp_path / "nope" / "setups.json"
+    monkeypatch.setattr(bot, "CACHE_PATH", str(tmp_path / "nope"))
+    monkeypatch.setattr(bot, "SETUPS_PATH", str(path))
+    monkeypatch.setattr(bot, "_SETUPS", [{"stale": True}])
+    bot.init_setups()
+    assert bot._SETUPS == []          # reset
+    assert path.exists()              # empty file created
+
+
+def test_init_setups_loads_existing(tmp_path, monkeypatch):
+    import json
+    path = tmp_path / "setups.json"
+    path.write_text(json.dumps({"version": 1, "setups": [
+        {"ticker": "ETH", "status": "OPEN"}, {"ticker": "BTC", "status": "WIN"}]}))
+    monkeypatch.setattr(bot, "CACHE_PATH", str(tmp_path))
+    monkeypatch.setattr(bot, "SETUPS_PATH", str(path))
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    bot.init_setups()
+    assert len(bot._SETUPS) == 2
+    assert {s["ticker"] for s in bot._SETUPS} == {"ETH", "BTC"}
+
+
+def test_init_setups_corrupt_file_starts_fresh(tmp_path, monkeypatch):
+    path = tmp_path / "setups.json"
+    path.write_text("{ this is not valid json ")
+    monkeypatch.setattr(bot, "CACHE_PATH", str(tmp_path))
+    monkeypatch.setattr(bot, "SETUPS_PATH", str(path))
+    monkeypatch.setattr(bot, "_SETUPS", [{"x": 1}])
+    bot.init_setups()
+    assert bot._SETUPS == []
+
+
+def test_track_setups_resolves_and_persists(tmp_path, monkeypatch):
+    import asyncio, json
+    monkeypatch.setattr(bot, "CACHE_PATH", str(tmp_path))
+    monkeypatch.setattr(bot, "SETUPS_PATH", str(tmp_path / "setups.json"))
+    monkeypatch.setattr(bot, "_SETUPS", [
+        {"ticker": "BTC", "coingecko_id": "bitcoin", "direction": "LONG",
+         "entry_price": 95800.0, "stop_loss": 94200.0, "tp1": 99400.0, "tp2": 101000.0,
+         "rr_ratio": "2.8", "conviction": "High",
+         "timestamp": bot.datetime.now(bot.IST).isoformat(),
+         "discord_message_id": 1, "discord_channel_id": 2, "status": "OPEN",
+         "resolution_price": None, "resolved_at": None, "result_pct": None, "outcome_label": None},
+    ])
+
+    async def fake_price(tool, args, **kw):
+        return {"market_data": {"current_price": 99500.0}}  # above tp1 → WIN
+
+    posted = {"n": 0}
+
+    async def fake_post(s):
+        posted["n"] += 1
+
+    monkeypatch.setattr(bot, "tn_call_safe", fake_price)
+    monkeypatch.setattr(bot, "_post_resolution", fake_post)
+    asyncio.run(bot.track_setups())
+
+    rec = bot._SETUPS[0]
+    assert rec["status"] == "WIN" and rec["outcome_label"] == "TP1"
+    assert rec["resolution_price"] == 99500.0 and rec["result_pct"] > 0
+    assert posted["n"] == 1
+    saved = json.loads((tmp_path / "setups.json").read_text())
+    assert saved["setups"][0]["status"] == "WIN"
+
+
+def test_track_setups_no_open_is_noop(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "_SETUPS", [{"status": "WIN"}])
+    hit = {"price": False}
+
+    async def fake_price(tool, args, **kw):
+        hit["price"] = True
+        return None
+
+    monkeypatch.setattr(bot, "tn_call_safe", fake_price)
+    asyncio.run(bot.track_setups())
+    assert hit["price"] is False  # never price-checks resolved setups
+
+
+def test_winrate_command_registered_no_cooldown():
+    cmd = bot.bot.get_command("winrate")
+    assert cmd is not None
+    assert cmd._buckets._cooldown is None  # no cooldown on a local-file read
+
+
+def test_setup_tracker_job_registered():
+    bot.setup_scheduler()
+    assert bot.scheduler.get_job("setup_tracker") is not None
