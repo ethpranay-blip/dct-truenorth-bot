@@ -1224,3 +1224,218 @@ def test_winrate_command_registered_no_cooldown():
 def test_setup_tracker_job_registered():
     bot.setup_scheduler()
     assert bot.scheduler.get_job("setup_tracker") is not None
+
+
+# =============================================================================
+# Regime-shift detection
+# =============================================================================
+
+def _ta(sma20_state, sma50_state, rsi, sma20_value=62000):
+    return {"technical_indicators": {
+        "sma20": {"value": sma20_value, "state": sma20_state},
+        "sma50": {"value": 69000, "state": sma50_state},
+        "rsi14": {"value": rsi, "state": "neutral"},
+    }}
+
+
+def _derivs(funding):
+    return {"derivative_data": {"BTC": {
+        "1h Aggregated OI weighted funding rate": {"current_funding_rate_in_percentage": funding}}}}
+
+
+def test_btc_funding_extraction():
+    assert bot._btc_funding(_derivs(0.003)) == 0.003
+    assert bot._btc_funding(_derivs(-0.01)) == -0.01
+    assert bot._btc_funding({}) is None
+    assert bot._btc_funding(None) is None
+
+
+def test_vix_value_extraction():
+    idx = {"prices": [{"index": "vix", "latest": {"close": 21.5}},
+                      {"index": "gspc", "latest": {"close": 7000}}]}
+    assert bot._vix_value(idx) == 21.5
+    assert bot._vix_value({"prices": []}) is None
+    assert bot._vix_value(None) is None
+
+
+def test_detect_regime_risk_off():
+    # BTC below both MAs + funding negative + RSI 35 → 3 off signals
+    regime, reasons = bot.detect_regime(_ta("price_below", "price_below", 35), _derivs(-0.02))
+    assert regime == "RISK-OFF"
+    assert any("below" in r and "MA" in r for r in reasons)
+    assert any("funding negative" in r for r in reasons)
+    assert any("RSI 35" in r for r in reasons)
+
+
+def test_detect_regime_risk_on():
+    regime, reasons = bot.detect_regime(_ta("price_above", "price_above", 60), _derivs(0.01))
+    assert regime == "RISK-ON"
+    assert any("above 20d & 50d" in r for r in reasons)
+    assert any("funding positive" in r for r in reasons)
+    assert any("RSI 60" in r for r in reasons)
+
+
+def test_detect_regime_neutral_one_signal_each():
+    # above both MAs (on) but funding negative (off) and RSI 50 (neither) → neither 2+
+    regime, _ = bot.detect_regime(_ta("price_above", "price_above", 50), _derivs(-0.01))
+    assert regime == "NEUTRAL"
+
+
+def test_detect_regime_risk_off_needs_two():
+    # Only one off signal (RSI 35); funding positive, MAs above → not RISK-OFF
+    regime, _ = bot.detect_regime(_ta("price_above", "price_above", 35), _derivs(0.01))
+    assert regime != "RISK-OFF"
+
+
+def test_detect_regime_vix_counts():
+    idx = {"prices": [{"index": "vix", "latest": {"close": 25}}]}
+    # below 50d MA (off) + VIX 25 (off) = RISK-OFF even with neutral RSI/funding
+    regime, reasons = bot.detect_regime(_ta("price_above", "price_below", 48), _derivs(0.0), idx)
+    assert regime == "RISK-OFF"
+    assert any("VIX 25" in r for r in reasons)
+
+
+def test_detect_regime_unknown_on_insufficient_data():
+    # No usable TA, no derivs → fewer than 2 signals → UNKNOWN (no false flip)
+    assert bot.detect_regime({}, {}) == ("UNKNOWN", [])
+    assert bot.detect_regime(None, None)[0] == "UNKNOWN"
+    # Only one signal available (funding) → still UNKNOWN
+    assert bot.detect_regime({}, _derivs(-0.01))[0] == "UNKNOWN"
+
+
+def test_detect_regime_ma_level_in_reason():
+    _, reasons = bot.detect_regime(_ta("price_below", "price_below", 35, sma20_value=94200), _derivs(-0.01))
+    assert any("$94,200" in r for r in reasons)
+
+
+def _regime_env(tmp_path, monkeypatch, baseline="UNKNOWN"):
+    monkeypatch.setattr(bot, "CACHE_PATH", str(tmp_path))
+    monkeypatch.setattr(bot, "REGIME_PATH", str(tmp_path / "last_regime.json"))
+    monkeypatch.setattr(bot, "_LAST_REGIME", {"regime": baseline, "timestamp": None, "reasons": []})
+
+
+def test_init_regime_missing_creates_unknown(tmp_path, monkeypatch):
+    _regime_env(tmp_path, monkeypatch, baseline="RISK-ON")
+    bot.init_regime()
+    assert bot._LAST_REGIME["regime"] == "UNKNOWN"
+    assert (tmp_path / "last_regime.json").exists()
+
+
+def test_init_regime_loads_existing(tmp_path, monkeypatch):
+    import json
+    (tmp_path / "last_regime.json").write_text(json.dumps(
+        {"regime": "RISK-OFF", "timestamp": "2026-06-28T09:00:00+05:30", "reasons": ["x"]}))
+    _regime_env(tmp_path, monkeypatch)
+    bot.init_regime()
+    assert bot._LAST_REGIME["regime"] == "RISK-OFF"
+
+
+def test_check_regime_shift_first_run_sets_baseline_no_alert(tmp_path, monkeypatch):
+    import asyncio
+    _regime_env(tmp_path, monkeypatch, baseline="UNKNOWN")
+
+    async def fake_call(tool, args, **kw):
+        if tool == "technical_analysis":
+            return _ta("price_below", "price_below", 35)
+        return _derivs(-0.02)
+
+    posted = {"n": 0}
+
+    async def fake_post(*a):
+        posted["n"] += 1
+
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    monkeypatch.setattr(bot, "_post_regime_shift", fake_post)
+    asyncio.run(bot.check_regime_shift("us"))
+    assert bot._LAST_REGIME["regime"] == "RISK-OFF"  # baseline set
+    assert posted["n"] == 0                          # UNKNOWN → RISK-OFF is not alerted
+
+
+def test_check_regime_shift_alerts_on_flip(tmp_path, monkeypatch):
+    import asyncio, json
+    _regime_env(tmp_path, monkeypatch, baseline="RISK-ON")
+
+    async def fake_call(tool, args, **kw):
+        if tool == "technical_analysis":
+            return _ta("price_below", "price_below", 35)
+        return _derivs(-0.02)
+
+    captured = {}
+
+    async def fake_post(session, prev, regime, reasons):
+        captured.update(session=session, prev=prev, regime=regime, reasons=reasons)
+
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    monkeypatch.setattr(bot, "_post_regime_shift", fake_post)
+    asyncio.run(bot.check_regime_shift("london"))
+    assert captured["prev"] == "RISK-ON" and captured["regime"] == "RISK-OFF"
+    assert captured["session"] == "london"
+    # baseline persisted
+    saved = json.loads((tmp_path / "last_regime.json").read_text())
+    assert saved["regime"] == "RISK-OFF"
+
+
+def test_check_regime_shift_same_regime_no_alert(tmp_path, monkeypatch):
+    import asyncio
+    _regime_env(tmp_path, monkeypatch, baseline="RISK-OFF")
+
+    async def fake_call(tool, args, **kw):
+        if tool == "technical_analysis":
+            return _ta("price_below", "price_below", 35)
+        return _derivs(-0.02)
+
+    posted = {"n": 0}
+
+    async def fake_post(*a):
+        posted["n"] += 1
+
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    monkeypatch.setattr(bot, "_post_regime_shift", fake_post)
+    asyncio.run(bot.check_regime_shift("asia"))
+    assert posted["n"] == 0  # RISK-OFF → RISK-OFF: no spam
+
+
+def test_check_regime_shift_data_outage_does_not_flip(tmp_path, monkeypatch):
+    import asyncio
+    _regime_env(tmp_path, monkeypatch, baseline="RISK-ON")
+
+    async def dead(tool, args, **kw):
+        return None  # both fetches fail
+
+    posted = {"n": 0}
+
+    async def fake_post(*a):
+        posted["n"] += 1
+
+    monkeypatch.setattr(bot, "tn_call_safe", dead)
+    monkeypatch.setattr(bot, "_post_regime_shift", fake_post)
+    asyncio.run(bot.check_regime_shift("us"))
+    assert posted["n"] == 0                       # UNKNOWN from outage → no alert
+    assert bot._LAST_REGIME["regime"] == "RISK-ON"  # baseline unchanged
+
+
+def test_regime_shift_embed_shape(monkeypatch):
+    import asyncio
+
+    class _Ch:
+        sent = []
+
+        async def send(self, embed=None):
+            _Ch.sent.append(embed)
+
+    monkeypatch.setattr(bot.bot, "get_channel", lambda cid: _Ch())
+    asyncio.run(bot._post_regime_shift("us", "RISK-ON", "RISK-OFF",
+                                       ["BTC below 20d MA ($94,200)", "funding negative (-0.020%)", "RSI 35 (<40)"]))
+    e = _Ch.sent[-1]
+    assert e.color.value == bot.COLOR_REGIME_SHIFT
+    assert e.title == "⚠️ REGIME SHIFT: Risk-On → Risk-Off"
+    assert "BTC below 20d MA" in e.description
+    assert "Auto-detected from US brief data" in e.footer.text
+
+
+def test_regime_check_runs_before_synthesis_in_brief():
+    # The regime check must be wired into run_session_brief ahead of synthesize().
+    import inspect
+    src = inspect.getsource(bot.run_session_brief)
+    assert "check_regime_shift" in src
+    assert src.index("check_regime_shift") < src.index("synthesize(")

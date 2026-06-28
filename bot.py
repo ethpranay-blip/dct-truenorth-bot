@@ -103,6 +103,7 @@ TYPEFULLY_API_KEY = os.environ.get("TYPEFULLY_API_KEY", "").strip()
 # gracefully at startup with a warning).
 CACHE_PATH = (os.environ.get("CACHE_PATH", ".").rstrip("/") or ".")
 SETUPS_PATH = os.path.join(CACHE_PATH, "setups.json")
+REGIME_PATH = os.path.join(CACHE_PATH, "last_regime.json")
 SETUP_EXPIRY_HOURS = 48
 
 # --- Embed colors ---
@@ -140,6 +141,9 @@ tn_state: dict = {
 
 # In-memory authoritative list of tracked setups (mirrors setups.json on disk).
 _SETUPS: list[dict] = []
+
+# Most recent rule-based regime read (mirrors last_regime.json on disk).
+_LAST_REGIME: dict = {"regime": "UNKNOWN", "timestamp": None, "reasons": []}
 
 
 # =============================================================================
@@ -1030,6 +1034,169 @@ def build_winrate_embed(stats: dict) -> discord.Embed:
 
 
 # =============================================================================
+# Regime-shift detection — rule-based, piggybacks on each session brief
+# =============================================================================
+
+COLOR_REGIME_SHIFT = 0xFF9500
+REGIME_DISPLAY = {"RISK-ON": "Risk-On", "RISK-OFF": "Risk-Off", "NEUTRAL": "Neutral", "UNKNOWN": "Unknown"}
+
+
+def _btc_funding(derivs: dict) -> float | None:
+    """Current funding % from a derivatives_analysis result (robust to symbol/section naming)."""
+    dd = (derivs or {}).get("derivative_data", {})
+    if isinstance(dd, dict):
+        for sections in dd.values():
+            if isinstance(sections, dict):
+                for name, sec in sections.items():
+                    if isinstance(sec, dict) and "funding" in name.lower():
+                        v = sec.get("current_funding_rate_in_percentage")
+                        if v is not None:
+                            return v
+    return None
+
+
+def _vix_value(indices: dict) -> float | None:
+    """VIX close from a market_index_price result, if present (briefs usually omit it)."""
+    if isinstance(indices, dict):
+        for p in indices.get("prices", []):
+            if isinstance(p, dict) and str(p.get("index")).lower() == "vix" and isinstance(p.get("latest"), dict):
+                return p["latest"].get("close")
+    return None
+
+
+def detect_regime(ta: dict, derivs: dict, indices: dict | None = None):
+    """Rule-based regime from raw TN data → (regime, reasons). No LLM.
+
+    RISK-OFF if 2+ of: BTC below 20d/50d MA, funding negative, VIX>20, RSI<40.
+    RISK-ON  if 2+ of: BTC above 20d AND 50d MA, funding positive, VIX<18, RSI>55.
+    Returns UNKNOWN if fewer than 2 signals are evaluable (e.g. data outage), so a
+    missing-data check never masquerades as a regime flip.
+    """
+    ind = (ta or {}).get("technical_indicators") or {}
+    s20 = (ind.get("sma20") or {}).get("state") if isinstance(ind.get("sma20"), dict) else None
+    s50 = (ind.get("sma50") or {}).get("state") if isinstance(ind.get("sma50"), dict) else None
+    v20 = (ind.get("sma20") or {}).get("value") if isinstance(ind.get("sma20"), dict) else None
+    rsi = (ind.get("rsi14") or {}).get("value") if isinstance(ind.get("rsi14"), dict) else None
+    funding = _btc_funding(derivs)
+    vix = _vix_value(indices)
+
+    ma_known = s20 is not None or s50 is not None
+    evaluable = (1 if ma_known else 0) + sum(x is not None for x in (rsi, funding, vix))
+    if evaluable < 2:
+        return "UNKNOWN", []
+
+    off, on = [], []
+    below = [w for w, st in (("20d", s20), ("50d", s50)) if st == "price_below"]
+    if below:
+        lvl = f" (${v20:,.0f})" if (s20 == "price_below" and isinstance(v20, (int, float))) else ""
+        off.append(f"BTC below {'/'.join(below)} MA{lvl}")
+    elif s20 == "price_above" and s50 == "price_above":
+        on.append("BTC above 20d & 50d MA")
+    if funding is not None and funding != 0:
+        if funding < 0:
+            off.append(f"funding negative ({funding:+.3f}%)")
+        else:
+            on.append(f"funding positive ({funding:+.3f}%)")
+    if vix is not None:
+        if vix > 20:
+            off.append(f"VIX {vix:.0f} (>20)")
+        elif vix < 18:
+            on.append(f"VIX {vix:.0f} (<18)")
+    if rsi is not None:
+        if rsi < 40:
+            off.append(f"RSI {rsi:.0f} (<40)")
+        elif rsi > 55:
+            on.append(f"RSI {rsi:.0f} (>55)")
+
+    if len(off) >= 2:
+        return "RISK-OFF", off
+    if len(on) >= 2:
+        return "RISK-ON", on
+    return "NEUTRAL", (off + on) or ["signals balanced"]
+
+
+def _persist_regime() -> None:
+    """Atomic write of _LAST_REGIME. Best-effort."""
+    try:
+        os.makedirs(CACHE_PATH, exist_ok=True)
+        tmp = REGIME_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_LAST_REGIME, f, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, REGIME_PATH)
+    except Exception as e:
+        print(f"[REGIME] WARNING: failed to persist: {type(e).__name__}: {e}")
+
+
+def init_regime() -> None:
+    """Load last_regime.json at startup; missing ⇒ baseline UNKNOWN (first brief sets
+    it with no alert). Covers an unmounted volume where the file doesn't persist."""
+    global _LAST_REGIME
+    try:
+        if os.path.exists(REGIME_PATH):
+            with open(REGIME_PATH) as f:
+                _LAST_REGIME = json.load(f)
+            print(f"[REGIME] loaded baseline: {_LAST_REGIME.get('regime')}")
+        else:
+            _LAST_REGIME = {"regime": "UNKNOWN", "timestamp": None, "reasons": []}
+            print(f"[REGIME] {REGIME_PATH} not found — baseline UNKNOWN (first brief sets it, no alert)")
+            _persist_regime()
+    except Exception as e:
+        _LAST_REGIME = {"regime": "UNKNOWN", "timestamp": None, "reasons": []}
+        print(f"[REGIME] WARNING: load failed ({type(e).__name__}) — baseline UNKNOWN")
+
+
+async def _post_regime_shift(session: str, prev: str, regime: str, reasons: list[str]) -> None:
+    channel = bot.get_channel(CH["regime"])
+    if channel is None:
+        print("[REGIME] #regime-outlook channel not found — can't post shift")
+        return
+    now = datetime.now(IST)
+    e = discord.Embed(
+        title=f"⚠️ REGIME SHIFT: {REGIME_DISPLAY.get(prev, prev)} → {REGIME_DISPLAY.get(regime, regime)}",
+        description=" • ".join(reasons[:3]) if reasons else "Signals shifted.",
+        color=COLOR_REGIME_SHIFT,
+    )
+    e.set_footer(text=f"Auto-detected from {SESSION_LABELS.get(session, session)} brief data | {now:%b %d, %H:%M IST}")
+    e.timestamp = now
+    try:
+        await channel.send(embed=e)
+    except Exception as ex:
+        print(f"[REGIME] failed to post shift: {type(ex).__name__}: {ex}")
+
+
+async def check_regime_shift(session: str) -> None:
+    """Fetch fresh daily TN data, derive the regime by rule, and alert #regime-outlook
+    on a flip vs the stored baseline. Piggybacks on a brief run; no Claude; never raises.
+
+    Uses a dedicated 1d technical_analysis call — the brief's 4h,1d result returns a
+    flat, timeframe-ambiguous indicator set, so a clean daily read is used for the
+    true 20d/50d MA + RSI signals.
+    """
+    try:
+        ta, derivs = await asyncio.gather(
+            tn_call_safe("technical_analysis", {"token_address": "bitcoin", "timeframe": "1d"}),
+            tn_call_safe("derivatives_analysis", {"token_address": "bitcoin"}),
+        )
+        regime, reasons = detect_regime(ta, derivs)
+        if regime == "UNKNOWN":
+            print(f"[REGIME] {session}: insufficient data — skipping")
+            return
+        prev = _LAST_REGIME.get("regime", "UNKNOWN")
+        now = datetime.now(IST)
+        _LAST_REGIME.update({"regime": regime, "timestamp": now.isoformat(), "reasons": reasons})
+        _persist_regime()  # baseline updated every check, shift or not
+        if prev not in (None, "UNKNOWN") and prev != regime:
+            await _post_regime_shift(session, prev, regime, reasons)
+            print(f"[REGIME] SHIFT {prev} -> {regime} ({session}) — alerted")
+        else:
+            print(f"[REGIME] {session}: {regime} (prev {prev}) — no alert")
+    except Exception as e:
+        print(f"[REGIME] check failed: {type(e).__name__}: {e}")
+
+
+# =============================================================================
 # Scheduled jobs
 # =============================================================================
 
@@ -1048,6 +1215,7 @@ async def run_session_brief(session: str, phase: str = "Pre-Open Brief") -> bool
         await channel.send(embed=_failure_embed(f"📊 {label} Session — {phase}", reason))
         await alert_ops(f"{label} brief failed", f"0/{len(BRIEF_SOURCES)} TN sources: {reason}")
         return False
+    await check_regime_shift(session)  # rule-based regime-shift alert (no Claude, never raises)
     print(f"[SCHED] {available}/{len(BRIEF_SOURCES)} sources ok; synthesizing…")
     try:
         text = await synthesize(build_brief_prompt(session, snapshot))
@@ -1169,6 +1337,7 @@ async def on_ready():
     print(f"DCT TrueNorth Bot online as {bot.user}")
     await start_webhook_server()
     init_setups()  # load tracked setups before the tracker job can fire
+    init_regime()  # load the regime baseline before any brief checks it
     setup_scheduler()
     if not scheduler.running:
         scheduler.start()
@@ -1368,6 +1537,16 @@ async def manual_health(ctx: commands.Context):
                f"({_ts['wins']} wins, {_ts['losses']} losses, {_ts['expired']} expired)"),
         inline=False,
     )
+    _reg = _LAST_REGIME.get("regime", "UNKNOWN")
+    _reg_ts = _LAST_REGIME.get("timestamp")
+    if _reg == "UNKNOWN" or not _reg_ts:
+        _reg_val = "UNKNOWN (not yet checked)"
+    else:
+        try:
+            _reg_val = f"{_reg} (last checked {_format_delta(datetime.fromisoformat(_reg_ts))})"
+        except (TypeError, ValueError):
+            _reg_val = _reg
+    e.add_field(name="Regime", value=_reg_val, inline=True)
     if scheduler.running:
         nxt = "\n".join(
             f"`{j.id}` → {j.next_run_time.astimezone(IST).strftime('%a %H:%M IST')}"
