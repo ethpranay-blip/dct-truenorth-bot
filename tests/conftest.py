@@ -4,7 +4,6 @@ import sys
 from pathlib import Path
 
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
-os.environ.setdefault("ANTHROPIC_API_KEY", "test-anthropic-key")
 os.environ.setdefault("CH_ASIA_SESSION", "2")
 os.environ.setdefault("CH_LONDON_SESSION", "3")
 os.environ.setdefault("CH_US_SESSION", "4")

@@ -70,76 +70,36 @@ def test_envelope_normal_failure_has_app_only_false():
 
 
 # =============================================================================
-# compact_json — prompt budget enforcement
-# =============================================================================
-
-def test_compact_json_under_limit_unchanged():
-    obj = {"a": 1, "b": [1, 2, 3]}
-    out = bot.compact_json(obj, 1000)
-    assert json.loads(out) == obj
-
-
-def test_compact_json_over_limit_truncates_with_marker():
-    obj = {"k": "x" * 500}
-    out = bot.compact_json(obj, 100)
-    assert len(out) <= 100 + len("…[truncated]")
-    assert out.endswith("…[truncated]")
-
-
-def test_compact_json_none_is_unavailable():
-    assert bot.compact_json(None, 100) == "(unavailable)"
-
-
-def test_compact_json_non_serializable_falls_back_to_str():
-    out = bot.compact_json({"dt": datetime(2026, 6, 12)}, 1000)
-    assert "2026-06-12" in out
-
-
-def test_compact_json_uses_compact_separators():
-    assert bot.compact_json({"a": 1, "b": 2}, 100) == '{"a":1,"b":2}'
-
-
-# =============================================================================
-# Source tables + key→tool mapping
+# Source tables + gather_raw
 # =============================================================================
 
 def test_brief_sources_cover_core_tools():
-    tools = {bot._source_tool_name(k) for k, _a, _b in bot.BRIEF_SOURCES}
+    tools = {tool for _k, tool, _a in bot.BRIEF_SOURCES}
     assert {"basic_market_info", "technical_analysis", "derivatives_analysis",
             "performance_scanner", "events"} <= tools
 
 
-def test_source_tool_name_strips_dedup_suffixes():
-    assert bot._source_tool_name("technical_analysis_eth") == "technical_analysis"
-    assert bot._source_tool_name("events_macro") == "events"
-    assert bot._source_tool_name("performance_scanner_7d") == "performance_scanner"
-    assert bot._source_tool_name("derivatives_analysis") == "derivatives_analysis"
-
-
 def test_brief_source_keys_are_unique():
-    keys = [k for k, _a, _b in bot.BRIEF_SOURCES]
+    keys = [k for k, _t, _a in bot.BRIEF_SOURCES]
     assert len(keys) == len(set(keys))
-    regime_keys = keys + [k for k, _a, _b in bot.REGIME_EXTRA_SOURCES]
+    regime_keys = keys + [k for k, _t, _a in bot.REGIME_EXTRA_SOURCES]
     assert len(regime_keys) == len(set(regime_keys))
 
 
 def test_regime_extra_sources_include_indices_and_macro_events():
-    tools = {bot._source_tool_name(k) for k, _a, _b in bot.REGIME_EXTRA_SOURCES}
+    tools = {tool for _k, tool, _a in bot.REGIME_EXTRA_SOURCES}
     assert "market_index_price" in tools
     assert "events" in tools
 
 
-def test_source_budgets_are_positive_and_bounded():
-    for key, _args, budget in bot.BRIEF_SOURCES + bot.REGIME_EXTRA_SOURCES:
-        assert 0 < budget <= 10000, f"{key} budget {budget} out of range"
+def test_brief_ta_sources_are_daily():
+    # Regime/levels need true daily MAs — the 4h,1d combined TA is ambiguous.
+    for key, tool, args in bot.BRIEF_SOURCES:
+        if tool == "technical_analysis":
+            assert args.get("timeframe") == "1d", key
 
 
-# =============================================================================
-# gather_snapshot
-# =============================================================================
-
-def test_gather_snapshot_tolerates_partial_failure(monkeypatch):
-    """One source failing must not poison the rest of the snapshot."""
+def test_gather_raw_returns_raw_dicts_and_tolerates_failure(monkeypatch):
     import asyncio
 
     async def fake_safe(tool, args, **kw):
@@ -148,90 +108,185 @@ def test_gather_snapshot_tolerates_partial_failure(monkeypatch):
         return {"tool": tool, "ok": True}
 
     monkeypatch.setattr(bot, "tn_call_safe", fake_safe)
-    snapshot = asyncio.run(bot.gather_snapshot(bot.BRIEF_SOURCES))
-    assert snapshot["derivatives_analysis"] == "(unavailable)"
-    assert "basic_market_info" in snapshot
-    assert "(unavailable)" not in snapshot["basic_market_info"]
-    assert set(snapshot) == {k for k, _a, _b in bot.BRIEF_SOURCES}
-
-
-def test_gather_snapshot_applies_budgets(monkeypatch):
-    import asyncio
-
-    async def fake_safe(tool, args, **kw):
-        return {"blob": "y" * 50000}
-
-    monkeypatch.setattr(bot, "tn_call_safe", fake_safe)
-    snapshot = asyncio.run(bot.gather_snapshot(bot.BRIEF_SOURCES))
-    for (key, _args, budget) in bot.BRIEF_SOURCES:
-        assert len(snapshot[key]) <= budget + len("…[truncated]")
+    d = asyncio.run(bot.gather_raw(bot.BRIEF_SOURCES))
+    assert d["derivs"] is None
+    assert d["info_btc"] == {"tool": "basic_market_info", "ok": True}
+    assert set(d) == {k for k, _t, _a in bot.BRIEF_SOURCES}
 
 
 # =============================================================================
-# Prompt builders
+# Deterministic brief engine — fixtures mirror live TN response shapes
 # =============================================================================
 
-SNAPSHOT = {
-    "basic_market_info": '{"market_data":{"current_price":62594.85}}',
-    "technical_analysis": '{"rsi14":{"value":56.24}}',
-    "derivatives_analysis": "(unavailable)",
-}
+def _ta_full(price_rel="price_below", rsi=33.8, sma20=62941.02, sma50=69453.55):
+    return {
+        "technical_indicators": {
+            "rsi14": {"value": rsi, "state": "neutral", "momentum": "rising"},
+            "macd_12_26_9": {"dif": -1292.8, "dea": -1873.3, "hist": 580.4, "state": "bull", "momentum": "rising"},
+            "sma20": {"value": sma20, "slope": "down", "state": price_rel},
+            "sma50": {"value": sma50, "slope": "down", "state": price_rel},
+            "boll_20_2": {"upper": 65946.1, "mid": 61994.3, "lower": 58042.5, "pb": 0.576,
+                          "mid_relation": "above_mid"},
+            "atr14": {"value": 2111.73, "atr_pct": 0.0337, "state": "normal"},
+            "volume": {"value": 50446.0, "ma20": 168638.4, "vs_ma20": -0.7009, "state": "low"},
+        },
+        "support_resistance": {
+            "support and resistance channel": {
+                "channels": [
+                    {"hi": 62401.7, "lo": 59080.0, "strength": 84},
+                    {"hi": 67255.4, "lo": 64918.2, "strength": 73},
+                    {"hi": 97932.1, "lo": 94555.0, "strength": 51},
+                ],
+                "signals": {"in_channel": False},
+            },
+            "recent_high_low": {"calendar": {"high_24h": 63114.9, "low_24h": 62410.1,
+                                             "high_7d": 63450.0, "low_7d": 57758.6}},
+        },
+    }
 
 
-def test_brief_prompt_names_the_session():
-    for session, marker in (("asia", "Tokyo"), ("london", "LSE"), ("us", "NYSE")):
-        prompt = bot.build_brief_prompt(session, SNAPSHOT)
-        assert marker in prompt
+def _info(price=62594.85, d1=0.62, d7=-2.0, d30=-22.1):
+    return {"market_data": {"current_price": price, "price_change_percentage_24h": d1,
+                            "price_change_percentage_7d": d7, "price_change_percentage_30d": d30}}
 
 
-def test_brief_prompt_includes_snapshot_sections():
-    prompt = bot.build_brief_prompt("asia", SNAPSHOT)
-    assert "62594.85" in prompt
-    assert "### technical_analysis" in prompt
-    assert "(unavailable)" in prompt  # missing sections are visible, not hidden
+def _derivs_full(funding=0.003, pctile=33.9):
+    return {"derivative_data": {"BTC": {
+        "Aggregated open interest": {
+            "current_open_interest": 6228606505.0,
+            "rolling_changes": {"oi_change_1d_abs": -315477047.0},
+            "percentile_analysis": {"current_oi_percentile_7d": 31.8},
+        },
+        "1h Aggregated OI weighted funding rate": {
+            "current_funding_rate_in_percentage": funding,
+            "current_funding_percentile_7d": pctile,
+        },
+        "Binance/Bybit/OKX aggreated liquidation map": {
+            "price_now": 63252.0,
+            "max_liquidation_points": {
+                "max_short_liquidation_point": [{"price": 64130.0, "liq_usd": 148229387, "distance_pct": 1.39}],
+                "max_long_liquidation_point": [{"price": 61200.0, "liq_usd": 118000000, "distance_pct": -2.2}],
+            },
+        },
+    }}}
 
 
-def test_brief_prompt_has_utc_timestamp():
-    prompt = bot.build_brief_prompt("us", SNAPSHOT)
-    assert "UTC" in prompt
-    assert str(datetime.now(ZoneInfo("UTC")).year) in prompt
+def _scanner_raw():
+    return {"leaderboard": [
+        {"rank": 1, "ticker": "CRVUSDT", "momentum1D": -4.6, "momentum7D": 34.1, "rsVsBenchmark": 30.4},
+        {"rank": 2, "ticker": "TRUMPUSDT", "momentum1D": 19.5, "momentum7D": 30.3, "rsVsBenchmark": 26.6},
+    ]}
 
 
-def test_regime_prompt_includes_snapshot_and_structure():
-    prompt = bot.build_regime_prompt(SNAPSHOT)
-    assert "62594.85" in prompt
-    assert "Regime" in prompt
-    assert "Catalysts" in prompt
+def _events_raw():
+    return {"results": [
+        {"title": "Content Not Related to Crypto: something political"},
+        {"title": "SEC approves spot altcoin ETF listings"},
+        {"title": "Content is not crypto-related; cannot generate a title."},
+        {"title": "Fed minutes flag slower balance-sheet runoff"},
+    ]}
 
 
-def test_synth_system_prohibits_invention_and_tables():
-    assert "Never invent" in bot.SYNTH_SYSTEM
-    assert "NO markdown tables" in bot.SYNTH_SYSTEM
+def _brief_data(**over):
+    d = {
+        "info_btc": _info(),
+        "ta_btc": _ta_full(),
+        "info_eth": _info(price=1603.7, d1=-0.7, d7=-3.2, d30=-25.0),
+        "ta_eth": _ta_full(price_rel="price_below", rsi=41.0, sma20=1700.0, sma50=1900.0),
+        "derivs": _derivs_full(),
+        "scanner": _scanner_raw(),
+        "events": _events_raw(),
+    }
+    d.update(over)
+    return d
 
 
-# =============================================================================
-# response_text — Claude content block extraction
-# =============================================================================
-
-class _Block:
-    def __init__(self, type_, **kw):
-        self.type = type_
-        for k, v in kw.items():
-            setattr(self, k, v)
+def test_nearest_levels_picks_adjacent_channels():
+    sup, res = bot._nearest_levels(_ta_full(), 62594.85)
+    assert "59,080" in sup and "62,402" in sup and "str 84" in sup
+    assert "64,918" in res and "67,255" in res and "str 73" in res
 
 
-def test_response_text_joins_text_blocks_skips_thinking():
-    blocks = [
-        _Block("thinking", thinking="hmm"),
-        _Block("text", text="**Regime** risk-off. "),
-        _Block("text", text="BTC at 62.5k."),
-    ]
-    assert bot.response_text(blocks) == "**Regime** risk-off. BTC at 62.5k."
+def test_nearest_levels_handles_missing():
+    assert bot._nearest_levels(None, 100.0) == (None, None)
+    assert bot._nearest_levels(_ta_full(), None) == (None, None)
 
 
-def test_response_text_empty_when_no_text_blocks():
-    assert bot.response_text([_Block("thinking", thinking="x")]) == ""
-    assert bot.response_text([]) == ""
+def test_clean_event_titles_filters_junk():
+    titles = bot.clean_event_titles(_events_raw())
+    assert titles == ["SEC approves spot altcoin ETF listings",
+                      "Fed minutes flag slower balance-sheet runoff"]
+    assert bot.clean_event_titles(None) == []
+
+
+def test_trend_line_reads_ma_macd_rsi():
+    line = bot._trend_line(_ta_full())
+    assert "below 20d ($62,941)" in line and "50d ($69,454)" in line
+    assert "MACD bull rising" in line
+    assert "RSI 34 rising" in line
+
+
+def test_positioning_lines_funding_oi_liq():
+    lines = bot._positioning_lines(_derivs_full())
+    joined = " | ".join(lines)
+    assert "Funding +0.0030%" in joined and "34th pctile" in joined
+    assert "OI $6.2B" in joined and "-$315M 24h" in joined
+    assert "148M shorts @ $64,130 (+1.4%)" in joined
+    assert "118M longs @ $61,200 (-2.2%)" in joined
+
+
+def test_build_rule_brief_has_all_sections():
+    text = bot.build_rule_brief("us", _brief_data())
+    assert text.startswith("**Regime — ")
+    assert "**BTC $62,594.85**" in text or "**BTC $62,595**" in text
+    assert "**ETH $1,603.70**" in text or "**ETH $1,604**" in text
+    assert "**Positioning**" in text
+    assert "**Movers (24h, RS vs BTC)**" in text and "CRV" in text
+    assert "**Watch**" in text and "SEC approves" in text
+    assert len(text) <= 4096
+
+
+def test_build_rule_brief_degrades_per_section():
+    text = bot.build_rule_brief("asia", _brief_data(events=None, scanner=None, derivs=None,
+                                                    info_eth=None, ta_eth=None))
+    assert "**BTC" in text
+    assert "**Positioning**" not in text
+    assert "**Movers" not in text
+    assert "**Watch**" not in text
+    assert "ETH" not in text
+
+
+def test_build_rule_brief_raises_without_btc_data():
+    with pytest.raises(RuntimeError):
+        bot.build_rule_brief("us", _brief_data(info_btc=None, ta_btc=None))
+
+
+def test_build_rule_brief_uses_only_snapshot_numbers():
+    # Every $ level in the output must come from the fixture — no invented data.
+    text = bot.build_rule_brief("us", _brief_data())
+    assert "$69,454" in text            # sma50 from fixture
+    assert "$57,759" in text            # 7d low from fixture
+    assert "$2,112" in text             # ATR from fixture
+
+
+def test_build_rule_regime_outlook_sections():
+    d = _brief_data()
+    d["indices"] = {"prices": [
+        {"index": "gspc", "latest": {"close": 7293.36, "change_percentage": 0.36}},
+        {"index": "vix", "latest": {"close": 21.56, "change_percentage": -2.97}},
+        {"index": "dxy", "latest": {"close": 100.28, "change_percentage": 0.37}},
+    ]}
+    d["scanner_7d"] = _scanner_raw()
+    d["events_7d"] = _events_raw()
+    text = bot.build_rule_regime_outlook(d)
+    assert "**Cross-asset**" in text and "SP500 7,293" in text and "VIX 21.56" in text
+    assert "**Rotation (7d RS vs BTC)**" in text
+    assert "**Catalysts**" in text
+
+
+def test_build_rule_regime_outlook_raises_when_empty():
+    with pytest.raises(RuntimeError):
+        bot.build_rule_regime_outlook({})
 
 
 # =============================================================================
@@ -523,8 +578,13 @@ def test_channels_required_set():
     assert set(bot.CH) == {"asia", "london", "us", "regime"}
 
 
-def test_synth_model_default():
-    assert bot.SYNTH_MODEL == "claude-opus-4-8"
+def test_no_llm_dependency():
+    # v3 is deterministic — the module must not import an LLM SDK.
+    import sys
+    assert "anthropic" not in sys.modules or not hasattr(bot, "claude_client")
+    src = open(bot.__file__).read()
+    assert "import anthropic" not in src
+    assert "api.anthropic.com" not in src
 
 
 # =============================================================================
@@ -551,43 +611,84 @@ def test_ticker_map_values_look_like_coingecko_ids():
         assert tid == tid.lower() and " " not in tid, f"bad id {tid}"
 
 
-def test_parse_setup_json_plain():
-    out = bot._parse_setup_json('{"has_setup": true, "direction": "LONG"}')
-    assert out["has_setup"] is True and out["direction"] == "LONG"
+def _bullish_ta():
+    ta = _ta_full(price_rel="price_above", rsi=62.0)
+    return ta
 
 
-def test_parse_setup_json_strips_code_fence():
-    fenced = '```json\n{"direction": "SHORT", "rr_ratio": "2.1"}\n```'
-    out = bot._parse_setup_json(fenced)
-    assert out["direction"] == "SHORT" and out["rr_ratio"] == "2.1"
+def _bearish_ta():
+    ta = _ta_full(price_rel="price_below", rsi=35.0)
+    ind = ta["technical_indicators"]
+    ind["macd_12_26_9"].update(state="bear", momentum="falling")
+    ind["rsi14"]["momentum"] = "falling"
+    ind["boll_20_2"]["mid_relation"] = "below_mid"
+    return ta
 
 
-def test_parse_setup_json_extracts_from_surrounding_prose():
-    messy = 'Here is the setup: {"direction": "NONE", "has_setup": false} — done.'
-    out = bot._parse_setup_json(messy)
-    assert out["direction"] == "NONE" and out["has_setup"] is False
+def test_rule_setup_long_on_bullish_alignment():
+    s = bot.build_rule_setup("BTC", _info(), _bullish_ta(), _derivs_full())
+    assert s["has_setup"] is True and s["direction"] == "LONG"
+    assert s["conviction"] in ("High", "Medium")
+    assert "1.5R/3R" in s["reasoning"] and "funding" in s["reasoning"]
+    # Levels coherent + ATR math: stop = price − 1.5·ATR, TP1 = +1.5R, TP2 = +3R
+    entry = bot._parse_zone_midpoint(s["entry_zone"])
+    stop = bot._parse_price(s["stop_loss"])
+    tp1 = bot._parse_price(s["take_profit_1"])
+    tp2 = bot._parse_price(s["take_profit_2"])
+    assert stop < entry < tp1 < tp2
+    assert abs((entry - stop) - 1.5 * 2111.73) < 2       # risk = 1.5 ATR
+    assert abs((tp1 - entry) - 1.5 * (entry - stop)) < 2  # 1.5R
+    assert abs((tp2 - entry) - 3.0 * (entry - stop)) < 2  # 3R
 
 
-def test_parse_setup_json_raises_on_garbage():
-    with pytest.raises(Exception):
-        bot._parse_setup_json("not json at all")
+def test_rule_setup_short_on_bearish_alignment():
+    s = bot.build_rule_setup("ETH", _info(price=2500.0), _bearish_ta(), None)
+    assert s["has_setup"] is True and s["direction"] == "SHORT"
+    entry = bot._parse_zone_midpoint(s["entry_zone"])
+    stop = bot._parse_price(s["stop_loss"])
+    tp1 = bot._parse_price(s["take_profit_1"])
+    assert tp1 < entry < stop  # SHORT coherence
 
 
-def test_setup_system_prompt_has_required_rules():
-    p = bot.SETUP_SYSTEM
-    assert "trade setup generator" in p
-    assert "Never invent numbers" in p
-    assert "No clear setup — ranging/choppy conditions." in p
-    # It is a .format template — must accept {ticker} and survive formatting.
-    assert "{ticker}" in p
-    filled = p.format(ticker="BTC")
-    assert "BTC" in filled and "{ticker}" not in filled
+def test_rule_setup_none_on_mixed_signals():
+    # price above MAs (bullish) but MACD bear + RSI weak/falling → |score| < 2.5
+    ta = _ta_full(price_rel="price_above", rsi=42.0)
+    ind = ta["technical_indicators"]
+    ind["macd_12_26_9"].update(state="bear", momentum="falling")
+    ind["rsi14"]["momentum"] = "falling"
+    ind["boll_20_2"]["mid_relation"] = "below_mid"
+    s = bot.build_rule_setup("SOL", _info(price=65.0), ta, None)
+    assert s["has_setup"] is False and s["direction"] == "NONE"
+    assert "ranging/choppy" in s["reasoning"]
+    assert s["conviction"] == "None"
 
 
-def test_setup_system_prompt_format_does_not_break_on_json_braces():
-    # The literal JSON example uses {{ }} so .format() must not choke.
-    filled = bot.SETUP_SYSTEM.format(ticker="ETH")
-    assert '"has_setup"' in filled
+def test_rule_setup_none_without_atr_or_price():
+    s = bot.build_rule_setup("BTC", None, _bullish_ta(), None)
+    assert s["has_setup"] is False and "unavailable" in s["reasoning"]
+    ta = _bullish_ta()
+    del ta["technical_indicators"]["atr14"]
+    s2 = bot.build_rule_setup("BTC", _info(), ta, None)
+    assert s2["has_setup"] is False
+
+
+def test_rule_setup_output_shape_matches_tracker_contract():
+    # log_setup + build_setup_embed consume this dict — keys must all be present.
+    s = bot.build_rule_setup("BTC", _info(), _bullish_ta(), _derivs_full())
+    assert set(s) == {"has_setup", "direction", "entry_zone", "stop_loss", "take_profit_1",
+                      "take_profit_2", "rr_ratio", "conviction", "reasoning"}
+    assert all(isinstance(s[k], str) for k in
+               ("entry_zone", "stop_loss", "take_profit_1", "take_profit_2", "rr_ratio", "conviction"))
+
+
+def test_rule_setup_is_trackable_end_to_end(tmp_path, monkeypatch):
+    # The generated setup must survive log_setup's parse + coherence guards.
+    monkeypatch.setattr(bot, "CACHE_PATH", str(tmp_path))
+    monkeypatch.setattr(bot, "SETUPS_PATH", str(tmp_path / "setups.json"))
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    s = bot.build_rule_setup("BTC", _info(), _bullish_ta(), _derivs_full())
+    bot.log_setup(s, "BTC", "bitcoin", _FakeMsg())
+    assert len(bot._SETUPS) == 1 and bot._SETUPS[0]["status"] == "OPEN"
 
 
 LONG_SETUP = {
@@ -763,24 +864,38 @@ def test_scan_command_registered_with_cooldown_and_gate():
 # Typefully auto-draft
 # =============================================================================
 
-def test_tweet_system_has_style_rules():
-    p = bot.TWEET_SYSTEM
-    assert "@corgil_" in p
-    assert "lowercase" in p and "260 chars" in p
-    assert "No hashtags" in p and "No links" in p
-    assert "ghostwriter" in p
+def test_template_tweet_hot_mover_variant():
+    tweet = bot.build_template_tweet("us", _brief_data())
+    assert tweet is not None and len(tweet) <= 280
+    assert tweet == tweet.lower()               # lowercase, casual
+    assert "crv" in tweet                       # hottest RS mover leads
+    assert tweet.rstrip().endswith("?")         # ends on a question
+    assert "#" not in tweet and "http" not in tweet
 
 
-def test_clean_tweet_strips_quotes_and_fences():
-    assert bot._clean_tweet('"hello world"') == "hello world"
-    assert bot._clean_tweet("'gm'") == "gm"
-    assert bot._clean_tweet("```\nbtc up\n```") == "btc up"
-    assert bot._clean_tweet("```json\nplain\n```") == "plain"
-    assert bot._clean_tweet("  no wrapping  ") == "no wrapping"
+def test_template_tweet_funding_variant():
+    d = _brief_data(scanner=None, derivs=_derivs_full(funding=0.02, pctile=85.0))
+    tweet = bot.build_template_tweet("asia", d)
+    assert tweet is not None and "funding" in tweet and "heating up" in tweet
+    assert "asia open" in tweet and tweet.rstrip().endswith("?")
 
 
-def test_clean_tweet_caps_at_280():
-    assert len(bot._clean_tweet("x" * 400)) == 280
+def test_template_tweet_regime_fallback_variant():
+    d = _brief_data(scanner=None, derivs=_derivs_full(funding=0.003, pctile=35.0))
+    tweet = bot.build_template_tweet("london", d)
+    assert tweet is not None and "london open" in tweet
+    assert "tape" in tweet and tweet.rstrip().endswith("?")
+
+
+def test_template_tweet_none_without_price():
+    assert bot.build_template_tweet("us", {"info_btc": None}) is None
+
+
+def test_fmt_price_short():
+    assert bot._fmt_price_short(96000) == "96k"
+    assert bot._fmt_price_short(62400) == "62.4k"
+    assert bot._fmt_price_short(1604) == "$1,604"
+    assert bot._fmt_price_short(0.19) == "$0.19"
 
 
 def test_autodraft_state_keys_present():
@@ -788,41 +903,41 @@ def test_autodraft_state_keys_present():
     assert "last_draft_error" in bot.tn_state
 
 
-def test_autodraft_skips_when_disabled(monkeypatch):
+def test_autodraft_skips_when_disabled_or_empty(monkeypatch):
     import asyncio
-    called = {"synth": False}
+    called = {"create": False}
 
-    async def fake_synth(_t):
-        called["synth"] = True
+    async def fake_create(_t):
+        called["create"] = True
         return "x"
 
+    monkeypatch.setattr(bot, "create_typefully_draft", fake_create)
     monkeypatch.setattr(bot, "AUTO_DRAFT_ENABLED", False)
     monkeypatch.setattr(bot, "TYPEFULLY_API_KEY", "k")
-    monkeypatch.setattr(bot, "synthesize_tweet", fake_synth)
-    asyncio.run(bot.maybe_autodraft("brief text", "US"))
-    assert called["synth"] is False  # no Claude call when disabled
+    asyncio.run(bot.maybe_autodraft("a tweet", "US"))
+    assert called["create"] is False            # disabled → no call
+    monkeypatch.setattr(bot, "AUTO_DRAFT_ENABLED", True)
+    asyncio.run(bot.maybe_autodraft(None, "US"))
+    assert called["create"] is False            # no tweet built → no call
 
 
 def test_autodraft_skips_when_key_missing(monkeypatch):
     import asyncio
-    called = {"synth": False}
+    called = {"create": False}
 
-    async def fake_synth(_t):
-        called["synth"] = True
+    async def fake_create(_t):
+        called["create"] = True
         return "x"
 
+    monkeypatch.setattr(bot, "create_typefully_draft", fake_create)
     monkeypatch.setattr(bot, "AUTO_DRAFT_ENABLED", True)
     monkeypatch.setattr(bot, "TYPEFULLY_API_KEY", "")
-    monkeypatch.setattr(bot, "synthesize_tweet", fake_synth)
-    asyncio.run(bot.maybe_autodraft("brief text", "US"))
-    assert called["synth"] is False
+    asyncio.run(bot.maybe_autodraft("a tweet", "US"))
+    assert called["create"] is False
 
 
 def test_autodraft_creates_and_increments_counter(monkeypatch):
     import asyncio
-
-    async def fake_synth(_t):
-        return "gm tweet"
 
     async def fake_create(t):
         assert t == "gm tweet"
@@ -830,33 +945,10 @@ def test_autodraft_creates_and_increments_counter(monkeypatch):
 
     monkeypatch.setattr(bot, "AUTO_DRAFT_ENABLED", True)
     monkeypatch.setattr(bot, "TYPEFULLY_API_KEY", "k")
-    monkeypatch.setattr(bot, "synthesize_tweet", fake_synth)
     monkeypatch.setattr(bot, "create_typefully_draft", fake_create)
     bot.tn_state["drafts_created"] = 0
-    asyncio.run(bot.maybe_autodraft("brief", "US"))
+    asyncio.run(bot.maybe_autodraft("gm tweet", "US"))
     assert bot.tn_state["drafts_created"] == 1
-
-
-def test_autodraft_tweet_gen_failure_does_not_raise(monkeypatch):
-    import asyncio
-
-    async def boom(_t):
-        raise RuntimeError("claude down")
-
-    create_called = {"hit": False}
-
-    async def fake_create(_t):
-        create_called["hit"] = True
-        return "x"
-
-    monkeypatch.setattr(bot, "AUTO_DRAFT_ENABLED", True)
-    monkeypatch.setattr(bot, "TYPEFULLY_API_KEY", "k")
-    monkeypatch.setattr(bot, "synthesize_tweet", boom)
-    monkeypatch.setattr(bot, "create_typefully_draft", fake_create)
-    bot.tn_state["drafts_created"] = 0
-    asyncio.run(bot.maybe_autodraft("brief", "US"))  # must not raise
-    assert create_called["hit"] is False
-    assert bot.tn_state["drafts_created"] == 0
 
 
 def _draft_transport(monkeypatch, handler):
@@ -1445,9 +1537,11 @@ def test_regime_shift_embed_shape(monkeypatch):
     assert "Auto-detected from US brief data" in e.footer.text
 
 
-def test_regime_check_runs_before_synthesis_in_brief():
-    # The regime check must be wired into run_session_brief ahead of synthesize().
+def test_regime_check_runs_before_compose_in_brief():
+    # The regime check must be wired into run_session_brief ahead of the compose,
+    # and must reuse the brief's own TA/derivs instead of refetching.
     import inspect
     src = inspect.getsource(bot.run_session_brief)
     assert "check_regime_shift" in src
-    assert src.index("check_regime_shift") < src.index("synthesize(")
+    assert src.index("check_regime_shift") < src.index("build_rule_brief(")
+    assert 'ta=d.get("ta_btc")' in src and 'derivs=d.get("derivs")' in src

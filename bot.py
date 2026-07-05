@@ -1,28 +1,31 @@
 """
-DCT TrueNorth Bot — Discord bridge for TrueNorth AI trading intelligence (v2).
+DCT TrueNorth Bot — Discord bridge for TrueNorth AI trading intelligence (v3).
 
-TrueNorth v2 retired the conversational SSE agent the v1 bot was built on.
-This rewrite uses TrueNorth's keyless agent-tools REST API (the same backend
-the official `@truenorth-ai/cli` wraps) for raw market data, and Claude for
-narrative synthesis:
+v3 is fully deterministic: everything is composed rule-based from TrueNorth's
+keyless agent-tools REST API (the backend the official `@truenorth-ai/cli`
+wraps). No LLM anywhere — zero API spend, no credits to expire, and output
+that is 100% numbers-from-source:
 
-    TN agent-tools (TA / derivatives / scanner / events)  ──▶  snapshot (JSON)
-    snapshot  ──▶  Claude (claude-opus-4-8)  ──▶  session brief / regime text
-    text      ──▶  Discord embed
+    TN agent-tools (TA / derivatives / scanner / events / indices)
+        ──▶  raw dicts  ──▶  rule engines (briefs · setups · regime · tweets)
+        ──▶  Discord embeds / Typefully drafts
 
 What it does:
   * Posts a pre-open market brief 15 minutes before each market opens —
     Asia (Tokyo 09:00 JST), London (LSE 08:00 UK), US (NYSE 09:30 ET).
     Cron jobs run in each market's local timezone so DST is automatic.
-  * Posts a macro regime outlook Mon/Wed/Fri 06:00 IST.
-  * Manual commands: !brief, !regime, !health.
+  * Posts a macro regime outlook Mon/Wed/Fri 06:00 IST, and real-time
+    regime-shift alerts between briefs.
+  * !setup <ticker>: ATR/level-based trade setups with outcome tracking
+    (!winrate); !scan: relative-strength screener.
+  * Optional Typefully template-tweet drafts after each brief.
   * Serves GET /healthz on $PORT for Railway liveness.
 
-Gone from v1 (TrueNorth v2 made them obsolete):
-  * Privy token refresh, token/thread caches, Mac-local harvester,
-    /credentials webhook — the agent-tools API needs no auth for crypto data.
-  * #claude-integration chat + Sonnet middleman, #trades channel posting.
-    Trade setups now live on the dashboard (DASHBOARD_URL), linked from briefs.
+History: v1 rode TrueNorth's authed conversational agent (Privy tokens,
+Mac-local harvester) — killed by the TN v2 upgrade. v2 paired the keyless
+tools API with Claude synthesis — killed by API credit burn. v3 keeps the
+v2 data layer and replaces the LLM with rule engines (see git history for
+both prior stacks).
 
 Channels (routed via env vars):
   #asia-session       · CH_ASIA_SESSION
@@ -45,7 +48,6 @@ from zoneinfo import ZoneInfo
 import discord
 from discord.ext import commands
 import httpx
-import anthropic
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -54,8 +56,9 @@ from apscheduler.triggers.interval import IntervalTrigger
 from aiohttp import web
 
 # --- Config ---
+# v3: fully deterministic — no LLM anywhere. Briefs, setups, and tweet drafts
+# are built rule-based from TrueNorth data. Zero API spend; nothing to expire.
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
-ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -81,18 +84,15 @@ TN_DEBUG = os.environ.get("TN_DEBUG", "").lower() in ("1", "true", "yes")
 
 WEBHOOK_PORT = int(os.environ.get("PORT", "8080"))
 
-SYNTH_MODEL = os.environ.get("SYNTH_MODEL", "claude-opus-4-8")
-
 # Channels where !setup is allowed (comma-separated IDs). Empty ⇒ allowed in
-# every channel; the 60s/user cooldown is the spam guard either way. Gating
-# exists because each !setup is a paid Claude call.
+# every channel; the 60s/user cooldown is the spam guard either way.
 SETUP_ALLOWED_CHANNELS: set[int] = {
     int(c) for c in os.environ.get("SETUP_ALLOWED_CHANNELS", "").replace(" ", "").split(",") if c
 }
 
-# Optional: after a brief posts to Discord, ghostwrite a tweet and save it as a
-# Typefully DRAFT (never published/scheduled). Off unless AUTO_DRAFT_ENABLED is
-# truthy AND a key is set. Failures here never affect the brief.
+# Optional: after a brief posts to Discord, build a template tweet and save it
+# as a Typefully DRAFT (never published/scheduled). Off unless AUTO_DRAFT_ENABLED
+# is truthy AND a key is set. Failures here never affect the brief.
 AUTO_DRAFT_ENABLED = os.environ.get("AUTO_DRAFT_ENABLED", "").lower() in ("1", "true", "yes")
 TYPEFULLY_API_KEY = os.environ.get("TYPEFULLY_API_KEY", "").strip()
 # Typefully v2 social set (default = @Corgil_). Override via env if it changes.
@@ -125,7 +125,6 @@ FOOTER = "DCT TrueNorth Bot · Powered by TrueNorth AI"
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
-claude_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
 scheduler = AsyncIOScheduler(timezone=IST)
 
 # --- Observability state ---
@@ -134,7 +133,7 @@ tn_state: dict = {
     "last_tool_success_at": None,   # datetime | None — any TN tool call OK
     "last_tool_error_at": None,     # datetime | None
     "last_tool_error": None,        # str | None
-    "last_synth_error": None,       # str | None — Claude-side failure
+    "last_synth_error": None,       # str | None — brief/setup builder failure
     "last_brief_at": {},            # {"asia"|"london"|"us": datetime}
     "last_regime_at": None,         # datetime | None
     "drafts_created": 0,            # int — Typefully drafts made this process
@@ -246,134 +245,270 @@ async def tn_call_safe(tool: str, args: dict, **kw):
 
 
 # =============================================================================
-# Market snapshot → Claude prompt
+# Deterministic brief engine — raw TN data → embed text, no LLM
 # =============================================================================
 
-def compact_json(obj, limit: int) -> str:
-    """Serialize a tool result for the prompt, hard-capped at `limit` chars."""
-    if obj is None:
-        return "(unavailable)"
-    try:
-        s = json.dumps(obj, separators=(",", ":"), default=str)
-    except (TypeError, ValueError):
-        s = str(obj)
-    if len(s) > limit:
-        return s[:limit] + "…[truncated]"
-    return s
-
-
-# Tool name → (args, char budget in the prompt). BTC carries the regime read so
-# it gets the deepest data; the rest are context.
+# key → (tool, args). Fetched in parallel; each result stays a raw dict.
 BRIEF_SOURCES = [
-    ("basic_market_info",    {"token_address": "bitcoin"},                      1500),
-    ("technical_analysis",   {"token_address": "bitcoin", "timeframe": "4h,1d"}, 7000),
-    ("technical_analysis_eth", {"token_address": "ethereum", "timeframe": "4h"}, 4000),
-    ("derivatives_analysis", {"token_address": "bitcoin"},                      5000),
-    ("performance_scanner",  {"top": 10, "lookback_days": 1},                   4000),
-    ("events",               {"query": "crypto", "time_window": "24h", "sort_by": "relevance"}, 3500),
+    ("info_btc", "basic_market_info",    {"token_address": "bitcoin"}),
+    ("ta_btc",   "technical_analysis",   {"token_address": "bitcoin", "timeframe": "1d"}),
+    ("info_eth", "basic_market_info",    {"token_address": "ethereum"}),
+    ("ta_eth",   "technical_analysis",   {"token_address": "ethereum", "timeframe": "1d"}),
+    ("derivs",   "derivatives_analysis", {"token_address": "bitcoin"}),
+    ("scanner",  "performance_scanner",  {"top": 5, "lookback_days": 1}),
+    ("events",   "events",               {"query": "crypto", "time_window": "24h", "sort_by": "relevance"}),
 ]
 
-# Regime outlook adds longer-horizon sources. market_index_price is app-gated
-# today — tn_call_safe degrades it to "(unavailable)" until TN_AUTH_TOKEN lands.
+# Regime outlook adds longer-horizon sources (all keyless, indices included).
 REGIME_EXTRA_SOURCES = [
-    ("market_index_price",   {"index": "all"},                                  1500),
-    ("events_macro",         {"query": "macro economy fed rates", "time_window": "7d", "sort_by": "relevance"}, 3500),
-    ("performance_scanner_7d", {"top": 10, "lookback_days": 7},                 4000),
+    ("indices",    "market_index_price",  {"index": "all"}),
+    ("events_7d",  "events",              {"query": "macro economy fed rates", "time_window": "7d", "sort_by": "relevance"}),
+    ("scanner_7d", "performance_scanner", {"top": 5, "lookback_days": 7}),
 ]
 
 
-def _source_tool_name(key: str) -> str:
-    """Map a source key to the actual TN tool (keys may be suffixed for uniqueness)."""
-    for suffix in ("_eth", "_macro", "_7d"):
-        if key.endswith(suffix):
-            return key[: -len(suffix)]
-    return key
+async def gather_raw(sources: list[tuple]) -> dict:
+    """Fetch all sources in parallel; return {key: raw dict or None}."""
+    results = await asyncio.gather(*(tn_call_safe(tool, args) for _k, tool, args in sources))
+    return {key: result for (key, _t, _a), result in zip(sources, results)}
 
 
-async def gather_snapshot(sources: list[tuple]) -> dict[str, str]:
-    """Fetch all sources in parallel; return {key: compacted JSON or '(unavailable)'}."""
-    keys = [k for k, _a, _b in sources]
-    results = await asyncio.gather(
-        *(tn_call_safe(_source_tool_name(k), a) for k, a, _b in sources)
+def _ind(ta: dict | None) -> dict:
+    return (ta or {}).get("technical_indicators") or {}
+
+
+def _sr(ta: dict | None) -> dict:
+    return (ta or {}).get("support_resistance") or {}
+
+
+def _pct_s(x, digits: int = 1) -> str:
+    return "—" if x is None else f"{x:+.{digits}f}%"
+
+
+def _nearest_levels(ta: dict | None, price: float | None):
+    """(support_str, resistance_str) from the S/R channels nearest to price."""
+    channels = (_sr(ta).get("support and resistance channel") or {}).get("channels") or []
+    if not channels or price is None:
+        return None, None
+    sup = [c for c in channels if c.get("hi") is not None and c["hi"] < price]
+    res = [c for c in channels if c.get("lo") is not None and c["lo"] > price]
+    sup_str = res_str = None
+    if sup:
+        c = max(sup, key=lambda c: c["hi"])
+        sup_str = f"{_money(c['lo'])}–{_money(c['hi'])} (str {c.get('strength', '?')})"
+    if res:
+        c = min(res, key=lambda c: c["lo"])
+        res_str = f"{_money(c['lo'])}–{_money(c['hi'])} (str {c.get('strength', '?')})"
+    return sup_str, res_str
+
+
+_EVENT_JUNK = ("not related", "not crypto", "cannot generate", "no direct crypto", "no crypto implication")
+
+
+def clean_event_titles(events: dict | None, limit: int = 3) -> list[str]:
+    """Top event titles with the LLM-filler junk items dropped."""
+    out: list[str] = []
+    for item in (events or {}).get("results") or []:
+        title = (item.get("title") or "").strip()
+        if not title or any(j in title.lower() for j in _EVENT_JUNK):
+            continue
+        if title not in out:
+            out.append(title)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _trend_line(ta: dict | None) -> str | None:
+    """'below 20d ($62,941) & 50d ($69,454) MA · MACD bull rising · RSI 34 rising'"""
+    ind = _ind(ta)
+    parts = []
+    s20, s50 = ind.get("sma20") or {}, ind.get("sma50") or {}
+    pos = []
+    for label, s in (("20d", s20), ("50d", s50)):
+        if s.get("state") == "price_above":
+            pos.append((label, s.get("value"), True))
+        elif s.get("state") == "price_below":
+            pos.append((label, s.get("value"), False))
+    if pos:
+        above = [p for p in pos if p[2]]
+        below = [p for p in pos if not p[2]]
+        seg = []
+        if above:
+            seg.append("above " + " & ".join(f"{l} ({_money(v)})" for l, v, _ in above))
+        if below:
+            seg.append("below " + " & ".join(f"{l} ({_money(v)})" for l, v, _ in below))
+        parts.append(" / ".join(seg) + " MA")
+    macd = ind.get("macd_12_26_9") or {}
+    if macd.get("state"):
+        parts.append(f"MACD {macd['state']}" + (f" {macd['momentum']}" if macd.get("momentum") else ""))
+    rsi = ind.get("rsi14") or {}
+    if rsi.get("value") is not None:
+        parts.append(f"RSI {rsi['value']:.0f}" + (f" {rsi['momentum']}" if rsi.get("momentum") else ""))
+    return " · ".join(parts) if parts else None
+
+
+def _range_line(ta: dict | None) -> str | None:
+    ind, sr = _ind(ta), _sr(ta)
+    hl = (sr.get("recent_high_low") or {}).get("calendar") or {}
+    parts = []
+    if hl.get("low_24h") is not None and hl.get("high_24h") is not None:
+        parts.append(f"24h {_money(hl['low_24h'])}–{_money(hl['high_24h'])}")
+    if hl.get("low_7d") is not None:
+        parts.append(f"7d low {_money(hl['low_7d'])}")
+    atr = ind.get("atr14") or {}
+    if atr.get("value") is not None:
+        pct = f" ({atr['atr_pct'] * 100:.1f}%)" if atr.get("atr_pct") is not None else ""
+        parts.append(f"ATR {_money(atr['value'])}{pct}")
+    vol = ind.get("volume") or {}
+    if vol.get("vs_ma20") is not None:
+        parts.append(f"volume {vol['vs_ma20'] * 100:+.0f}% vs 20d avg")
+    return " · ".join(parts) if parts else None
+
+
+def _positioning_lines(derivs: dict | None) -> list[str]:
+    dd = (derivs or {}).get("derivative_data", {})
+    sections = next((v for v in dd.values() if isinstance(v, dict)), {}) if isinstance(dd, dict) else {}
+    lines = []
+    fund = next((s for n, s in sections.items() if isinstance(s, dict) and "funding" in n.lower()), {})
+    oi = next((s for n, s in sections.items() if isinstance(s, dict) and "open interest" in n.lower()), {})
+    seg = []
+    if fund.get("current_funding_rate_in_percentage") is not None:
+        f = fund["current_funding_rate_in_percentage"]
+        pctile = fund.get("current_funding_percentile_7d")
+        seg.append(f"Funding {f:+.4f}%" + (f" ({pctile:.0f}th pctile 7d)" if pctile is not None else ""))
+    if oi.get("current_open_interest") is not None:
+        chg = (oi.get("rolling_changes") or {}).get("oi_change_1d_abs")
+        pctile = (oi.get("percentile_analysis") or {}).get("current_oi_percentile_7d")
+        s = f"OI ${oi['current_open_interest'] / 1e9:.1f}B"
+        if chg is not None:
+            s += f" ({'+' if chg >= 0 else '-'}${abs(chg) / 1e6:.0f}M 24h"
+            s += f", {pctile:.0f}th pctile)" if pctile is not None else ")"
+        seg.append(s)
+    if seg:
+        lines.append(" · ".join(seg))
+    liq = next((s for n, s in sections.items() if isinstance(s, dict) and "liquidation" in n.lower()), {})
+    pts = liq.get("max_liquidation_points") or {}
+    seg = []
+    for label, key in (("shorts", "max_short_liquidation_point"), ("longs", "max_long_liquidation_point")):
+        cands = pts.get(key) or []
+        if cands:
+            p = min(cands, key=lambda c: abs(c.get("distance_pct", 9e9)))
+            seg.append(f"${p['liq_usd'] / 1e6:.0f}M {label} @ {_money(p['price'])} ({p['distance_pct']:+.1f}%)")
+    if seg:
+        lines.append("Liq magnets: " + " · ".join(seg))
+    return lines
+
+
+def _mover_line(scanner: dict | None) -> str | None:
+    rows = (scanner or {}).get("leaderboard") or []
+    if not rows:
+        return None
+    return " · ".join(
+        f"{_clean_ticker(r.get('ticker') or r.get('token'))} {_pct_s(r.get('momentum7D') if r.get('momentum7D') is not None else r.get('momentum1D'))}"
+        f" (RS {_pct_s(r.get('rsVsBenchmark'))})"
+        for r in rows[:5]
     )
-    return {
-        key: compact_json(result, budget)
-        for (key, _args, budget), result in zip(sources, results)
-    }
 
 
-SYNTH_SYSTEM = """You write market briefs for Corgi Calls, a crypto trading Discord community. You are given a JSON data snapshot pulled live from TrueNorth AI's market-data tools and must synthesize it into a brief.
-
-Rules:
-- Use ONLY numbers present in the snapshot. Never invent prices, levels, percentages, or events. If a data section is "(unavailable)", skip what depends on it without apologizing.
-- Tone: direct, trader-native. Funding, OI, R:R, HTF, VWAP are fine. No marketing speak, no hedging filler, no "as an AI".
-- Format for a Discord embed: short **bold** section headers, tight bullet points, plain prose. NO markdown tables. No preamble, no sign-off — start directly with the first section.
-- Stay under 3300 characters."""
-
-
-def build_brief_prompt(session: str, snapshot: dict[str, str]) -> str:
-    """Prompt for one session's pre-open brief."""
-    labels = {
-        "asia": "Asia (Tokyo opens 09:00 JST)",
-        "london": "London (LSE opens 08:00 UK)",
-        "us": "US (NYSE opens 09:30 ET)",
-    }
-    now_utc = datetime.now(ZoneInfo("UTC"))
-    sections = "\n".join(f"### {k}\n{v}" for k, v in snapshot.items())
+def _asset_header(name: str, info: dict | None) -> str | None:
+    md = (info or {}).get("market_data") or {}
+    if md.get("current_price") is None:
+        return None
     return (
-        f"Write the pre-open market brief for the {labels.get(session, session)} trading session.\n"
-        f"Current time: {now_utc.strftime('%Y-%m-%d %H:%M')} UTC. The market opens in ~15 minutes.\n\n"
-        "Structure:\n"
-        "1. **Regime** — one-line market regime read (risk-on/off/neutral and why).\n"
-        "2. **BTC** — price, trend, momentum, and the key support/resistance levels from the TA data.\n"
-        "3. **ETH** — same, shorter.\n"
-        "4. **Positioning** — funding, open interest, liquidation zones from the derivatives data.\n"
-        "5. **Movers** — top relative-strength names from the scanner, one line each, max 5.\n"
-        "6. **Watch** — events/catalysts in the next 24h that matter for this session. Skip if nothing notable.\n\n"
-        f"Live data snapshot:\n{sections}"
+        f"**{name} {_money(md['current_price'])}**  "
+        f"{_pct_s(md.get('price_change_percentage_24h'))} 24h · "
+        f"{_pct_s(md.get('price_change_percentage_7d'))} 7d · "
+        f"{_pct_s(md.get('price_change_percentage_30d'))} 30d"
     )
 
 
-def build_regime_prompt(snapshot: dict[str, str]) -> str:
-    """Prompt for the Mon/Wed/Fri macro regime outlook."""
-    now_utc = datetime.now(ZoneInfo("UTC"))
-    sections = "\n".join(f"### {k}\n{v}" for k, v in snapshot.items())
-    return (
-        "Write the macro regime outlook for the next 24-48 hours, crypto-centric.\n"
-        f"Current time: {now_utc.strftime('%Y-%m-%d %H:%M')} UTC.\n\n"
-        "Structure:\n"
-        "1. **Regime** — dominant market regime (risk-on/off/neutral) and the evidence.\n"
-        "2. **BTC & ETH** — key levels and the higher-timeframe picture.\n"
-        "3. **Cross-asset** — indices/DXY/yields read IF index data is present in the snapshot; otherwise skip entirely.\n"
-        "4. **Rotation** — where 7-day relative strength is concentrating.\n"
-        "5. **Catalysts** — dated events ahead (macro prints, crypto-specific). Only events from the snapshot.\n\n"
-        f"Live data snapshot:\n{sections}"
-    )
+def build_rule_brief(session: str, d: dict) -> str:
+    """Compose the session brief embed text from raw tool results. Pure, no LLM.
+
+    Sections degrade independently: any missing source just drops its lines.
+    Raises only if BOTH BTC price and BTC TA are missing (nothing to say).
+    """
+    if (d.get("info_btc") or {}).get("market_data") is None and not _ind(d.get("ta_btc")):
+        raise RuntimeError("no BTC data available")
+    price_btc = ((d.get("info_btc") or {}).get("market_data") or {}).get("current_price")
+    regime, reasons = detect_regime(d.get("ta_btc"), d.get("derivs"))
+    out: list[str] = []
+    if regime != "UNKNOWN":
+        out.append(f"**Regime — {REGIME_DISPLAY.get(regime, regime)}**  ·  " + " · ".join(reasons[:3]))
+    hdr = _asset_header("BTC", d.get("info_btc"))
+    if hdr:
+        out.append(hdr)
+    for line in (_trend_line(d.get("ta_btc")), _range_line(d.get("ta_btc"))):
+        if line:
+            out.append(f"• {line}")
+    sup, res = _nearest_levels(d.get("ta_btc"), price_btc)
+    if sup or res:
+        seg = [s for s in (f"support {sup}" if sup else None, f"resistance {res}" if res else None) if s]
+        out.append("• Levels: " + " · ".join(seg))
+    hdr = _asset_header("ETH", d.get("info_eth"))
+    if hdr:
+        out.append(hdr)
+        line = _trend_line(d.get("ta_eth"))
+        if line:
+            out.append(f"• {line}")
+    pos = _positioning_lines(d.get("derivs"))
+    if pos:
+        out.append("**Positioning**")
+        out.extend(f"• {p}" for p in pos)
+    movers = _mover_line(d.get("scanner"))
+    if movers:
+        out.append("**Movers (24h, RS vs BTC)**")
+        out.append(f"• {movers}")
+    titles = clean_event_titles(d.get("events"))
+    if titles:
+        out.append("**Watch**")
+        out.extend(f"• {t}" for t in titles)
+    return "\n".join(out)
 
 
-def response_text(content_blocks) -> str:
-    """Join the text blocks of a Claude response (skips thinking blocks)."""
-    return "".join(b.text for b in content_blocks if getattr(b, "type", "") == "text").strip()
+def _indices_line(indices: dict | None) -> str | None:
+    wanted = {"gspc": "SP500", "ixic": "NASDAQ", "vix": "VIX", "dxy": "DXY", "tnx": "US10Y"}
+    parts = []
+    for p in (indices or {}).get("prices") or []:
+        label = wanted.get(str(p.get("index")).lower())
+        latest = p.get("latest") or {}
+        if label and latest.get("close") is not None:
+            close = latest["close"]
+            val = f"{close:,.0f}" if close >= 1000 else f"{close:,.2f}"  # US10Y 4.53, not "4"
+            chg = latest.get("change_percentage")
+            parts.append(f"{label} {val}" + (f" ({_pct_s(chg)})" if chg is not None else ""))
+    return " · ".join(parts) if parts else None
 
 
-async def synthesize(prompt: str) -> str:
-    """One Claude call: snapshot prompt → brief text. Raises on failure."""
-    try:
-        resp = await claude_client.messages.create(
-            model=SYNTH_MODEL,
-            max_tokens=16000,
-            thinking={"type": "adaptive"},
-            system=SYNTH_SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except anthropic.APIError as e:
-        tn_state["last_synth_error"] = f"{type(e).__name__}: {e}"
-        raise
-    text = response_text(resp.content)
-    if not text:
-        tn_state["last_synth_error"] = f"empty response (stop_reason={resp.stop_reason})"
-        raise RuntimeError(tn_state["last_synth_error"])
-    return text
+def build_rule_regime_outlook(d: dict) -> str:
+    """Mon/Wed/Fri macro outlook, composed from raw data. Pure, no LLM."""
+    regime, reasons = detect_regime(d.get("ta_btc"), d.get("derivs"), d.get("indices"))
+    out: list[str] = []
+    if regime != "UNKNOWN":
+        out.append(f"**Regime — {REGIME_DISPLAY.get(regime, regime)}**  ·  " + " · ".join(reasons[:4]))
+    for name, info_k, ta_k in (("BTC", "info_btc", "ta_btc"), ("ETH", "info_eth", "ta_eth")):
+        hdr = _asset_header(name, d.get(info_k))
+        if hdr:
+            out.append(hdr)
+            line = _trend_line(d.get(ta_k))
+            if line:
+                out.append(f"• {line}")
+    idx = _indices_line(d.get("indices"))
+    if idx:
+        out.append("**Cross-asset**")
+        out.append(f"• {idx}")
+    movers = _mover_line(d.get("scanner_7d"))
+    if movers:
+        out.append("**Rotation (7d RS vs BTC)**")
+        out.append(f"• {movers}")
+    titles = clean_event_titles(d.get("events_7d"))
+    if titles:
+        out.append("**Catalysts**")
+        out.extend(f"• {t}" for t in titles)
+    if not out:
+        raise RuntimeError("no data available for regime outlook")
+    return "\n".join(out)
 
 
 # =============================================================================
@@ -407,48 +542,95 @@ def _resolve_token(arg: str) -> str:
     return TICKER_TO_ID.get(arg.strip().upper(), arg.strip().lower())
 
 
-SETUP_SYSTEM = """You are a trade setup generator. Given the following market data for {ticker}, produce a structured trade setup with: Direction (LONG/SHORT), Entry Zone, Stop Loss, Take Profit 1, Take Profit 2, R:R ratio, Conviction (Low/Medium/High), and a 1-2 sentence reasoning. Use only the data provided. Never invent numbers. If the data doesn't support a clean setup, say 'No clear setup — ranging/choppy conditions.'
-
-Output ONLY a single JSON object — no prose, no markdown fences — with exactly these keys:
-{{"has_setup": boolean, "direction": "LONG" | "SHORT" | "NONE", "entry_zone": string, "stop_loss": string, "take_profit_1": string, "take_profit_2": string, "rr_ratio": string, "conviction": "Low" | "Medium" | "High" | "None", "reasoning": string}}
-
-Price levels are strings in the asset's own price precision (e.g. "$62,400 – $62,900" or "$0.1840"). When there is no clean setup: set has_setup=false, direction="NONE", every price level and rr_ratio to "—", conviction="None", and put the ranging/choppy message in reasoning."""
+# Signal weights for the rule-based setup engine. Direction needs |score| ≥ 2.5;
+# conviction is High at |score| ≥ 4. Tuned to demand multi-signal alignment.
+SETUP_SCORE_MIN = 2.5
+SETUP_SCORE_HIGH = 4.0
 
 
-def _parse_setup_json(text: str) -> dict:
-    """Parse the model's JSON, tolerating ``` fences or stray prose around it."""
-    t = text.strip()
-    if t.startswith("```"):
-        t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.IGNORECASE).strip()
-    try:
-        return json.loads(t)
-    except json.JSONDecodeError:
-        start, end = t.find("{"), t.rfind("}")
-        if start != -1 and end > start:
-            return json.loads(t[start : end + 1])
-        raise
+def _setup_score(ta: dict | None) -> tuple[float, list[str], list[str]]:
+    """(score, bull_signals, bear_signals) from daily TA. Positive ⇒ bullish."""
+    ind = _ind(ta)
+    score, bull, bear = 0.0, [], []
+
+    def _hit(cond_bull, cond_bear, weight, btext, betext):
+        nonlocal score
+        if cond_bull:
+            score += weight
+            bull.append(btext)
+        elif cond_bear:
+            score -= weight
+            bear.append(betext)
+
+    s20 = (ind.get("sma20") or {}).get("state")
+    s50 = (ind.get("sma50") or {}).get("state")
+    _hit(s20 == "price_above", s20 == "price_below", 1.0, "above SMA20", "below SMA20")
+    _hit(s50 == "price_above", s50 == "price_below", 1.0, "above SMA50", "below SMA50")
+    macd = ind.get("macd_12_26_9") or {}
+    _hit(macd.get("state") == "bull", macd.get("state") == "bear", 1.0, "MACD bull", "MACD bear")
+    _hit(macd.get("momentum") == "rising", macd.get("momentum") == "falling", 0.5,
+         "MACD momentum rising", "MACD momentum falling")
+    rsi = (ind.get("rsi14") or {}).get("value")
+    if rsi is not None:
+        _hit(rsi > 55, rsi < 45, 1.0, f"RSI {rsi:.0f} strong", f"RSI {rsi:.0f} weak")
+    rsi_m = (ind.get("rsi14") or {}).get("momentum")
+    _hit(rsi_m == "rising", rsi_m == "falling", 0.5, "RSI rising", "RSI falling")
+    boll = ind.get("boll_20_2") or {}
+    _hit(boll.get("mid_relation") == "above_mid", boll.get("mid_relation") == "below_mid", 0.5,
+         "above BB mid", "below BB mid")
+    return score, bull, bear
 
 
-async def synthesize_setup(ticker: str, snapshot: dict[str, str]) -> dict:
-    """One Claude call: single-asset snapshot → structured trade setup dict."""
-    sections = "\n".join(f"### {k}\n{v}" for k, v in snapshot.items())
-    prompt = f"Market data for {ticker}:\n{sections}"
-    try:
-        resp = await claude_client.messages.create(
-            model=SYNTH_MODEL,
-            max_tokens=2000,
-            thinking={"type": "adaptive"},
-            system=SETUP_SYSTEM.format(ticker=ticker),
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except anthropic.APIError as e:
-        tn_state["last_synth_error"] = f"{type(e).__name__}: {e}"
-        raise
-    text = response_text(resp.content)
-    if not text:
-        tn_state["last_synth_error"] = f"empty setup response (stop_reason={resp.stop_reason})"
-        raise RuntimeError(tn_state["last_synth_error"])
-    return _parse_setup_json(text)
+NO_SETUP = {
+    "has_setup": False, "direction": "NONE", "entry_zone": "—", "stop_loss": "—",
+    "take_profit_1": "—", "take_profit_2": "—", "rr_ratio": "—", "conviction": "None",
+}
+
+
+def build_rule_setup(ticker: str, info: dict | None, ta: dict | None, derivs: dict | None) -> dict:
+    """Deterministic trade setup from TN data — ATR-based levels, no LLM.
+
+    Same output shape the Claude generator produced, so the embed builder and
+    outcome tracking are untouched. Direction requires multi-signal alignment
+    (|score| ≥ 2.5 of ±5.5 possible); levels are ATR-derived and coherent by
+    construction: stop 1.5×ATR from entry, TP1/TP2 at 1.5R/3R.
+    """
+    price = ((info or {}).get("market_data") or {}).get("current_price")
+    atr = (_ind(ta).get("atr14") or {}).get("value")
+    score, bull, bear = _setup_score(ta)
+    fund = _btc_funding(derivs)
+    fund_note = f"funding {fund:+.4f}%" if fund is not None else None
+
+    if price is None or atr is None or not atr > 0:
+        return {**NO_SETUP, "reasoning": "No clear setup — price/ATR data unavailable."}
+    if abs(score) < SETUP_SCORE_MIN:
+        detail = ", ".join((bull + bear)[:3]) or "signals flat"
+        return {**NO_SETUP,
+                "reasoning": f"No clear setup — ranging/choppy conditions (signal score {score:+.1f}: {detail})."}
+
+    direction = "LONG" if score > 0 else "SHORT"
+    sign = 1 if direction == "LONG" else -1
+    entry_lo, entry_hi = price - 0.25 * atr, price + 0.25 * atr
+    stop = price - sign * 1.5 * atr
+    risk = abs(price - stop)
+    tp1 = price + sign * 1.5 * risk
+    tp2 = price + sign * 3.0 * risk
+    signals = bull if direction == "LONG" else bear
+    reasoning = f"{'Bullish' if sign > 0 else 'Bearish'} alignment (score {score:+.1f}): " + ", ".join(signals[:4])
+    if fund_note:
+        reasoning += f"; {fund_note}"
+    reasoning += ". Levels are 1.5×ATR risk with 1.5R/3R targets."
+    return {
+        "has_setup": True,
+        "direction": direction,
+        "entry_zone": f"{_money(entry_lo)} – {_money(entry_hi)}",
+        "stop_loss": _money(stop),
+        "take_profit_1": _money(tp1),
+        "take_profit_2": _money(tp2),
+        "rr_ratio": "1.5 (TP1) / 3.0 (TP2)",
+        "conviction": "High" if abs(score) >= SETUP_SCORE_HIGH else "Medium",
+        "reasoning": reasoning,
+    }
 
 
 def _setup_channel_allowed(channel_id: int) -> bool:
@@ -460,47 +642,61 @@ def _setup_channel_allowed(channel_id: int) -> bool:
 # Typefully auto-draft (optional) — a posted brief → a tweet draft to review
 # =============================================================================
 
-TWEET_SYSTEM = (
-    "You are @corgil_'s tweet ghostwriter. Given this market brief data, write a "
-    "single standalone tweet (under 260 chars). Style: lowercase, casual, crypto-native. "
-    "Lead with the most interesting data point. End with a question to drive replies. "
-    "No hashtags. No links. No emojis except sparingly. Example tone: 'btc holding 96k "
-    "into US open but funding is starting to heat up. this is where the last 3 squeezes "
-    "started. anyone else seeing this?'"
-)
-
 def _typefully_drafts_url() -> str:
     return f"https://api.typefully.com/v2/social-sets/{TYPEFULLY_SOCIAL_SET_ID}/drafts"
 
 
-def _clean_tweet(text: str) -> str:
-    """Strip a model's stray quotes / code fences and cap to the platform limit."""
-    t = (text or "").strip()
-    if t.startswith("```"):
-        t = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", t).strip()
-    if len(t) >= 2 and t[0] in "\"'" and t[-1] == t[0]:
-        t = t[1:-1].strip()
-    return t[:280]
+def _fmt_price_short(x: float) -> str:
+    """Casual tweet-style price: 96k, 62.4k, $1,604, $0.19."""
+    if x >= 10_000:
+        return f"{x / 1000:.0f}k" if x >= 100_000 else f"{x / 1000:.1f}k".replace(".0k", "k")
+    if x >= 1:
+        return f"${x:,.0f}"
+    return f"${x:.2g}"
 
 
-async def synthesize_tweet(brief_text: str) -> str:
-    """Ghostwrite one tweet from an already-synthesized brief (same model/key).
+def build_template_tweet(session: str, d: dict) -> str | None:
+    """Deterministic draft tweet from the brief's raw data — lowercase,
+    crypto-native, ends on a question. It's a DRAFT: you edit before posting.
 
-    The brief narrative already contains the regime read, BTC level, funding and
-    the standout mover, so we hand it straight to the ghostwriter and let it pick
-    the most interesting point — no brittle re-parsing of free text.
+    Picks the most notable data point: hot mover (|RS| ≥ 8%) > funding extreme
+    (≥60th/≤10th pctile) > regime + level read. Returns None if there's no BTC
+    price (nothing worth drafting).
     """
-    try:
-        resp = await claude_client.messages.create(
-            model=SYNTH_MODEL,
-            max_tokens=600,
-            system=TWEET_SYSTEM,
-            messages=[{"role": "user", "content": f"Market brief data:\n{brief_text[:2000]}"}],
-        )
-    except anthropic.APIError as e:
-        tn_state["last_synth_error"] = f"{type(e).__name__}: {e}"
-        raise
-    return _clean_tweet(response_text(resp.content))
+    md = ((d.get("info_btc") or {}).get("market_data") or {})
+    price = md.get("current_price")
+    if price is None:
+        return None
+    p = _fmt_price_short(price)
+    sess = {"asia": "asia open", "london": "london open", "us": "us open"}.get(session, "the open")
+    regime, _reasons = detect_regime(d.get("ta_btc"), d.get("derivs"))
+    ind = _ind(d.get("ta_btc"))
+    rsi = (ind.get("rsi14") or {}).get("value")
+    s20 = (ind.get("sma20") or {}).get("state")
+    trend = "under the 20d" if s20 == "price_below" else "over the 20d" if s20 == "price_above" else "at the 20d"
+
+    rows = (d.get("scanner") or {}).get("leaderboard") or []
+    hot = max(rows, key=lambda r: abs(r.get("rsVsBenchmark") or 0), default=None)
+    dd = (d.get("derivs") or {}).get("derivative_data", {})
+    sections = next((v for v in dd.values() if isinstance(v, dict)), {}) if isinstance(dd, dict) else {}
+    fund = next((s for n, s in sections.items() if isinstance(s, dict) and "funding" in n.lower()), {})
+    fund_pctile = fund.get("current_funding_percentile_7d")
+
+    if hot and abs(hot.get("rsVsBenchmark") or 0) >= 8:
+        tk = _clean_ticker(hot.get("ticker") or hot.get("token")).lower()
+        rs = hot.get("rsVsBenchmark")
+        chg = hot.get("momentum7D") if hot.get("momentum7D") is not None else hot.get("momentum1D")
+        return (f"{tk} {'+' if (chg or 0) >= 0 else ''}{chg:.1f}% while btc sits {trend} at {p} — "
+                f"that's {rs:+.0f}% relative strength into {sess}. rotation or head-fake?")[:280]
+    if fund_pctile is not None and (fund_pctile >= 60 or fund_pctile <= 10):
+        f = fund.get("current_funding_rate_in_percentage")
+        heat = "heating up" if fund_pctile >= 60 else "washed out"
+        return (f"btc {p} into {sess} and funding is {heat} "
+                f"({f:+.4f}%, {fund_pctile:.0f}th pctile this week). rsi {rsi:.0f}. "
+                f"who's positioned for this?")[:280] if rsi is not None else None
+    mood = {"RISK-ON": "risk-on tape", "RISK-OFF": "risk-off tape", "NEUTRAL": "two-sided tape"}.get(regime, "mixed tape")
+    rsi_s = f", rsi {rsi:.0f}" if rsi is not None else ""
+    return f"btc {trend} at {p} into {sess}{rsi_s} — {mood}. what's your lean here?"[:280]
 
 
 async def create_typefully_draft(text: str) -> str | None:
@@ -541,21 +737,14 @@ async def create_typefully_draft(text: str) -> str | None:
     return None
 
 
-async def maybe_autodraft(brief_text: str, label: str) -> None:
-    """Best-effort: brief → ghostwritten tweet → Typefully draft. Fully gated and
-    self-contained; any failure is logged and swallowed so the brief is unaffected."""
-    if not AUTO_DRAFT_ENABLED:
+async def maybe_autodraft(tweet: str | None, label: str) -> None:
+    """Best-effort: push a pre-built template tweet to Typefully as a draft.
+    Fully gated and self-contained; failures are logged and swallowed so the
+    brief is unaffected."""
+    if not AUTO_DRAFT_ENABLED or not tweet:
         return
     if not TYPEFULLY_API_KEY:
         print("[AUTODRAFT] AUTO_DRAFT_ENABLED set but TYPEFULLY_API_KEY missing — skipping")
-        return
-    try:
-        tweet = await synthesize_tweet(brief_text)
-    except Exception as e:
-        tn_state["last_draft_error"] = f"tweet gen: {type(e).__name__}"
-        print(f"[AUTODRAFT] {label} tweet generation failed: {type(e).__name__}: {e}")
-        return
-    if not tweet:
         return
     url = await create_typefully_draft(tweet)
     if url:
@@ -1166,19 +1355,19 @@ async def _post_regime_shift(session: str, prev: str, regime: str, reasons: list
         print(f"[REGIME] failed to post shift: {type(ex).__name__}: {ex}")
 
 
-async def check_regime_shift(session: str) -> None:
-    """Fetch fresh daily TN data, derive the regime by rule, and alert #regime-outlook
-    on a flip vs the stored baseline. Piggybacks on a brief run; no Claude; never raises.
+async def check_regime_shift(session: str, ta: dict | None = None, derivs: dict | None = None) -> None:
+    """Derive the regime by rule and alert #regime-outlook on a flip vs the stored
+    baseline. Piggybacks on a brief run; never raises.
 
-    Uses a dedicated 1d technical_analysis call — the brief's 4h,1d result returns a
-    flat, timeframe-ambiguous indicator set, so a clean daily read is used for the
-    true 20d/50d MA + RSI signals.
+    The brief passes its own daily TA + derivatives in; standalone callers can
+    omit them and fresh data is fetched.
     """
     try:
-        ta, derivs = await asyncio.gather(
-            tn_call_safe("technical_analysis", {"token_address": "bitcoin", "timeframe": "1d"}),
-            tn_call_safe("derivatives_analysis", {"token_address": "bitcoin"}),
-        )
+        if ta is None or derivs is None:
+            ta, derivs = await asyncio.gather(
+                tn_call_safe("technical_analysis", {"token_address": "bitcoin", "timeframe": "1d"}),
+                tn_call_safe("derivatives_analysis", {"token_address": "bitcoin"}),
+            )
         regime, reasons = detect_regime(ta, derivs)
         if regime == "UNKNOWN":
             print(f"[REGIME] {session}: insufficient data — skipping")
@@ -1201,33 +1390,35 @@ async def check_regime_shift(session: str) -> None:
 # =============================================================================
 
 async def run_session_brief(session: str, phase: str = "Pre-Open Brief") -> bool:
-    """Gather snapshot → synthesize → post to the session channel."""
+    """Gather raw data → rule-based compose → post to the session channel."""
     label = SESSION_LABELS.get(session, session)
     channel = bot.get_channel(CH[session])
     if not channel:
         print(f"[SCHED] cannot find #{session} channel")
         return False
-    print(f"[SCHED] gathering snapshot for {label} {phase}…")
-    snapshot = await gather_snapshot(BRIEF_SOURCES)
-    available = sum(1 for v in snapshot.values() if v != "(unavailable)")
+    print(f"[SCHED] gathering data for {label} {phase}…")
+    d = await gather_raw(BRIEF_SOURCES)
+    available = sum(1 for v in d.values() if v is not None)
     if available == 0:
         reason = tn_state.get("last_tool_error") or "every TrueNorth tool call failed"
         await channel.send(embed=_failure_embed(f"📊 {label} Session — {phase}", reason))
         await alert_ops(f"{label} brief failed", f"0/{len(BRIEF_SOURCES)} TN sources: {reason}")
         return False
-    await check_regime_shift(session)  # rule-based regime-shift alert (no Claude, never raises)
-    print(f"[SCHED] {available}/{len(BRIEF_SOURCES)} sources ok; synthesizing…")
+    # Regime-shift alert reuses the brief's own daily TA + derivs (no refetch).
+    await check_regime_shift(session, ta=d.get("ta_btc"), derivs=d.get("derivs"))
+    print(f"[SCHED] {available}/{len(BRIEF_SOURCES)} sources ok; composing…")
     try:
-        text = await synthesize(build_brief_prompt(session, snapshot))
+        text = build_rule_brief(session, d)
     except Exception as e:
-        reason = f"synthesis failed: {type(e).__name__}: {e}"
+        tn_state["last_synth_error"] = f"{type(e).__name__}: {e}"
+        reason = f"brief build failed: {type(e).__name__}: {e}"
         await channel.send(embed=_failure_embed(f"📊 {label} Session — {phase}", reason))
         await alert_ops(f"{label} brief failed", reason)
         return False
     await channel.send(embed=build_brief_embed(text, session, phase))
     tn_state["last_brief_at"][session] = datetime.now(IST)
     print(f"[SCHED] {label} {phase} posted ({available}/{len(BRIEF_SOURCES)} sources)")
-    await maybe_autodraft(text, f"{label} {phase}")  # bonus tweet draft; never fails the brief
+    await maybe_autodraft(build_template_tweet(session, d), f"{label} {phase}")
     return True
 
 
@@ -1237,25 +1428,26 @@ async def run_regime_update() -> bool:
     if not channel:
         print("[SCHED] cannot find #regime-outlook channel")
         return False
-    print("[SCHED] gathering regime snapshot…")
-    snapshot = await gather_snapshot(BRIEF_SOURCES + REGIME_EXTRA_SOURCES)
-    available = sum(1 for v in snapshot.values() if v != "(unavailable)")
+    print("[SCHED] gathering regime data…")
+    d = await gather_raw(BRIEF_SOURCES + REGIME_EXTRA_SOURCES)
+    available = sum(1 for v in d.values() if v is not None)
     if available == 0:
         reason = tn_state.get("last_tool_error") or "every TrueNorth tool call failed"
         await channel.send(embed=_failure_embed("🌐 Macro Regime Outlook", reason))
         await alert_ops("Regime outlook failed", reason)
         return False
     try:
-        text = await synthesize(build_regime_prompt(snapshot))
+        text = build_rule_regime_outlook(d)
     except Exception as e:
-        reason = f"synthesis failed: {type(e).__name__}: {e}"
+        tn_state["last_synth_error"] = f"{type(e).__name__}: {e}"
+        reason = f"outlook build failed: {type(e).__name__}: {e}"
         await channel.send(embed=_failure_embed("🌐 Macro Regime Outlook", reason))
         await alert_ops("Regime outlook failed", reason)
         return False
     await channel.send(embed=build_regime_embed(text))
     tn_state["last_regime_at"] = datetime.now(IST)
     print("[SCHED] regime outlook posted")
-    await maybe_autodraft(text, "Regime")  # bonus tweet draft; never fails the post
+    await maybe_autodraft(build_template_tweet("us", d), "Regime")
     return True
 
 
@@ -1411,10 +1603,10 @@ async def trade_setup(ctx: commands.Context, ticker: str = ""):
     token_id = _resolve_token(ticker)
     status = await ctx.send(f"⏳ Building **{ticker}** setup…")
 
-    # Same TN pattern as the brief engine, scoped to one asset.
+    # 4h timeframe: signals and ATR-sized levels that fit the 48h tracking window.
     info, ta, derivs = await asyncio.gather(
         tn_call_safe("basic_market_info", {"token_address": token_id}),
-        tn_call_safe("technical_analysis", {"token_address": token_id, "timeframe": "4h,1d"}),
+        tn_call_safe("technical_analysis", {"token_address": token_id, "timeframe": "4h"}),
         tn_call_safe("derivatives_analysis", {"token_address": token_id}),
     )
     price = (info or {}).get("market_data", {}).get("current_price")
@@ -1425,14 +1617,10 @@ async def trade_setup(ctx: commands.Context, ticker: str = ""):
         ))
         return
 
-    snapshot = {
-        "basic_market_info": compact_json(info, 1500),
-        "technical_analysis": compact_json(ta, 8000),
-        "derivatives_analysis": compact_json(derivs, 5000),
-    }
     try:
-        setup = await synthesize_setup(ticker, snapshot)
+        setup = build_rule_setup(ticker, info, ta, derivs)  # deterministic, no LLM
     except Exception as e:
+        tn_state["last_synth_error"] = f"{type(e).__name__}: {e}"
         print(f"[SETUP] {ticker} failed: {type(e).__name__}: {e}")
         await status.edit(content=f"⚠️ Setup generation failed ({type(e).__name__}). Run `!health`.")
         return
@@ -1504,14 +1692,14 @@ async def manual_health(ctx: commands.Context):
 
     e = discord.Embed(title="🩺 Bot Health", color=COLOR_INFO)
     e.add_field(name="Uptime", value=(f"{d}d {h}h {m}m" if d else f"{h}h {m}m"), inline=True)
-    e.add_field(name="Engine", value=f"TN agent-tools + `{SYNTH_MODEL}`", inline=True)
+    e.add_field(name="Engine", value="TN agent-tools · rule-based (no LLM)", inline=True)
     e.add_field(name="TN auth", value=("token set" if TN_AUTH_TOKEN else "keyless (crypto tools only)"), inline=True)
     e.add_field(name="Last TN tool success", value=_format_delta(tn_state["last_tool_success_at"]), inline=True)
     e.add_field(name="Last TN tool error", value=_format_delta(tn_state["last_tool_error_at"]), inline=True)
     if tn_state["last_tool_error"]:
         e.add_field(name="Error detail", value=f"```\n{str(tn_state['last_tool_error'])[:400]}\n```", inline=False)
     if tn_state["last_synth_error"]:
-        e.add_field(name="Last synthesis error", value=f"```\n{str(tn_state['last_synth_error'])[:400]}\n```", inline=False)
+        e.add_field(name="Last build error", value=f"```\n{str(tn_state['last_synth_error'])[:400]}\n```", inline=False)
     briefs = ", ".join(
         f"{SESSION_LABELS[s]} {_format_delta(dt)}" for s, dt in tn_state["last_brief_at"].items()
     ) or "none this process"
