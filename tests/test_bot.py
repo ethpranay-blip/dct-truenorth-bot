@@ -401,7 +401,8 @@ def test_schedule_sessions_have_channels():
 def test_setup_scheduler_registers_jobs():
     bot.setup_scheduler()
     job_ids = {j.id for j in bot.scheduler.get_jobs()}
-    assert job_ids == {"asia_pre_open", "london_pre_open", "us_pre_open", "regime_mwf", "setup_tracker"}
+    assert job_ids == {"asia_pre_open", "london_pre_open", "us_pre_open",
+                       "regime_mwf", "setup_tracker", "regime_15m"}
     # Re-running must not introduce new job ids. (Exact-count idempotency only
     # holds on a *running* scheduler — replace_existing dedupes at start() —
     # and on_ready always starts the scheduler right after the first setup.)
@@ -1612,7 +1613,7 @@ def test_check_regime_shift_first_run_sets_baseline_no_alert(tmp_path, monkeypat
     assert posted["n"] == 0                          # UNKNOWN → RISK-OFF is not alerted
 
 
-def test_check_regime_shift_alerts_on_flip(tmp_path, monkeypatch):
+def test_check_regime_shift_alerts_on_confirmed_flip(tmp_path, monkeypatch):
     import asyncio, json
     _regime_env(tmp_path, monkeypatch, baseline="RISK-ON")
 
@@ -1628,12 +1629,52 @@ def test_check_regime_shift_alerts_on_flip(tmp_path, monkeypatch):
 
     monkeypatch.setattr(bot, "tn_call_safe", fake_call)
     monkeypatch.setattr(bot, "_post_regime_shift", fake_post)
+
+    # 1st differing read → pending only, baseline holds, NO alert.
     asyncio.run(bot.check_regime_shift("london"))
-    assert captured["prev"] == "RISK-ON" and captured["regime"] == "RISK-OFF"
-    assert captured["session"] == "london"
-    # baseline persisted
+    assert captured == {}
+    assert bot._LAST_REGIME["regime"] == "RISK-ON"
+    assert bot._LAST_REGIME["pending_regime"] == "RISK-OFF"
+    assert bot._LAST_REGIME["pending_count"] == 1
     saved = json.loads((tmp_path / "last_regime.json").read_text())
-    assert saved["regime"] == "RISK-OFF"
+    assert saved["pending_regime"] == "RISK-OFF"     # pending survives a restart
+
+    # 2nd consecutive identical read → confirmed: alert + baseline moves.
+    asyncio.run(bot.check_regime_shift("interval"))
+    assert captured["prev"] == "RISK-ON" and captured["regime"] == "RISK-OFF"
+    assert captured["session"] == "interval"
+    saved = json.loads((tmp_path / "last_regime.json").read_text())
+    assert saved["regime"] == "RISK-OFF" and saved["pending_regime"] is None
+
+
+def test_check_regime_shift_oscillation_never_alerts(tmp_path, monkeypatch):
+    """Boundary flapping (OFF, ON, OFF, ON…) must never produce an alert —
+    the pending counter resets whenever a read matches the baseline."""
+    import asyncio
+    _regime_env(tmp_path, monkeypatch, baseline="RISK-ON")
+    posted = {"n": 0}
+
+    async def fake_post(*a):
+        posted["n"] += 1
+
+    monkeypatch.setattr(bot, "_post_regime_shift", fake_post)
+
+    async def run_alternating():
+        for i in range(6):
+            off = i % 2 == 0
+            ta = _ta("price_below", "price_below", 35) if off else _ta("price_above", "price_above", 60)
+            dv = _derivs(-0.02) if off else _derivs(0.02)
+            await bot.check_regime_shift("interval", ta=ta, derivs=dv)
+
+    asyncio.run(run_alternating())
+    assert posted["n"] == 0                          # never confirmed → never alerted
+    assert bot._LAST_REGIME["regime"] == "RISK-ON"   # baseline never moved
+
+
+def test_regime_15m_job_registered():
+    bot.setup_scheduler()
+    job = bot.scheduler.get_job("regime_15m")
+    assert job is not None
 
 
 def test_check_regime_shift_same_regime_no_alert(tmp_path, monkeypatch):
@@ -1702,3 +1743,72 @@ def test_regime_check_runs_before_compose_in_brief():
     assert "check_regime_shift" in src
     assert src.index("check_regime_shift") < src.index("build_rule_brief(")
     assert 'ta=d.get("ta_btc")' in src and 'derivs=d.get("derivs")' in src
+
+
+# =============================================================================
+# /api/track-record — public JSON for the dashboard
+# =============================================================================
+
+def _tr_setups():
+    return [
+        _resolved("WIN", resolution_price=99400.0, result_pct=3.8,
+                  resolved_at="2026-07-05T10:00:00+05:30"),
+        _resolved("LOSS", resolution_price=94200.0, result_pct=-1.7,
+                  resolved_at="2026-07-06T12:00:00+05:30"),
+        _resolved("EXPIRED", resolution_price=96000.0, result_pct=0.2,
+                  resolved_at="2026-07-04T09:00:00+05:30"),
+        {"status": "OPEN", "ticker": "ETH", "entry_price": 2500.0, "stop_loss": 2400.0,
+         "tp1": 2700.0, "timestamp": bot.datetime.now(bot.IST).isoformat()},
+    ]
+
+
+def test_track_record_payload_stats_and_recent(monkeypatch):
+    monkeypatch.setattr(bot, "_SETUPS", _tr_setups())
+    p = bot.build_track_record_payload()
+    assert p["stats"]["total"] == 4 and p["stats"]["open"] == 1
+    assert p["stats"]["wins"] == 1 and p["stats"]["losses"] == 1 and p["stats"]["expired"] == 1
+    # recent: resolved only, newest resolved_at first, OPEN excluded
+    statuses = [r["status"] for r in p["recent"]]
+    assert statuses == ["LOSS", "WIN", "EXPIRED"]
+    assert all(r["status"] != "OPEN" for r in p["recent"])
+    row = p["recent"][0]
+    assert {"ticker", "direction", "status", "entry_price", "resolution_price",
+            "result_pct", "conviction", "opened_at", "resolved_at"} <= set(row)
+    assert "generated_at" in p
+
+
+def test_track_record_payload_caps_recent(monkeypatch):
+    many = [_resolved("WIN", resolution_price=101.0, result_pct=1.0,
+                      resolved_at=f"2026-07-{d:02d}T10:00:00+05:30") for d in range(1, 16)]
+    monkeypatch.setattr(bot, "_SETUPS", many)
+    p = bot.build_track_record_payload()
+    assert len(p["recent"]) == bot.TRACK_RECORD_RECENT_N
+    assert p["recent"][0]["resolved_at"].startswith("2026-07-15")  # newest first
+
+
+def test_track_record_payload_empty(monkeypatch):
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    p = bot.build_track_record_payload()
+    assert p["stats"]["total"] == 0 and p["recent"] == []
+
+
+def test_track_record_endpoint_json_and_headers(monkeypatch):
+    import asyncio, json as _json
+    monkeypatch.setattr(bot, "_SETUPS", _tr_setups())
+    resp = asyncio.run(bot._handle_track_record(None))
+    assert resp.status == 200
+    assert resp.headers["Access-Control-Allow-Origin"] == "*"
+    assert "max-age=300" in resp.headers["Cache-Control"]
+    body = _json.loads(resp.body)
+    assert body["stats"]["wins"] == 1 and len(body["recent"]) == 3
+
+
+def test_healthz_exposes_regime_and_build_error(monkeypatch):
+    import asyncio, json as _json
+    monkeypatch.setattr(bot, "_LAST_REGIME", {"regime": "RISK-OFF", "timestamp": "t", "reasons": []})
+    bot.tn_state["last_synth_error"] = "boom"
+    resp = asyncio.run(bot._handle_healthz(None))
+    body = _json.loads(resp.body)
+    assert body["regime"] == "RISK-OFF"
+    assert body["last_build_error"] == "boom"
+    bot.tn_state["last_synth_error"] = None

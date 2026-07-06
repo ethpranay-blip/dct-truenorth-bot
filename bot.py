@@ -1433,7 +1433,8 @@ async def _post_regime_shift(session: str, prev: str, regime: str, reasons: list
         description=" • ".join(reasons[:3]) if reasons else "Signals shifted.",
         color=COLOR_REGIME_SHIFT,
     )
-    e.set_footer(text=f"Auto-detected from {SESSION_LABELS.get(session, session)} brief data | {now:%b %d, %H:%M IST}")
+    src = f"{SESSION_LABELS[session]} brief data" if session in SESSION_LABELS else "15-min market check"
+    e.set_footer(text=f"Auto-detected from {src} | {now:%b %d, %H:%M IST}")
     e.timestamp = now
     try:
         await channel.send(embed=e)
@@ -1441,12 +1442,20 @@ async def _post_regime_shift(session: str, prev: str, regime: str, reasons: list
         print(f"[REGIME] failed to post shift: {type(ex).__name__}: {ex}")
 
 
-async def check_regime_shift(session: str, ta: dict | None = None, derivs: dict | None = None) -> None:
-    """Derive the regime by rule and alert #regime-outlook on a flip vs the stored
-    baseline. Piggybacks on a brief run; never raises.
+# A regime flip must be seen on this many CONSECUTIVE checks before alerting.
+# At 15-min cadence a metric hovering on a rule boundary (RSI ≈ 40, price at
+# the 20d MA) would otherwise flap NEUTRAL↔RISK-OFF alerts all day.
+REGIME_CONFIRM_CHECKS = 2
 
-    The brief passes its own daily TA + derivatives in; standalone callers can
-    omit them and fresh data is fetched.
+
+async def check_regime_shift(session: str, ta: dict | None = None, derivs: dict | None = None) -> None:
+    """Derive the regime by rule and alert #regime-outlook on a CONFIRMED flip vs
+    the stored baseline. Runs every 15 min (interval job) and on every brief
+    (which passes its own daily TA + derivatives in). Never raises.
+
+    Confirmation: a reading that differs from the baseline is held as pending;
+    only REGIME_CONFIRM_CHECKS consecutive identical differing reads alert and
+    move the baseline. A read matching the baseline clears any pending flip.
     """
     try:
         if ta is None or derivs is None:
@@ -1458,15 +1467,34 @@ async def check_regime_shift(session: str, ta: dict | None = None, derivs: dict 
         if regime == "UNKNOWN":
             print(f"[REGIME] {session}: insufficient data — skipping")
             return
-        prev = _LAST_REGIME.get("regime", "UNKNOWN")
         now = datetime.now(IST)
-        _LAST_REGIME.update({"regime": regime, "timestamp": now.isoformat(), "reasons": reasons})
-        _persist_regime()  # baseline updated every check, shift or not
-        if prev not in (None, "UNKNOWN") and prev != regime:
+        prev = _LAST_REGIME.get("regime", "UNKNOWN")
+        if prev in (None, "UNKNOWN"):
+            _LAST_REGIME.update({"regime": regime, "timestamp": now.isoformat(), "reasons": reasons,
+                                 "pending_regime": None, "pending_count": 0})
+            _persist_regime()
+            print(f"[REGIME] {session}: baseline set to {regime} (no alert)")
+            return
+        if regime == prev:
+            _LAST_REGIME.update({"timestamp": now.isoformat(), "reasons": reasons,
+                                 "pending_regime": None, "pending_count": 0})
+            _persist_regime()
+            print(f"[REGIME] {session}: {regime} (stable) — no alert")
+            return
+        # Differs from baseline — confirm across consecutive checks before alerting.
+        count = (_LAST_REGIME.get("pending_count", 0) + 1
+                 if _LAST_REGIME.get("pending_regime") == regime else 1)
+        if count >= REGIME_CONFIRM_CHECKS:
+            _LAST_REGIME.update({"regime": regime, "timestamp": now.isoformat(), "reasons": reasons,
+                                 "pending_regime": None, "pending_count": 0})
+            _persist_regime()
             await _post_regime_shift(session, prev, regime, reasons)
-            print(f"[REGIME] SHIFT {prev} -> {regime} ({session}) — alerted")
+            print(f"[REGIME] SHIFT {prev} -> {regime} ({session}, confirmed ×{count}) — alerted")
         else:
-            print(f"[REGIME] {session}: {regime} (prev {prev}) — no alert")
+            _LAST_REGIME.update({"timestamp": now.isoformat(),
+                                 "pending_regime": regime, "pending_count": count})
+            _persist_regime()
+            print(f"[REGIME] {session}: {regime} pending ({count}/{REGIME_CONFIRM_CHECKS}) — baseline stays {prev}")
     except Exception as e:
         print(f"[REGIME] check failed: {type(e).__name__}: {e}")
 
@@ -1569,6 +1597,13 @@ def setup_scheduler() -> None:
         id="setup_tracker",
         replace_existing=True,
     )
+    scheduler.add_job(
+        check_regime_shift,
+        IntervalTrigger(minutes=15),
+        args=["interval"],
+        id="regime_15m",
+        replace_existing=True,
+    )
 
 
 # =============================================================================
@@ -1588,6 +1623,41 @@ async def _handle_healthz(_request: web.Request) -> web.Response:
         "last_briefs": {
             k: v.isoformat() for k, v in tn_state["last_brief_at"].items()
         },
+        "last_build_error": tn_state["last_synth_error"],
+        "regime": _LAST_REGIME.get("regime", "UNKNOWN"),
+    })
+
+
+TRACK_RECORD_RECENT_N = 10
+
+
+def build_track_record_payload() -> dict:
+    """Public JSON for the dashboard: aggregate stats + recent resolved calls.
+    Same numbers !winrate shows — one source of truth for the track record."""
+    resolved = [s for s in _SETUPS if s.get("status") in ("WIN", "LOSS", "EXPIRED")]
+    resolved.sort(key=lambda s: s.get("resolved_at") or "", reverse=True)
+    recent = [{
+        "ticker": s.get("ticker"),
+        "direction": s.get("direction"),
+        "status": s.get("status"),
+        "entry_price": s.get("entry_price"),
+        "resolution_price": s.get("resolution_price"),
+        "result_pct": s.get("result_pct"),
+        "conviction": s.get("conviction"),
+        "opened_at": s.get("timestamp"),
+        "resolved_at": s.get("resolved_at"),
+    } for s in resolved[:TRACK_RECORD_RECENT_N]]
+    return {
+        "generated_at": datetime.now(IST).isoformat(),
+        "stats": compute_winrate(_SETUPS),
+        "recent": recent,
+    }
+
+
+async def _handle_track_record(_request: web.Request) -> web.Response:
+    return web.json_response(build_track_record_payload(), headers={
+        "Access-Control-Allow-Origin": "*",         # public data, dashboard consumes it
+        "Cache-Control": "public, max-age=300",
     })
 
 
@@ -1598,12 +1668,13 @@ async def start_webhook_server() -> None:
         return
     app = web.Application()
     app.router.add_get("/healthz", _handle_healthz)
+    app.router.add_get("/api/track-record", _handle_track_record)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
     await site.start()
     _web_runner = runner
-    print(f"[Webhook] /healthz listening on 0.0.0.0:{WEBHOOK_PORT}")
+    print(f"[Webhook] /healthz + /api/track-record listening on 0.0.0.0:{WEBHOOK_PORT}")
 
 
 # =============================================================================
