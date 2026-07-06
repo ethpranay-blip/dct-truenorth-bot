@@ -1146,29 +1146,115 @@ async def _post_resolution(s: dict) -> None:
             print(f"[TRACK] channel send also failed: {type(ex2).__name__}: {ex2}")
 
 
+def _parse_ts(x: str | None):
+    """ISO timestamp → aware datetime. Handles both UTC 'Z' (TN candles) and
+    +05:30 offsets (our records)."""
+    if not isinstance(x, str) or not x:
+        return None
+    try:
+        return datetime.fromisoformat(x.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def evaluate_setup_candles(setup: dict, candles: list[dict]):
+    """Wick-accurate resolution: scan 15m candles chronologically from entry time;
+    the first candle whose high/low crosses a level decides the outcome.
+
+    A spot check every 15 min misses intra-interval wicks — a stop that gets
+    tagged and recovers would silently count as still-open (overstating the
+    public win rate). Candle highs/lows close that hole. If ONE candle spans
+    both stop and TP1, we can't know intra-candle order → conservative LOSS.
+
+    Returns (status, label, resolution_price, resolved_at_iso) or None.
+    Fills are assumed at the level itself (stop/TP1), not the candle close.
+    """
+    entry_ts = _parse_ts(setup.get("timestamp"))
+    if entry_ts is None:
+        return None
+    long = setup["direction"] == "LONG"
+    stop, tp1 = setup["stop_loss"], setup["tp1"]
+    for c in sorted(candles, key=lambda c: c.get("t") or ""):
+        ct = _parse_ts(c.get("t_close") or c.get("t"))
+        if ct is None or ct <= entry_ts:
+            continue  # candle closed before (or at) entry — pre-trade action
+        try:
+            hi, lo = float(c["high"]), float(c["low"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        hit_stop = lo <= stop if long else hi >= stop
+        hit_tp = hi >= tp1 if long else lo <= tp1
+        if hit_stop:  # both-in-one-candle also lands here → conservative LOSS
+            return ("LOSS", "SL", stop, ct.astimezone(IST).isoformat())
+        if hit_tp:
+            return ("WIN", "TP1", tp1, ct.astimezone(IST).isoformat())
+    return None
+
+
 async def track_setups() -> None:
-    """Every 15 min: price-check OPEN setups, resolve + announce any that hit."""
+    """Every 15 min: resolve OPEN setups against 15m candle wicks (one batched
+    historical_bars call for all of them), announce + persist any that hit.
+    Falls back to a spot check for an instrument with no candle data; expiry
+    (48h no-trigger) is evaluated either way."""
     open_setups = [s for s in _SETUPS if s.get("status") == "OPEN"]
     if not open_setups:
         return
+    ids = sorted({s["coingecko_id"] for s in open_setups})
+    oldest = min(_parse_ts(s["timestamp"]) or datetime.now(IST) for s in open_setups)
+    bars = await tn_call_safe("historical_bars", {
+        "instruments": ids, "asset_class": "crypto", "timeframe": "15m",
+        "start": oldest.astimezone(ZoneInfo("UTC")).isoformat(), "align": "outer",
+    })
+    series = (bars or {}).get("data") or {}
     changed = False
     for s in open_setups:
-        info = await tn_call_safe("basic_market_info", {"token_address": s["coingecko_id"]})
-        price = (info or {}).get("market_data", {}).get("current_price")
-        outcome = evaluate_setup(s, price)
-        if outcome is None:
-            continue
-        status, label = outcome
+        candles = series.get(s["coingecko_id"]) or []
+        hit = evaluate_setup_candles(s, candles)
+        if hit:
+            status, label, res_price, resolved_at = hit
+        else:
+            # No wick trigger. Reference price: last candle close, else spot
+            # (fallback covers a historical_bars outage for this instrument).
+            ref = None
+            if candles:
+                try:
+                    ref = float(candles[-1]["close"])
+                except (KeyError, TypeError, ValueError):
+                    ref = None
+            if ref is None:
+                info = await tn_call_safe("basic_market_info", {"token_address": s["coingecko_id"]})
+                ref = (info or {}).get("market_data", {}).get("current_price")
+            outcome = evaluate_setup(s, ref)  # spot-level WIN/LOSS (fallback) + expiry
+            if outcome is None:
+                continue
+            status, label = outcome
+            res_price, resolved_at = ref, datetime.now(IST).isoformat()
         s["status"] = status
         s["outcome_label"] = label
-        s["resolution_price"] = price
-        s["resolved_at"] = datetime.now(IST).isoformat()
-        s["result_pct"] = _trade_pct(s, price)
+        s["resolution_price"] = res_price
+        s["resolved_at"] = resolved_at
+        s["result_pct"] = _trade_pct(s, res_price)
         changed = True
-        print(f"[TRACK] {s['ticker']} {s['direction']} → {status} ({label}) at {_money(price)}")
+        print(f"[TRACK] {s['ticker']} {s['direction']} → {status} ({label}) at {_money(res_price)}")
         await _post_resolution(s)
     if changed:
         _persist_setups()
+
+
+SETUP_REUSE_HOURS = 6
+
+
+def _find_recent_open(coingecko_id: str, hours: float = SETUP_REUSE_HOURS) -> dict | None:
+    """An OPEN setup for this asset younger than `hours`, if any — !setup reuses
+    it instead of double-logging near-identical trades into the track record."""
+    now = datetime.now(IST)
+    for s in reversed(_SETUPS):  # newest first
+        if s.get("status") != "OPEN" or s.get("coingecko_id") != coingecko_id:
+            continue
+        ts = _parse_ts(s.get("timestamp"))
+        if ts and (now - ts).total_seconds() < hours * 3600:
+            return s
+    return None
 
 
 def compute_winrate(setups: list[dict]) -> dict:
@@ -1601,6 +1687,24 @@ async def trade_setup(ctx: commands.Context, ticker: str = ""):
         return
 
     token_id = _resolve_token(ticker)
+
+    # Dedupe: an open tracked setup for this asset < 6h old is reused, not
+    # re-generated — repeated !setup calls must not stack near-identical
+    # trades into the public track record.
+    existing = _find_recent_open(token_id)
+    if existing:
+        jump = ""
+        if ctx.guild:
+            jump = (f" · [original](https://discord.com/channels/{ctx.guild.id}/"
+                    f"{existing['discord_channel_id']}/{existing['discord_message_id']})")
+        await ctx.send(
+            f"♻️ **{existing['ticker']} {existing['direction']}** already open from "
+            f"{_format_delta(_parse_ts(existing['timestamp']))} — entry {_money(existing['entry_price'])}, "
+            f"SL {_money(existing['stop_loss'])}, TP1 {_money(existing['tp1'])}. "
+            f"Tracking continues; `!winrate` for the record{jump}."
+        )
+        return
+
     status = await ctx.send(f"⏳ Building **{ticker}** setup…")
 
     # 4h timeframe: signals and ATR-sized levels that fit the 48h tracking window.

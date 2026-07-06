@@ -1305,6 +1305,163 @@ def test_track_setups_resolves_and_persists(tmp_path, monkeypatch):
     assert saved["setups"][0]["status"] == "WIN"
 
 
+def test_parse_ts_handles_utc_z_and_offsets():
+    a = bot._parse_ts("2026-07-06T08:00:00Z")
+    b = bot._parse_ts("2026-07-06T13:30:00+05:30")
+    assert a is not None and b is not None
+    assert a == b  # same instant
+    assert bot._parse_ts(None) is None
+    assert bot._parse_ts("not a date") is None
+
+
+def _candle(t, hi, lo, close=None):
+    return {"t": t, "t_close": t.replace("T00:", "T00:").replace("Z", "Z"),
+            "open": str(lo), "high": str(hi), "low": str(lo), "close": str(close or hi),
+            "volume": "1"}
+
+
+def _open_long(entry=100.0, stop=95.0, tp1=110.0, ts="2026-07-06T00:00:00+00:00"):
+    return {"ticker": "BTC", "coingecko_id": "bitcoin", "direction": "LONG",
+            "entry_price": entry, "stop_loss": stop, "tp1": tp1, "tp2": 120.0,
+            "rr_ratio": "1.5", "conviction": "High", "timestamp": ts,
+            "discord_message_id": 1, "discord_channel_id": 2, "status": "OPEN",
+            "resolution_price": None, "resolved_at": None, "result_pct": None,
+            "outcome_label": None}
+
+
+def test_candles_win_on_wick_high():
+    s = _open_long()
+    candles = [
+        _candle("2026-07-06T01:00:00Z", hi=105, lo=99),
+        _candle("2026-07-06T02:00:00Z", hi=111, lo=104),  # wick tags TP1
+    ]
+    status, label, price, resolved_at = bot.evaluate_setup_candles(s, candles)
+    assert (status, label) == ("WIN", "TP1")
+    assert price == 110.0                      # fill at the level, not the close
+    assert "+05:30" in resolved_at             # candle time, converted to IST
+
+
+def test_candles_loss_on_wick_low_even_if_close_recovers():
+    s = _open_long()
+    # Low tags the stop intra-candle but the candle closes back above entry —
+    # the exact case a 15-min spot check would miss.
+    candles = [_candle("2026-07-06T01:00:00Z", hi=103, lo=94.5, close=101)]
+    status, label, price, _ = bot.evaluate_setup_candles(s, candles)
+    assert (status, label) == ("LOSS", "SL")
+    assert price == 95.0
+
+
+def test_candles_both_levels_in_one_candle_is_conservative_loss():
+    s = _open_long()
+    candles = [_candle("2026-07-06T01:00:00Z", hi=112, lo=94)]  # spans both
+    status, label, _p, _t = bot.evaluate_setup_candles(s, candles)
+    assert (status, label) == ("LOSS", "SL")
+
+
+def test_candles_first_hit_wins_chronologically():
+    s = _open_long()
+    candles = [  # deliberately out of order — must sort by t
+        _candle("2026-07-06T03:00:00Z", hi=112, lo=105),  # would be WIN later
+        _candle("2026-07-06T01:30:00Z", hi=99, lo=94),    # LOSS comes first
+    ]
+    status, label, _price, _t = bot.evaluate_setup_candles(s, candles)
+    assert (status, label) == ("LOSS", "SL")
+
+
+def test_candles_before_entry_are_ignored():
+    s = _open_long(ts="2026-07-06T02:00:00+00:00")
+    candles = [
+        _candle("2026-07-06T01:00:00Z", hi=112, lo=94),   # pre-entry spike: ignore
+        _candle("2026-07-06T03:00:00Z", hi=105, lo=101),  # post-entry, no trigger
+    ]
+    assert bot.evaluate_setup_candles(s, candles) is None
+
+
+def test_candles_short_direction_mirrored():
+    s = {**_open_long(), "direction": "SHORT", "stop_loss": 105.0, "tp1": 90.0}
+    win = [_candle("2026-07-06T01:00:00Z", hi=101, lo=89)]
+    status, label, price, _ = bot.evaluate_setup_candles(s, win)
+    assert (status, label, price) == ("WIN", "TP1", 90.0)
+    loss = [_candle("2026-07-06T01:00:00Z", hi=106, lo=98)]
+    assert bot.evaluate_setup_candles(s, loss)[0] == "LOSS"
+
+
+def test_candles_none_on_empty_or_garbage():
+    s = _open_long()
+    assert bot.evaluate_setup_candles(s, []) is None
+    assert bot.evaluate_setup_candles(s, [{"t": "2026-07-06T01:00:00Z", "high": "x", "low": None}]) is None
+
+
+def test_track_setups_wick_resolution_end_to_end(tmp_path, monkeypatch):
+    import asyncio, json
+    monkeypatch.setattr(bot, "CACHE_PATH", str(tmp_path))
+    monkeypatch.setattr(bot, "SETUPS_PATH", str(tmp_path / "setups.json"))
+    rec = _open_long(entry=95800.0, stop=94200.0, tp1=99400.0,
+                     ts=bot.datetime.now(bot.IST).isoformat())
+    rec["tp2"] = 101000.0
+    monkeypatch.setattr(bot, "_SETUPS", [rec])
+    calls = []
+
+    async def fake_call(tool, args, **kw):
+        calls.append((tool, args.get("instruments")))
+        if tool == "historical_bars":
+            t = bot.datetime.now(bot.ZoneInfo("UTC")).isoformat()
+            return {"data": {"bitcoin": [
+                {"t": t, "t_close": t, "open": "95800", "high": "99500",
+                 "low": "95500", "close": "99000", "volume": "1"},
+            ]}}
+        raise AssertionError("spot fallback must not fire when candles exist")
+
+    posted = {"n": 0}
+
+    async def fake_post(s):
+        posted["n"] += 1
+
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    monkeypatch.setattr(bot, "_post_resolution", fake_post)
+    asyncio.run(bot.track_setups())
+    assert rec["status"] == "WIN" and rec["outcome_label"] == "TP1"
+    assert rec["resolution_price"] == 99400.0   # the TP1 level, not the candle close
+    assert posted["n"] == 1
+    assert calls[0][0] == "historical_bars" and calls[0][1] == ["bitcoin"]
+    saved = json.loads((tmp_path / "setups.json").read_text())
+    assert saved["setups"][0]["status"] == "WIN"
+
+
+def test_track_setups_batches_one_bars_call_for_all_ids(monkeypatch):
+    import asyncio
+    a = _open_long(ts=bot.datetime.now(bot.IST).isoformat())
+    b = {**_open_long(ts=bot.datetime.now(bot.IST).isoformat()), "coingecko_id": "ethereum", "ticker": "ETH"}
+    monkeypatch.setattr(bot, "_SETUPS", [a, b])
+    bars_calls = []
+
+    async def fake_call(tool, args, **kw):
+        if tool == "historical_bars":
+            bars_calls.append(args["instruments"])
+            return {"data": {}}
+        return None  # spot fallback also unavailable → nothing resolves
+
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    asyncio.run(bot.track_setups())
+    assert bars_calls == [["bitcoin", "ethereum"]]  # one batched call, sorted ids
+    assert a["status"] == "OPEN" and b["status"] == "OPEN"  # no data → untouched
+
+
+def test_find_recent_open_window_and_filters(monkeypatch):
+    from datetime import timedelta
+    now = bot.datetime.now(bot.IST)
+    fresh = {**_open_long(ts=(now - timedelta(hours=2)).isoformat())}
+    stale = {**_open_long(ts=(now - timedelta(hours=9)).isoformat())}
+    resolved = {**_open_long(ts=now.isoformat()), "status": "WIN"}
+    other = {**_open_long(ts=now.isoformat()), "coingecko_id": "ethereum"}
+    monkeypatch.setattr(bot, "_SETUPS", [stale, resolved, other, fresh])
+    hit = bot._find_recent_open("bitcoin")
+    assert hit is fresh                       # newest OPEN bitcoin inside 6h
+    monkeypatch.setattr(bot, "_SETUPS", [stale, resolved])
+    assert bot._find_recent_open("bitcoin") is None   # stale + resolved don't count
+    assert bot._find_recent_open("solana") is None
+
+
 def test_track_setups_no_open_is_noop(monkeypatch):
     import asyncio
     monkeypatch.setattr(bot, "_SETUPS", [{"status": "WIN"}])
