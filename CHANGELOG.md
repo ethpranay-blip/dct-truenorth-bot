@@ -2,6 +2,20 @@
 
 History of notable changes to `dct-truenorth-bot`. Grouped by week, with key commit hashes for reference.
 
+## v3 + track-record integrity — 2026-07-06
+
+- **2026-07-06 · `f3b630c`** — **Wick-accurate outcome resolution + `!setup` dedupe.** The tracker now resolves open setups against 15-minute candle highs/lows (one batched `historical_bars` call for all open instruments) instead of spot checks — a stop that wicks and recovers no longer counts as still-open, so the public win rate can't overstate. Both-levels-in-one-candle books as a conservative LOSS; fills book at the level; `resolved_at` is the crossing candle's time. Repeat `!setup` for the same asset within 6 h reuses the open trade (reuse notice + jump link) instead of double-logging. 146 tests.
+- **2026-07-06 · `9534db3`** — **v3: removed the LLM entirely.** After the Anthropic credit balance emptied on Jul 3 (second billing incident; briefs silently dead for 3 days), all synthesis went rule-based: `build_rule_brief` (regime line, BTC/ETH trend + levels, S/R channels with strength, funding/OI percentiles + liq magnets, movers, filtered headlines), `build_rule_regime_outlook` (+ cross-asset strip), `build_rule_setup` (weighted 4h signal score; ATR levels at 1.5R/3R; honest no-setup), `build_template_tweet`. `anthropic` removed from requirements; `ANTHROPIC_API_KEY` no longer read. Briefs fetch clean 1d TA for BTC+ETH; the regime check reuses brief data instead of refetching. Zero API spend; nothing left that can bill or expire. 135 tests.
+
+## Feature wave — 2026-06-27 → 2026-06-29
+
+- **2026-06-29 · `aeb03c5`** — **Typefully auto-draft moved to the v2 API** (`POST /v2/social-sets/{id}/drafts`, `Authorization: Bearer`) after v1 started returning 403. Social set configurable via `TYPEFULLY_SOCIAL_SET_ID` (default @Corgil_).
+- **2026-06-28 · `40e4d55`** — **Regime-shift detection.** Rule-based RISK-ON/OFF/NEUTRAL derived on every brief run (MA position, funding sign, RSI, VIX when present; ≥2 signals per side, UNKNOWN on sparse data so outages can't false-alert); flips post an orange alert to `#regime-outlook`; baseline persisted to `last_regime.json`.
+- **2026-06-28 · `aa17c6b`** — **Setup outcome tracking.** Every LONG/SHORT `!setup` logged to `setups.json` (atomic writes), resolved by a 15-min job, announced as a reply to the original message (green WIN / red LOSS / grey EXPIRED with direction-adjusted %), surfaced via the new `!winrate` command and a `!health` line.
+- **2026-06-28 · `1f2d375`** — **Typefully auto-draft** (opt-in via `AUTO_DRAFT_ENABLED` + `TYPEFULLY_API_KEY`): each posted brief ghostwrote a tweet and saved it as a draft, never published. Fully failure-isolated from the brief.
+- **2026-06-27 · `e694467`** — **`!scan [1-25]`** — zero-cost ANSI-colored top-N by 7-day relative strength vs BTC (works even with no LLM key — which mattered a day later).
+- **2026-06-27 · `99dd67d`** — **`!setup <ticker>`** — on-demand single-asset trade setup (then Claude-generated; rule-based since v3). Ticker→CoinGecko-id map, channel gating via `SETUP_ALLOWED_CHANNELS`, 60 s/user cooldown.
+
 ## v2 pivot — 2026-06-12
 
 - **2026-06-12 · `a9eb804`** — **Pivot to TrueNorth v2 agent-tools engine.** TrueNorth v2 retired the conversational SSE endpoint (`/sse/v2/streams` rejects the v1 request shape), killing scheduled briefs. Rebuilt on the keyless agent-tools REST API (the `@truenorth-ai/cli` backend): parallel tool calls (TA, derivatives, scanner, events, market info) build a JSON snapshot; `claude-opus-4-8` synthesizes the narrative. Briefs now fire 15 min before each market's local open with per-market-timezone crons (Tokyo 08:45 JST, London 07:45 UK, NY 09:15 ET — DST-proof); regime stays MWF 06:00 IST. Channel layout simplified: `#claude-integration` chat (+ Sonnet middleman) and `#trades` posting removed — briefs link to the setups dashboard (`DASHBOARD_URL`) instead. Deleted the entire v1 credential stack: Privy refresh, token/thread caches, `/credentials` webhook, Mac-local harvester (`harvester_local/`), `README_SETUP.md`. New test suite: 54 passing.
