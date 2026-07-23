@@ -2120,3 +2120,128 @@ def test_storage_status_flags_ephemeral_vs_persistent(tmp_path):
     assert "persistent" in s and "not yet created" in s
     (tmp_path / "setups.json").write_text("{}")
     assert "present" in bot._storage_status(path=d, setups_file=sf)
+
+
+# --- cross-asset support (stocks + commodities) -----------------------------
+
+def test_classify_asset_routing():
+    assert bot.classify_asset("BTC") == ("crypto", "bitcoin")
+    assert bot.classify_asset("btc") == ("crypto", "bitcoin")
+    assert bot.classify_asset("GOLD") == ("commodity", "gold")
+    assert bot.classify_asset("OIL") == ("commodity", "oil")
+    assert bot.classify_asset("AAPL") == ("stock", "AAPL")
+    assert bot.classify_asset("NVDA") == ("stock", "NVDA")
+    assert bot.classify_asset("curve-dao-token") == ("crypto", "curve-dao-token")  # id passthrough
+
+
+def _ramp_bars(n=80, start=100.0, step=1.0, vol=1000.0):
+    """Compounding trend (accelerating) so MACD reads bull+rising on the way up /
+    bear+falling on the way down — a realistic directional series, not a linear
+    ramp (whose MACD histogram fades to flat)."""
+    g = 0.01 if step > 0 else -0.01
+    out = []
+    for i in range(n):
+        c = start * ((1 + g) ** i)
+        out.append({"t": f"{i:04d}", "open": str(c), "high": str(c * 1.005),
+                    "low": str(c * 0.995), "close": str(c), "volume": str(vol)})
+    return out
+
+
+def test_compute_indicators_shape_and_uptrend_scores_long():
+    ta = bot.compute_indicators_from_bars(_ramp_bars(step=1.0))
+    ind = ta["technical_indicators"]
+    assert set(ind) == {"sma20", "sma50", "macd_12_26_9", "rsi14", "boll_20_2", "atr14"}
+    assert ind["sma20"]["state"] == "price_above" and ind["sma50"]["state"] == "price_above"
+    assert ind["atr14"]["value"] is not None and ind["atr14"]["value"] > 0
+    score, bull, bear = bot._setup_score(ta)
+    assert score >= 4.0 and not bear          # clean uptrend → high-conviction long
+    info = {"market_data": {"current_price": float(_ramp_bars()[-1]["close"])}}
+    s = bot.build_rule_setup("X", info, ta, None, min_score=bot.SETUP_SCORE_HIGH, tp_rs=(2.5, 4.0))
+    assert s["has_setup"] and s["direction"] == "LONG"
+
+
+def test_compute_indicators_downtrend_scores_short():
+    ta = bot.compute_indicators_from_bars(_ramp_bars(start=200.0, step=-1.0))
+    score, bull, bear = bot._setup_score(ta)
+    assert score <= -3.0                       # clearly bearish
+    info = {"market_data": {"current_price": 100.0}}
+    s = bot.build_rule_setup("X", info, ta, None)
+    assert s["has_setup"] and s["direction"] == "SHORT"
+
+
+def test_compute_indicators_insufficient_bars_returns_none():
+    assert bot.compute_indicators_from_bars(_ramp_bars(n=40)) is None
+    assert bot.compute_indicators_from_bars([]) is None
+    assert bot.compute_indicators_from_bars(None) is None
+
+
+def test_expiry_hours_per_asset_class():
+    assert bot._expiry_hours({"asset_class": "crypto"}) == 48
+    assert bot._expiry_hours({"asset_class": "stock"}) == 168
+    assert bot._expiry_hours({"asset_class": "commodity"}) == 168
+    assert bot._expiry_hours({}) == 48   # default/back-compat
+
+
+def test_gather_setup_inputs_stock_path(monkeypatch):
+    import asyncio
+    bars = _ramp_bars(step=1.0)
+
+    async def fake_call(tool, args, **kw):
+        if tool == "historical_bars":
+            assert args["asset_class"] == "stock" and args["timeframe"] == "1d"
+            return {"data": {"AAPL": bars}}
+        raise AssertionError(f"stock path must not call {tool}")
+
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    g = asyncio.run(bot.gather_setup_inputs("AAPL"))
+    assert g["asset_class"] == "stock" and g["instrument"] == "AAPL" and g["timeframe"] == "1d"
+    assert g["ta"]["technical_indicators"]["sma20"]["state"] == "price_above"
+    assert g["info"]["market_data"]["current_price"] == float(bars[-1]["close"])
+    assert g["derivs"] is None and g["bars"] == bars
+
+
+def test_track_setups_routes_stock_to_daily_bars(monkeypatch):
+    import asyncio
+    # A stock LONG that a daily candle takes through TP1
+    rec = {"ticker": "AAPL", "coingecko_id": "AAPL", "asset_class": "stock",
+           "direction": "LONG", "entry_price": 100.0, "stop_loss": 94.0,
+           "tp1": 115.0, "tp2": 124.0, "status": "OPEN",
+           "timestamp": bot.datetime.now(bot.IST).isoformat(),
+           "resolution_price": None, "resolved_at": None, "result_pct": None, "outcome_label": None}
+    monkeypatch.setattr(bot, "_SETUPS", [rec])
+    calls = []
+
+    async def fake_call(tool, args, **kw):
+        calls.append((tool, args.get("asset_class"), args.get("timeframe")))
+        if tool == "historical_bars":
+            t = bot.datetime.now(bot.ZoneInfo("UTC")).isoformat()
+            return {"data": {"AAPL": [{"t": t, "t_close": t, "open": "100",
+                    "high": "116", "low": "99", "close": "115", "volume": "1"}]}}
+        raise AssertionError("no spot fallback for stocks")
+
+    async def fake_post(s): pass
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    monkeypatch.setattr(bot, "_post_resolution", fake_post)
+    asyncio.run(bot.track_setups())
+    assert rec["status"] == "WIN" and rec["resolution_price"] == 115.0
+    assert calls[0] == ("historical_bars", "stock", "1d")   # routed to daily stock bars
+
+
+def test_scan_watchlist_posts_aligned_stock(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "CH_SIGNALS", 999)
+    monkeypatch.setattr(bot, "SIGNALS_WATCHLIST", ["NVDA"])
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    ch = _StubChannel()
+    monkeypatch.setattr(bot.bot, "get_channel", lambda _id: ch)
+    bars = _ramp_bars(step=1.0)  # uptrend → LONG + RVWAP LONG (price above VWAPs)
+
+    async def fake_call(tool, args, **kw):
+        if tool == "historical_bars":
+            return {"data": {"NVDA": bars}}
+        return None
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    n = asyncio.run(bot._scan_watchlist())
+    assert n == 1 and len(ch.sent) == 1
+    assert ch.sent[0].title == "🤖 NVDA Auto Signal"
+    assert bot._SETUPS[0]["asset_class"] == "stock" and bot._SETUPS[0]["source"] == "auto"

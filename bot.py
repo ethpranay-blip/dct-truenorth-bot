@@ -611,6 +611,166 @@ def _resolve_token(arg: str) -> str:
     return TICKER_TO_ID.get(arg.strip().upper(), arg.strip().lower())
 
 
+# =============================================================================
+# Cross-asset support (stocks + commodities) — additive, crypto path untouched.
+# TN has NO indicator tool for non-crypto (technical_analysis / _v3 are crypto-
+# only), so we compute the SAME indicator dict shape technical_analysis returns
+# from raw historical_bars OHLCV. build_rule_setup / _setup_score then work
+# unchanged. Stocks/commodities have no 4h bars → these run on the daily.
+# =============================================================================
+
+COMMODITY_ALIASES = {"GOLD", "SILVER", "OIL", "GAS", "NATGAS", "COPPER",
+                     "PLATINUM", "PALLADIUM", "WTI", "BRENT"}
+
+# Per-asset-class setup config: (setup timeframe, resolution timeframe, expiry h).
+# Crypto keeps 4h/15m/48h; non-crypto runs daily with a longer window because a
+# daily setup can't resolve inside 48h.
+ASSET_CFG = {
+    "crypto":    {"tf": "4h", "res_tf": "15m", "expiry_h": 48},
+    "stock":     {"tf": "1d", "res_tf": "1d",  "expiry_h": 168},
+    "commodity": {"tf": "1d", "res_tf": "1d",  "expiry_h": 168},
+}
+
+
+def classify_asset(ticker: str) -> tuple[str, str]:
+    """(asset_class, instrument) for a user ticker. Crypto stays the default so
+    existing behavior is byte-identical; only recognized commodity aliases and
+    plausible stock tickers route to the new path.
+    ponytail: an obscure crypto ticker not in TICKER_TO_ID and not hyphenated
+    could misroute to 'stock' — user can pass the CoinGecko id to force crypto."""
+    t = ticker.strip().upper()
+    if t in TICKER_TO_ID:
+        return "crypto", TICKER_TO_ID[t]
+    if t in COMMODITY_ALIASES:
+        return "commodity", t.lower()
+    # Hyphen or lowercase input ⇒ a CoinGecko id (e.g. "curve-dao-token") ⇒ crypto.
+    if "-" in ticker or ticker != t:
+        return "crypto", ticker.strip().lower()
+    # A bare 1–5 letter uppercase symbol we don't know as crypto ⇒ treat as a stock.
+    if t.isalpha() and 1 <= len(t) <= 5:
+        return "stock", t
+    return "crypto", t.lower()
+
+
+def _ema(values: list[float], span: int) -> list[float]:
+    """Standard EMA series (SMA seed on the first `span` values)."""
+    if len(values) < span:
+        return []
+    k = 2 / (span + 1)
+    ema = sum(values[:span]) / span
+    out = [ema]
+    for v in values[span:]:
+        ema = v * k + ema * (1 - k)
+        out.append(ema)
+    return out
+
+
+def _rsi_series(closes: list[float], length: int = 14) -> list[float]:
+    """Wilder RSI series (one value per bar from index `length` on)."""
+    if len(closes) <= length:
+        return []
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        ch = closes[i] - closes[i - 1]
+        gains.append(max(ch, 0.0))
+        losses.append(max(-ch, 0.0))
+    avg_g = sum(gains[:length]) / length
+    avg_l = sum(losses[:length]) / length
+    out = []
+    for i in range(length, len(gains) + 1):
+        if i > length:
+            avg_g = (avg_g * (length - 1) + gains[i - 1]) / length
+            avg_l = (avg_l * (length - 1) + losses[i - 1]) / length
+        rs = (avg_g / avg_l) if avg_l > 0 else float("inf")
+        out.append(100.0 if avg_l == 0 else 100 - 100 / (1 + rs))
+    return out
+
+
+def compute_indicators_from_bars(bars: list[dict]) -> dict | None:
+    """Return technical_analysis-compatible {'technical_indicators': {...}} from
+    raw OHLCV bars, so build_rule_setup / _setup_score consume it unchanged.
+    None if there aren't enough clean bars (need ≥ 51 for SMA50 + momentum)."""
+    closes, highs, lows = [], [], []
+    for b in sorted(bars or [], key=lambda c: c.get("t") or ""):
+        try:
+            closes.append(float(b["close"]))
+            highs.append(float(b["high"]))
+            lows.append(float(b["low"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if len(closes) < 51:
+        return None
+    price = closes[-1]
+    sma20 = sum(closes[-20:]) / 20
+    sma50 = sum(closes[-50:]) / 50
+
+    macd_line = [f - s for f, s in zip(_ema(closes, 12)[-len(_ema(closes, 26)):], _ema(closes, 26))]
+    signal = _ema(macd_line, 9)
+    hist = [m - s for m, s in zip(macd_line[-len(signal):], signal)] if signal else []
+    macd_state = macd_momo = None
+    if signal:
+        macd_state = "bull" if macd_line[-1] > signal[-1] else "bear"
+    if len(hist) >= 2 and hist[-1] != hist[-2]:   # tie ⇒ neutral, not "falling"
+        macd_momo = "rising" if hist[-1] > hist[-2] else "falling"
+
+    rsi = _rsi_series(closes, 14)
+    rsi_val = rsi[-1] if rsi else None
+    rsi_momo = None
+    if len(rsi) >= 2 and rsi[-1] != rsi[-2]:      # tie ⇒ neutral
+        rsi_momo = "rising" if rsi[-1] > rsi[-2] else "falling"
+
+    trs = [max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+           for i in range(1, len(closes))]
+    atr = sum(trs[-14:]) / 14 if len(trs) >= 14 else None
+
+    return {"technical_indicators": {
+        "sma20": {"state": "price_above" if price > sma20 else "price_below", "value": sma20},
+        "sma50": {"state": "price_above" if price > sma50 else "price_below", "value": sma50},
+        "macd_12_26_9": {"state": macd_state, "momentum": macd_momo},
+        "rsi14": {"value": rsi_val, "momentum": rsi_momo},
+        "boll_20_2": {"mid_relation": "above_mid" if price > sma20 else "below_mid"},
+        "atr14": {"value": atr},
+    }}
+
+
+async def _none_coro():
+    """Awaitable that yields None — lets asyncio.gather skip a branch cleanly."""
+    return None
+
+
+async def gather_setup_inputs(ticker: str) -> dict:
+    """Route a ticker to its asset class and return everything build_rule_setup
+    needs, in a uniform shape. Crypto path is byte-identical to the old inline
+    gather; stocks/commodities fetch daily bars and compute indicators locally."""
+    asset_class, instrument = classify_asset(ticker)
+    cfg = ASSET_CFG[asset_class]
+    if asset_class == "crypto":
+        info, ta, derivs = await asyncio.gather(
+            tn_call_safe("basic_market_info", {"token_address": instrument}),
+            tn_call_safe("technical_analysis", {"token_address": instrument, "timeframe": cfg["tf"]}),
+            tn_call_safe("derivatives_analysis", {"token_address": instrument}),
+        )
+        return {"asset_class": asset_class, "instrument": instrument, "timeframe": cfg["tf"],
+                "info": info, "ta": ta, "derivs": derivs, "bars": None}
+    # Stocks / commodities: daily bars → local indicators, price from last close.
+    start = (datetime.now(IST) - timedelta(days=260)).astimezone(ZoneInfo("UTC")).isoformat()
+    raw = await tn_call_safe("historical_bars", {
+        "instruments": [instrument], "asset_class": asset_class,
+        "timeframe": cfg["tf"], "start": start,
+    })
+    bars = ((raw or {}).get("data") or {}).get(instrument) or []
+    ta = compute_indicators_from_bars(bars)
+    price = None
+    if bars:
+        try:
+            price = float(sorted(bars, key=lambda c: c.get("t") or "")[-1]["close"])
+        except (KeyError, TypeError, ValueError):
+            price = None
+    info = {"market_data": {"current_price": price}} if price is not None else None
+    return {"asset_class": asset_class, "instrument": instrument, "timeframe": cfg["tf"],
+            "info": info, "ta": ta, "derivs": None, "bars": bars}
+
+
 # Signal weights for the rule-based setup engine. Direction needs |score| ≥ 2.5;
 # conviction is High at |score| ≥ 4. Tuned to demand multi-signal alignment.
 SETUP_SCORE_MIN = 2.5
@@ -757,6 +917,15 @@ AUTO_SIGNAL_PER_SIDE = 3      # leaders considered for longs / laggards for shor
 AUTO_TP_RS = (2.5, 4.0)       # min 1:2.5 R:R — Pranay's spec, vs !setup's 1.5R/3R
 RVWAP_WINDOWS = (7, 30, 90, 365)
 
+# Fixed cross-asset watchlist for auto-signals: stocks/commodities have no RS
+# scanner, so we scan a named list each run. Gate = RVWAP bias + score ≥ 4.0
+# (no BTC regime — RVWAP structural bias is the trend filter for these).
+# ponytail: per-asset-class lead-instrument gating (SPX→stocks, DXY→metals) is a
+# future refinement; instrument-own RVWAP already encodes each one's trend.
+SIGNALS_WATCHLIST = [
+    t.strip() for t in os.environ.get("SIGNALS_WATCHLIST", "NVDA,AAPL,TSLA,GOLD,OIL").split(",") if t.strip()
+]
+
 
 def compute_rvwaps(candles: list[dict], windows: tuple = RVWAP_WINDOWS) -> dict[int, float]:
     """Rolling VWAP over the trailing N daily candles: Σ(close·volume)/Σvolume.
@@ -793,10 +962,52 @@ def rvwap_bias(price: float | None, rv: dict[int, float]) -> str:
     return "MIXED"
 
 
+async def _emit_auto_signal(ticker: str, instrument: str, asset_class: str,
+                            price: float, setup: dict, basis: str) -> bool:
+    """Post one auto-signal embed to CH_SIGNALS and log it. Returns True if sent."""
+    channel = bot.get_channel(CH_SIGNALS)
+    if channel is None:
+        print(f"[AUTOSIG] channel {CH_SIGNALS} not found")
+        return False
+    embed = build_setup_embed(ticker, float(price), setup)
+    embed.title = f"🤖 {ticker} Auto Signal"
+    embed.add_field(name="Basis", value=basis, inline=False)
+    if asset_class != "crypto":
+        embed.set_footer(text=f"{asset_class} · daily · " + FOOTER + " · not financial advice")
+    msg = await channel.send(embed=embed)
+    log_setup(setup, ticker, instrument, msg, source="auto", asset_class=asset_class)
+    return True
+
+
+async def _scan_watchlist() -> int:
+    """Non-crypto leg of the auto-signal scan: each SIGNALS_WATCHLIST symbol on
+    the daily, gated by its own RVWAP bias + score ≥ 4.0. Returns count posted."""
+    posted = 0
+    for sym in SIGNALS_WATCHLIST:
+        asset_class, instrument = classify_asset(sym)
+        if asset_class == "crypto":
+            continue  # crypto is covered by the RS-rotation leg
+        if _find_recent_open(instrument):
+            continue
+        g = await gather_setup_inputs(sym)
+        price = ((g.get("info") or {}).get("market_data") or {}).get("current_price")
+        if price is None or g.get("ta") is None:
+            continue
+        bias = rvwap_bias(price, compute_rvwaps(g.get("bars") or []))
+        setup = build_rule_setup(sym, g["info"], g["ta"], None,
+                                 min_score=SETUP_SCORE_HIGH, tp_rs=AUTO_TP_RS)
+        if not setup.get("has_setup") or bias == "MIXED" or setup["direction"] != bias:
+            continue
+        if await _emit_auto_signal(sym, instrument, asset_class, float(price), setup,
+                                   f"RVWAP bias {bias} · {asset_class} · daily score ≥ 4.0"):
+            posted += 1
+    return posted
+
+
 async def auto_signal_scan() -> None:
-    """Every 4h (UTC candle close): post high-conviction, regime- and
-    RVWAP-aligned setups to CH_SIGNALS. Silence is the normal outcome —
-    the gate (score ≥ 4.0 + triple alignment) is meant to fire rarely."""
+    """Every 4h (UTC candle close): post high-conviction setups to CH_SIGNALS —
+    crypto via regime + RS rotation + RVWAP, plus a fixed cross-asset watchlist
+    (stocks/commodities) via RVWAP + score. Silence is the normal outcome."""
     if CH_SIGNALS is None:
         return
     d = await gather_raw([
@@ -841,21 +1052,12 @@ async def auto_signal_scan() -> None:
                                  min_score=SETUP_SCORE_HIGH, tp_rs=AUTO_TP_RS)
         if not setup.get("has_setup") or setup["direction"] != want or bias != want:
             continue
-        channel = bot.get_channel(CH_SIGNALS)
-        if channel is None:
-            print(f"[AUTOSIG] channel {CH_SIGNALS} not found")
-            return
-        embed = build_setup_embed(ticker, float(price), setup)
-        embed.title = f"🤖 {ticker} Auto Signal"
-        embed.add_field(
-            name="Basis",
-            value=f"Regime {regime} · RVWAP bias {bias} · 7d RS rotation",
-            inline=False,
-        )
-        msg = await channel.send(embed=embed)
-        log_setup(setup, ticker, token_id, msg, source="auto")
-        posted += 1
-    print(f"[AUTOSIG] {regime}: {len(candidates)} candidates → {posted} signal(s)")
+        if await _emit_auto_signal(ticker, token_id, "crypto", float(price), setup,
+                                   f"Regime {regime} · RVWAP bias {bias} · 7d RS rotation"):
+            posted += 1
+    wl_posted = await _scan_watchlist()
+    print(f"[AUTOSIG] {regime}: {len(candidates)} crypto candidates → {posted} · "
+          f"watchlist → {wl_posted} signal(s)")
 
 
 # =============================================================================
@@ -1268,11 +1470,13 @@ def init_setups() -> None:
         print(f"[TRACK] WARNING: could not load setups ({type(e).__name__}: {e}) — starting fresh.")
 
 
-def log_setup(setup: dict, ticker: str, coingecko_id: str, message, source: str = "manual") -> None:
+def log_setup(setup: dict, ticker: str, coingecko_id: str, message, source: str = "manual",
+              asset_class: str = "crypto") -> None:
     """Record a LONG/SHORT setup for outcome tracking. No-ops on 'no clear setup'
     or unparseable/incoherent levels (the embed still posts; it's just not tracked).
-    source: "manual" (!setup) or "auto" (4h auto-signal scan) — kept per-trade so
-    the public record can report the two engines separately."""
+    source: "manual" (!setup) or "auto" (auto-signal scan) — kept per-trade so the
+    public record can report the two engines separately. asset_class routes outcome
+    resolution to the right bars (crypto 15m vs stock/commodity daily)."""
     direction = str(setup.get("direction") or "NONE").upper()
     if not setup.get("has_setup") or direction not in ("LONG", "SHORT"):
         return
@@ -1290,7 +1494,7 @@ def log_setup(setup: dict, ticker: str, coingecko_id: str, message, source: str 
         "ticker": ticker, "coingecko_id": coingecko_id, "direction": direction,
         "entry_price": entry, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
         "rr_ratio": str(setup.get("rr_ratio", "")), "conviction": str(setup.get("conviction", "")),
-        "source": source,
+        "source": source, "asset_class": asset_class,
         "timestamp": datetime.now(IST).isoformat(),
         "discord_message_id": message.id, "discord_channel_id": message.channel.id,
         "status": "OPEN", "resolution_price": None, "resolved_at": None,
@@ -1300,9 +1504,15 @@ def log_setup(setup: dict, ticker: str, coingecko_id: str, message, source: str 
     print(f"[TRACK] logged {ticker} {direction} entry={_money(entry)} stop={_money(stop)} tp1={_money(tp1)}")
 
 
+def _expiry_hours(setup: dict) -> int:
+    """Per-asset-class no-trigger expiry — crypto 48h, stocks/commodities longer
+    (a daily setup can't resolve inside 48h)."""
+    return ASSET_CFG.get(setup.get("asset_class", "crypto"), ASSET_CFG["crypto"])["expiry_h"]
+
+
 def evaluate_setup(setup: dict, price: float | None):
     """Return (status, label) if an OPEN setup resolved, else None.
-    WIN/LOSS need a price; EXPIRED is purely time-based (48h)."""
+    WIN/LOSS need a price; EXPIRED is purely time-based (per asset class)."""
     if price is not None:
         if setup["direction"] == "LONG":
             if price >= setup["tp1"]:
@@ -1318,7 +1528,7 @@ def evaluate_setup(setup: dict, price: float | None):
         age_h = (datetime.now(IST) - datetime.fromisoformat(setup["timestamp"])).total_seconds() / 3600
     except (TypeError, ValueError):
         age_h = 0
-    if age_h >= SETUP_EXPIRY_HOURS:
+    if age_h >= _expiry_hours(setup):
         return ("EXPIRED", "EXPIRED")
     return None
 
@@ -1415,51 +1625,57 @@ def evaluate_setup_candles(setup: dict, candles: list[dict]):
 
 
 async def track_setups() -> None:
-    """Every 15 min: resolve OPEN setups against 15m candle wicks (one batched
-    historical_bars call for all of them), announce + persist any that hit.
-    Falls back to a spot check for an instrument with no candle data; expiry
-    (48h no-trigger) is evaluated either way."""
+    """Every 15 min: resolve OPEN setups against candle wicks, announce + persist
+    any that hit. Open setups are grouped by asset class so each gets the right
+    bars (crypto 15m, stocks/commodities daily); one batched historical_bars call
+    per class. Spot-check fallback + per-class expiry apply either way."""
     open_setups = [s for s in _SETUPS if s.get("status") == "OPEN"]
     if not open_setups:
         return
-    ids = sorted({s["coingecko_id"] for s in open_setups})
-    oldest = min(_parse_ts(s["timestamp"]) or datetime.now(IST) for s in open_setups)
-    bars = await tn_call_safe("historical_bars", {
-        "instruments": ids, "asset_class": "crypto", "timeframe": "15m",
-        "start": oldest.astimezone(ZoneInfo("UTC")).isoformat(), "align": "outer",
-    })
-    series = (bars or {}).get("data") or {}
     changed = False
+    by_class: dict[str, list[dict]] = {}
     for s in open_setups:
-        candles = series.get(s["coingecko_id"]) or []
-        hit = evaluate_setup_candles(s, candles)
-        if hit:
-            status, label, res_price, resolved_at = hit
-        else:
-            # No wick trigger. Reference price: last candle close, else spot
-            # (fallback covers a historical_bars outage for this instrument).
-            ref = None
-            if candles:
-                try:
-                    ref = float(candles[-1]["close"])
-                except (KeyError, TypeError, ValueError):
-                    ref = None
-            if ref is None:
-                info = await tn_call_safe("basic_market_info", {"token_address": s["coingecko_id"]})
-                ref = (info or {}).get("market_data", {}).get("current_price")
-            outcome = evaluate_setup(s, ref)  # spot-level WIN/LOSS (fallback) + expiry
-            if outcome is None:
-                continue
-            status, label = outcome
-            res_price, resolved_at = ref, datetime.now(IST).isoformat()
-        s["status"] = status
-        s["outcome_label"] = label
-        s["resolution_price"] = res_price
-        s["resolved_at"] = resolved_at
-        s["result_pct"] = _trade_pct(s, res_price)
-        changed = True
-        print(f"[TRACK] {s['ticker']} {s['direction']} → {status} ({label}) at {_money(res_price)}")
-        await _post_resolution(s)
+        by_class.setdefault(s.get("asset_class", "crypto"), []).append(s)
+
+    for asset_class, group in by_class.items():
+        cfg = ASSET_CFG.get(asset_class, ASSET_CFG["crypto"])
+        ids = sorted({s["coingecko_id"] for s in group})
+        oldest = min(_parse_ts(s["timestamp"]) or datetime.now(IST) for s in group)
+        bars = await tn_call_safe("historical_bars", {
+            "instruments": ids, "asset_class": asset_class, "timeframe": cfg["res_tf"],
+            "start": oldest.astimezone(ZoneInfo("UTC")).isoformat(), "align": "outer",
+        })
+        series = (bars or {}).get("data") or {}
+        for s in group:
+            candles = series.get(s["coingecko_id"]) or []
+            hit = evaluate_setup_candles(s, candles)
+            if hit:
+                status, label, res_price, resolved_at = hit
+            else:
+                # No wick trigger. Reference price: last candle close, else spot
+                # (crypto only — basic_market_info doesn't cover stocks/commodities).
+                ref = None
+                if candles:
+                    try:
+                        ref = float(candles[-1]["close"])
+                    except (KeyError, TypeError, ValueError):
+                        ref = None
+                if ref is None and asset_class == "crypto":
+                    info = await tn_call_safe("basic_market_info", {"token_address": s["coingecko_id"]})
+                    ref = (info or {}).get("market_data", {}).get("current_price")
+                outcome = evaluate_setup(s, ref)  # spot-level WIN/LOSS (fallback) + expiry
+                if outcome is None:
+                    continue
+                status, label = outcome
+                res_price, resolved_at = ref, datetime.now(IST).isoformat()
+            s["status"] = status
+            s["outcome_label"] = label
+            s["resolution_price"] = res_price
+            s["resolved_at"] = resolved_at
+            s["result_pct"] = _trade_pct(s, res_price)
+            changed = True
+            print(f"[TRACK] {s['ticker']} {s['direction']} → {status} ({label}) at {_money(res_price)}")
+            await _post_resolution(s)
     if changed:
         _persist_setups()
 
@@ -2002,12 +2218,12 @@ async def trade_setup(ctx: commands.Context, ticker: str = ""):
         await ctx.send("Usage: `!setup BTC` — a ticker (BTC, ETH, SOL…) or a CoinGecko id.")
         return
 
-    token_id = _resolve_token(ticker)
+    asset_class, instrument = classify_asset(ticker)
 
     # Dedupe: an open tracked setup for this asset < 6h old is reused, not
     # re-generated — repeated !setup calls must not stack near-identical
     # trades into the public track record.
-    existing = _find_recent_open(token_id)
+    existing = _find_recent_open(instrument)
     if existing:
         jump = ""
         if ctx.guild:
@@ -2023,24 +2239,24 @@ async def trade_setup(ctx: commands.Context, ticker: str = ""):
 
     status = await ctx.send(f"⏳ Building **{ticker}** setup…")
 
-    # 4h timeframe: signals and ATR-sized levels that fit the 48h tracking window.
+    # Router: crypto = 4h TN TA; stocks/commodities = daily bars → local indicators.
     now_ts = datetime.now(IST).timestamp()
-    info, ta, derivs, unlock = await asyncio.gather(
-        tn_call_safe("basic_market_info", {"token_address": token_id}),
-        tn_call_safe("technical_analysis", {"token_address": token_id, "timeframe": "4h"}),
-        tn_call_safe("derivatives_analysis", {"token_address": token_id}),
+    g, unlock = await asyncio.gather(
+        gather_setup_inputs(ticker),
         tn_call_safe("token_unlock", {
-            "token_address": token_id,
+            "token_address": instrument,
             "event_after_timestamp": int(now_ts),
             "event_before_timestamp": int(now_ts) + UNLOCK_WARN_DAYS * 86400,
-        }),
+        }) if asset_class == "crypto" else _none_coro(),
     )
+    info, ta, derivs = g["info"], g["ta"], g["derivs"]
     price = (info or {}).get("market_data", {}).get("current_price")
     if price is None:
-        await status.edit(content=(
-            f"⚠️ Couldn't find market data for `{ticker}`. "
-            f"Try `BTC`/`ETH`/`SOL`, or a CoinGecko id (e.g. `!setup bitcoin`)."
-        ))
+        hint = ("Try `BTC`/`ETH`/`SOL`, or a CoinGecko id (e.g. `!setup bitcoin`)."
+                if asset_class == "crypto" else
+                f"No daily data for `{ticker}` as a {asset_class}. Check the symbol "
+                f"(stocks like `NVDA`, commodities like `GOLD`/`OIL`).")
+        await status.edit(content=f"⚠️ Couldn't find market data for `{ticker}`. {hint}")
         return
 
     try:
@@ -2052,13 +2268,15 @@ async def trade_setup(ctx: commands.Context, ticker: str = ""):
         return
 
     embed = build_setup_embed(ticker, float(price), setup)
+    if asset_class != "crypto":
+        embed.set_footer(text=f"{asset_class} · daily · " + FOOTER + " · not financial advice")
     # Unlock cliff inside the tracking horizon is a risk flag, never a signal —
     # it must not touch the deterministic score (mirrored in TN app memory).
     warn = _unlock_warning(unlock, now_ts)
     if warn:
         embed.add_field(name="⚠️ Unlock risk", value=warn[:200], inline=False)
     await status.edit(content=None, embed=embed)
-    log_setup(setup, ticker, token_id, status)  # track LONG/SHORT outcomes (no-ops otherwise)
+    log_setup(setup, ticker, instrument, status, asset_class=asset_class)
 
 
 @bot.command(name="scan")
