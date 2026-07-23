@@ -40,6 +40,7 @@ from __future__ import annotations
 import os
 import re
 import json
+import hmac
 import asyncio
 import traceback
 from datetime import datetime, timedelta
@@ -143,6 +144,9 @@ REGIME_PATH = os.path.join(CACHE_PATH, "last_regime.json")
 WATCHLIST_PATH = os.path.join(CACHE_PATH, "watchlist.json")
 SETUP_EXPIRY_HOURS = 48
 WATCHLIST_MAX = 25   # cap the user watchlist so the 4h scan can't balloon
+# Shared secret for the dashboard's watchlist write API (POST /api/watchlist).
+# Unset ⇒ the write endpoint is disabled (read + Discord !watch still work).
+WATCHLIST_SECRET = os.environ.get("WATCHLIST_SECRET", "").strip()
 
 # --- Embed colors ---
 COLOR_RISK   = 0xFFAA00
@@ -2245,12 +2249,30 @@ async def build_cross_asset_map() -> dict:
 
 
 async def refresh_dashboard_cache() -> None:
-    """Recompute the cross-asset map into the cache (every 15 min). Best-effort."""
+    """Recompute the cross-asset map + trending tickers into the cache (every
+    15 min). Best-effort."""
     try:
         _DASH_CACHE["crossasset"] = await build_cross_asset_map()
-        print(f"[DASH] cross-asset map refreshed ({len((_DASH_CACHE['crossasset'] or {}).get('tiles', []))} tiles)")
+        sc = await tn_call_safe("performance_scanner",
+                                {"universe_size": 30, "top_n": 30, "lookback_days": 7})
+        _DASH_CACHE["scanner_tickers"] = [
+            _clean_ticker(r.get("ticker") or r.get("token"))
+            for r in (sc or {}).get("leaderboard") or [] if (r.get("ticker") or r.get("token"))
+        ]
+        print(f"[DASH] cache refreshed ({len((_DASH_CACHE['crossasset'] or {}).get('tiles', []))} tiles, "
+              f"{len(_DASH_CACHE.get('scanner_tickers') or [])} trending)")
     except Exception as e:
-        print(f"[DASH] map refresh failed: {type(e).__name__}: {e}")
+        print(f"[DASH] cache refresh failed: {type(e).__name__}: {e}")
+
+
+def _watchlist_candidates() -> list[str]:
+    """Tickers offered in the dashboard's add-search: known majors + commodities
+    + current scanner movers. The client filters this list as you type."""
+    cands = set(TICKER_TO_ID.keys())
+    cands |= COMMODITY_ALIASES
+    cands |= set(CROSS_ASSET_STOCKS)
+    cands |= {t for t in (_DASH_CACHE.get("scanner_tickers") or []) if t}
+    return sorted(cands)
 
 
 def build_live_payload() -> dict:
@@ -2316,6 +2338,60 @@ async def _handle_live(_request: web.Request) -> web.Response:
     })
 
 
+_WL_CORS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, X-Watchlist-Secret",
+    "Access-Control-Max-Age": "86400",
+}
+
+
+async def _handle_watchlist_options(_request: web.Request) -> web.Response:
+    return web.Response(status=204, headers=_WL_CORS)
+
+
+async def _handle_watchlist_get(_request: web.Request) -> web.Response:
+    """Public read: current watched tickers + the add-search candidate list."""
+    return web.json_response({
+        "current": list(_WATCHLIST),
+        "candidates": _watchlist_candidates(),
+        "max": WATCHLIST_MAX,
+        "write_enabled": bool(WATCHLIST_SECRET),
+    }, headers={**_WL_CORS, "Cache-Control": "no-store"})
+
+
+async def _handle_watchlist_post(request: web.Request) -> web.Response:
+    """Secret-gated add/remove from the dashboard. Body: {action, tickers[]}.
+    The secret is compared in constant time; unset ⇒ the endpoint is disabled."""
+    if not WATCHLIST_SECRET:
+        return web.json_response({"error": "watchlist writes disabled"}, status=403, headers=_WL_CORS)
+    supplied = request.headers.get("X-Watchlist-Secret", "")
+    if not hmac.compare_digest(supplied, WATCHLIST_SECRET):
+        return web.json_response({"error": "unauthorized"}, status=401, headers=_WL_CORS)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "bad json"}, status=400, headers=_WL_CORS)
+    action = str(body.get("action") or "").lower()
+    raw = body.get("tickers") if isinstance(body.get("tickers"), list) else [body.get("ticker")]
+    tickers = [str(t).strip().upper() for t in raw if t]
+    tickers = [t for t in tickers if re.match(r"^[A-Z0-9\-]{1,24}$", t)]
+    if action not in ("add", "remove") or not tickers or len(tickers) > WATCHLIST_MAX:
+        return web.json_response({"error": "invalid request"}, status=400, headers=_WL_CORS)
+    changed = False
+    for t in tickers:
+        if action == "add" and t not in _WATCHLIST and len(_WATCHLIST) < WATCHLIST_MAX:
+            _WATCHLIST.append(t)
+            changed = True
+        elif action == "remove" and t in _WATCHLIST:
+            _WATCHLIST.remove(t)
+            changed = True
+    if changed:
+        _persist_watchlist()
+        print(f"[WATCH] dashboard {action}: {tickers} → {_WATCHLIST}")
+    return web.json_response({"current": list(_WATCHLIST), "max": WATCHLIST_MAX}, headers=_WL_CORS)
+
+
 async def start_webhook_server() -> None:
     """Bring up the aiohttp server on $PORT. Idempotent."""
     global _web_runner
@@ -2325,6 +2401,9 @@ async def start_webhook_server() -> None:
     app.router.add_get("/healthz", _handle_healthz)
     app.router.add_get("/api/track-record", _handle_track_record)
     app.router.add_get("/api/live", _handle_live)
+    app.router.add_get("/api/watchlist", _handle_watchlist_get)
+    app.router.add_post("/api/watchlist", _handle_watchlist_post)
+    app.router.add_route("OPTIONS", "/api/watchlist", _handle_watchlist_options)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)

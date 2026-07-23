@@ -2386,3 +2386,71 @@ def test_eval_watchlist_crypto_fetches_daily_bars_for_rvwap(monkeypatch):
     assert posted is True
     assert ("historical_bars", "crypto", "1d") in calls   # fetched daily bars for RVWAP
     assert bot._SETUPS[0]["ticker"] == "BTC" and bot._SETUPS[0]["source"] == "auto"
+
+
+# --- dashboard watchlist write API ------------------------------------------
+
+class _FakeReq:
+    def __init__(self, headers=None, body=None):
+        self.headers = headers or {}
+        self._body = body
+    async def json(self):
+        if self._body is None:
+            raise ValueError("no body")
+        return self._body
+
+
+def test_watchlist_get_returns_current_and_candidates(monkeypatch):
+    import asyncio, json as _json
+    monkeypatch.setattr(bot, "_WATCHLIST", ["SUI"])
+    monkeypatch.setattr(bot, "WATCHLIST_SECRET", "s3cret")
+    monkeypatch.setattr(bot, "_DASH_CACHE", {"scanner_tickers": ["WIF", "PEPE"]})
+    resp = asyncio.run(bot._handle_watchlist_get(_FakeReq()))
+    body = _json.loads(resp.body)
+    assert body["current"] == ["SUI"] and body["write_enabled"] is True
+    assert "BTC" in body["candidates"] and "WIF" in body["candidates"] and "GOLD" in body["candidates"]
+
+
+def test_watchlist_post_requires_secret(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "_WATCHLIST", [])
+    monkeypatch.setattr(bot, "WATCHLIST_SECRET", "s3cret")
+    # missing/wrong secret → 401
+    r = asyncio.run(bot._handle_watchlist_post(_FakeReq(headers={"X-Watchlist-Secret": "nope"},
+                                                        body={"action": "add", "tickers": ["SUI"]})))
+    assert r.status == 401 and bot._WATCHLIST == []
+
+
+def test_watchlist_post_disabled_without_secret(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "WATCHLIST_SECRET", "")
+    r = asyncio.run(bot._handle_watchlist_post(_FakeReq(headers={}, body={"action": "add", "tickers": ["SUI"]})))
+    assert r.status == 403
+
+
+def test_watchlist_post_add_and_remove(tmp_path, monkeypatch):
+    import asyncio, json as _json
+    monkeypatch.setattr(bot, "CACHE_PATH", str(tmp_path))
+    monkeypatch.setattr(bot, "WATCHLIST_PATH", str(tmp_path / "watchlist.json"))
+    monkeypatch.setattr(bot, "_WATCHLIST", [])
+    monkeypatch.setattr(bot, "WATCHLIST_SECRET", "s3cret")
+    hdr = {"X-Watchlist-Secret": "s3cret"}
+    r = asyncio.run(bot._handle_watchlist_post(_FakeReq(headers=hdr,
+                    body={"action": "add", "tickers": ["sui", "arb"]})))  # lowercase → normalized
+    assert r.status == 200 and _json.loads(r.body)["current"] == ["SUI", "ARB"]
+    r = asyncio.run(bot._handle_watchlist_post(_FakeReq(headers=hdr,
+                    body={"action": "remove", "tickers": ["SUI"]})))
+    assert _json.loads(r.body)["current"] == ["ARB"]
+    assert _json.loads((tmp_path / "watchlist.json").read_text())["tickers"] == ["ARB"]
+
+
+def test_watchlist_post_rejects_bad_input(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "_WATCHLIST", [])
+    monkeypatch.setattr(bot, "WATCHLIST_SECRET", "s3cret")
+    hdr = {"X-Watchlist-Secret": "s3cret"}
+    for body in ({"action": "nuke", "tickers": ["SUI"]}, {"action": "add", "tickers": []},
+                 {"action": "add", "tickers": ["bad ticker!"]}):
+        r = asyncio.run(bot._handle_watchlist_post(_FakeReq(headers=hdr, body=body)))
+        assert r.status == 400
+    assert bot._WATCHLIST == []
