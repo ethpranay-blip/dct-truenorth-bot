@@ -2454,3 +2454,76 @@ def test_watchlist_post_rejects_bad_input(monkeypatch):
         r = asyncio.run(bot._handle_watchlist_post(_FakeReq(headers=hdr, body=body)))
         assert r.status == 400
     assert bot._WATCHLIST == []
+
+
+# --- on-demand setup search API (GET /api/setup) ----------------------------
+
+class _SetupReq:
+    def __init__(self, ticker=None):
+        self.query = {"ticker": ticker} if ticker is not None else {}
+
+
+def _patch_setup_engine(monkeypatch, *, ta=None, price=100.0, bars=None):
+    """Stub gather_setup_inputs + tn_call_safe so compute_setup_for runs offline."""
+    ta = ta or _ta_strong_4h(price=price)
+
+    async def fake_gather(ticker):
+        ac, inst = bot.classify_asset(ticker)
+        return {"asset_class": ac, "instrument": inst, "timeframe": "4h" if ac == "crypto" else "1d",
+                "info": {"market_data": {"current_price": price}}, "ta": ta,
+                "derivs": None, "bars": bars}
+
+    async def fake_call(tool, args, **kw):
+        if tool == "historical_bars":
+            return {"data": {args["instruments"][0]: bars or _ramp_bars(step=1.0)}}
+        return None
+
+    monkeypatch.setattr(bot, "gather_setup_inputs", fake_gather)
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+
+
+def test_compute_setup_for_full_read(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "_LAST_REGIME", {"regime": "RISK-ON"})
+    up = _ramp_bars(step=1.0)
+    price = float(up[-1]["close"])   # price consistent with the bars → above the VWAPs
+    _patch_setup_engine(monkeypatch, price=price, ta=_ta_strong_4h(price=price), bars=up)
+    r = asyncio.run(bot.compute_setup_for("BTC"))
+    assert r["ticker"] == "BTC" and r["asset_class"] == "crypto"
+    assert r["has_setup"] and r["direction"] == "LONG" and r["conviction"] == "High"
+    assert r["rvwap_bias"] == "LONG" and r["regime"] == "RISK-ON"
+    assert r["gate_cleared"] is True         # score≥4 + bias==dir + (regime shown)
+    assert "reasoning" in r and r["take_profit_1"] and r["rr_ratio"] == "2.5 (TP1) / 4.0 (TP2)"
+
+
+def test_setup_endpoint_validates_and_caches(monkeypatch):
+    import asyncio, json as _json
+    monkeypatch.setattr(bot, "_LAST_REGIME", {"regime": "RISK-ON"})
+    monkeypatch.setattr(bot, "_SETUP_CACHE", {})
+    monkeypatch.setattr(bot, "_SETUP_REQ_TIMES", [])
+    _patch_setup_engine(monkeypatch, bars=_ramp_bars(step=1.0))
+    calls = {"n": 0}
+    orig = bot.compute_setup_for
+
+    async def counting(t):
+        calls["n"] += 1
+        return await orig(t)
+    monkeypatch.setattr(bot, "compute_setup_for", counting)
+
+    bad = asyncio.run(bot._handle_setup(_SetupReq("bad ticker!")))
+    assert bad.status == 400
+    r1 = asyncio.run(bot._handle_setup(_SetupReq("BTC")))
+    r2 = asyncio.run(bot._handle_setup(_SetupReq("BTC")))   # served from cache
+    assert r1.status == 200 and r2.status == 200
+    assert calls["n"] == 1                                   # second hit didn't recompute
+    assert _json.loads(r1.body)["direction"] == "LONG"
+
+
+def test_setup_endpoint_rate_limits(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "_SETUP_CACHE", {})
+    monkeypatch.setattr(bot, "_SETUP_REQ_TIMES", [bot.time.monotonic()] * bot._SETUP_RATE_LIMIT)
+    monkeypatch.setattr(bot, "_LAST_REGIME", {"regime": "RISK-ON"})
+    _patch_setup_engine(monkeypatch)
+    r = asyncio.run(bot._handle_setup(_SetupReq("ETH")))     # window full → 429
+    assert r.status == 429

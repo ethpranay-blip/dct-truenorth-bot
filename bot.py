@@ -40,6 +40,7 @@ from __future__ import annotations
 import os
 import re
 import json
+import time
 import hmac
 import asyncio
 import traceback
@@ -2346,6 +2347,77 @@ _WL_CORS = {
 }
 
 
+# On-demand setup search (GET /api/setup?ticker=X) — the !setup engine over HTTP.
+# Public + does real compute per call, so: 90s per-ticker cache + a global rate
+# limit blunt abuse without needing auth on a read.
+_SETUP_CACHE: dict = {}          # ticker → (payload, monotonic_ts)
+_SETUP_CACHE_TTL = 90.0
+_SETUP_REQ_TIMES: list = []      # monotonic timestamps of recent computes
+_SETUP_RATE_LIMIT = 30           # max fresh computes per 60s window
+
+
+async def compute_setup_for(ticker: str) -> dict:
+    """Full setup read for one ticker against our pre-set conditions — the same
+    build_rule_setup the bot/!setup use, plus the RVWAP structural bias and the
+    current regime, so the dashboard shows the complete directional picture.
+    Cross-asset: crypto scores on 4h TA, stocks/commodities on the daily."""
+    asset_class, instrument = classify_asset(ticker)
+    g = await gather_setup_inputs(ticker)
+    price = ((g.get("info") or {}).get("market_data") or {}).get("current_price")
+    if price is None or g.get("ta") is None:
+        return {"ticker": ticker.upper(), "asset_class": asset_class, "error": "no market data"}
+    bars = g.get("bars")
+    if bars is None:  # crypto: gather returns 4h TA but no bars — fetch daily for RVWAP
+        start = (datetime.now(IST) - timedelta(days=RVWAP_WINDOWS[-1] + 5)).astimezone(ZoneInfo("UTC")).isoformat()
+        raw = await tn_call_safe("historical_bars",
+                                 {"instruments": [instrument], "asset_class": "crypto",
+                                  "timeframe": "1d", "start": start})
+        bars = ((raw or {}).get("data") or {}).get(instrument) or []
+    bias = rvwap_bias(price, compute_rvwaps(bars))
+    setup = build_rule_setup(ticker, g["info"], g["ta"], g.get("derivs"))  # 2.5R/4R, dir at |score|≥2.5
+    score, _b, _be = _setup_score(g["ta"])
+    regime = _LAST_REGIME.get("regime", "UNKNOWN")
+    gate_cleared = bool(setup.get("has_setup")) and abs(score) >= SETUP_SCORE_HIGH and setup["direction"] == bias
+    return {
+        "ticker": ticker.upper(),
+        "asset_class": asset_class,
+        "timeframe": g["timeframe"],
+        "price": price,
+        "score": round(score, 1),
+        "rvwap_bias": bias,
+        "regime": regime,
+        "gate_cleared": gate_cleared,   # would this also fire as an auto-signal?
+        **{k: setup.get(k) for k in ("has_setup", "direction", "conviction", "entry_zone",
+                                     "stop_loss", "take_profit_1", "take_profit_2",
+                                     "rr_ratio", "reasoning")},
+    }
+
+
+async def _handle_setup(request: web.Request) -> web.Response:
+    ticker = (request.query.get("ticker") or "").strip().upper()
+    hdr = {"Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=60"}
+    if not ticker or not re.match(r"^[A-Z0-9\-]{1,24}$", ticker):
+        return web.json_response({"error": "pass ?ticker=BTC (a ticker or CoinGecko id)"},
+                                 status=400, headers=hdr)
+    now = time.monotonic()
+    hit = _SETUP_CACHE.get(ticker)
+    if hit and now - hit[1] < _SETUP_CACHE_TTL:
+        return web.json_response(hit[0], headers=hdr)
+    # Rate limit only fresh (uncached) computes.
+    _SETUP_REQ_TIMES[:] = [t for t in _SETUP_REQ_TIMES if now - t < 60]
+    if len(_SETUP_REQ_TIMES) >= _SETUP_RATE_LIMIT:
+        return web.json_response({"error": "busy — try again shortly"}, status=429, headers=hdr)
+    _SETUP_REQ_TIMES.append(now)
+    try:
+        payload = await compute_setup_for(ticker)
+    except Exception as e:
+        print(f"[SETUP-API] {ticker} failed: {type(e).__name__}: {e}")
+        return web.json_response({"ticker": ticker, "error": "setup generation failed"},
+                                 status=500, headers=hdr)
+    _SETUP_CACHE[ticker] = (payload, now)
+    return web.json_response(payload, headers=hdr)
+
+
 async def _handle_watchlist_options(_request: web.Request) -> web.Response:
     return web.Response(status=204, headers=_WL_CORS)
 
@@ -2404,6 +2476,7 @@ async def start_webhook_server() -> None:
     app.router.add_get("/api/watchlist", _handle_watchlist_get)
     app.router.add_post("/api/watchlist", _handle_watchlist_post)
     app.router.add_route("OPTIONS", "/api/watchlist", _handle_watchlist_options)
+    app.router.add_get("/api/setup", _handle_setup)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
