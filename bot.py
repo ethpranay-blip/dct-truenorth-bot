@@ -2176,6 +2176,14 @@ CROSS_ASSET_STOCKS = ["NVDA", "AAPL", "TSLA"]
 CROSS_ASSET_COMMOD = [("GOLD", "gold"), ("OIL", "oil")]
 CROSS_ASSET_INDICES = {"gspc": "SPX", "ndx": "NDX", "dxy": "DXY", "tnx": "US10Y", "vix": "VIX"}
 
+# Stocks screener (dashboard section): curated list, benchmarked vs QQQ (the
+# Nasdaq-100 ETF — the only NDX history reachable keyless). Env-overridable.
+STOCKS_SCREENER = [
+    t.strip().upper() for t in os.environ.get(
+        "STOCKS_SCREENER", "NVDA,AAPL,TSLA,AMD,ASML,AVGO,AMZN,BABA,BX").split(",") if t.strip()
+]
+STOCKS_BENCHMARK = "QQQ"
+
 # Cached dashboard snapshot (refreshed every 15 min by refresh_dashboard_cache).
 _DASH_CACHE: dict = {"crossasset": None, "brief": None}
 
@@ -2249,11 +2257,56 @@ async def build_cross_asset_map() -> dict:
     return {"tiles": tiles, "lead": lead, "at": datetime.now(IST).isoformat()}
 
 
+async def build_stocks_screener() -> list[dict]:
+    """Stocks screener rows for the dashboard: one batched daily-bars call for
+    the curated list + QQQ benchmark → price, 24h/30d %, 30d RS vs Nasdaq-100,
+    RVWAP structural bias, daily signal score, and a 30-close spark. 30d uses
+    21 trading bars (~one month of sessions)."""
+    start = (datetime.now(IST) - timedelta(days=380)).astimezone(ZoneInfo("UTC")).isoformat()
+    raw = await tn_call_safe("historical_bars", {
+        "instruments": STOCKS_SCREENER + [STOCKS_BENCHMARK],
+        "asset_class": "stock", "timeframe": "1d", "start": start,
+    })
+    data = (raw or {}).get("data") or {}
+    bench30 = _pct_change(data.get(STOCKS_BENCHMARK) or [], 21)
+    rows = []
+    for sym in STOCKS_SCREENER:
+        bars = sorted(data.get(sym) or [], key=lambda c: c.get("t") or "")
+        if len(bars) < 25:
+            continue
+        try:
+            price = float(bars[-1]["close"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        ta = compute_indicators_from_bars(bars)
+        score, _b, _be = _setup_score(ta) if ta else (None, [], [])
+        chg30 = _pct_change(bars, 21)
+        spark = []
+        for c in bars[-30:]:
+            try:
+                spark.append(float(c["close"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        rows.append({
+            "ticker": sym,
+            "price": price,
+            "chg1d": _pct_change(bars, 1),
+            "chg30d": chg30,
+            "rs30d": (chg30 - bench30) if (chg30 is not None and bench30 is not None) else None,
+            "rvwap_bias": rvwap_bias(price, compute_rvwaps(bars)),
+            "score": round(score, 1) if score is not None else None,
+            "spark": spark,
+        })
+    rows.sort(key=lambda r: r["rs30d"] if r["rs30d"] is not None else -999, reverse=True)
+    return rows
+
+
 async def refresh_dashboard_cache() -> None:
     """Recompute the cross-asset map + trending tickers into the cache (every
     15 min). Best-effort."""
     try:
         _DASH_CACHE["crossasset"] = await build_cross_asset_map()
+        _DASH_CACHE["stocks"] = await build_stocks_screener()
         sc = await tn_call_safe("performance_scanner",
                                 {"universe_size": 30, "top_n": 30, "lookback_days": 7})
         _DASH_CACHE["scanner_tickers"] = [
@@ -2299,6 +2352,7 @@ def build_live_payload() -> dict:
         "open_setups": open_setups,
         "crossasset": _DASH_CACHE.get("crossasset"),
         "brief": _DASH_CACHE.get("brief"),
+        "stocks": _DASH_CACHE.get("stocks"),
     }
 
 

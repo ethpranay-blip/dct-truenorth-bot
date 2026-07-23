@@ -2527,3 +2527,48 @@ def test_setup_endpoint_rate_limits(monkeypatch):
     _patch_setup_engine(monkeypatch)
     r = asyncio.run(bot._handle_setup(_SetupReq("ETH")))     # window full → 429
     assert r.status == 429
+
+
+# --- stocks screener (dashboard /api/live "stocks") --------------------------
+
+def test_build_stocks_screener_rows_and_rs(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "STOCKS_SCREENER", ["NVDA", "TSLA"])
+    up = _ramp_bars(n=60, step=1.0)          # compounding up
+    dn = _ramp_bars(n=60, start=200.0, step=-1.0)
+    flat = [{"t": f"{i:04d}", "open": "100", "high": "100.5", "low": "99.5",
+             "close": "100", "volume": "5"} for i in range(60)]
+
+    async def fake_call(tool, args, **kw):
+        assert tool == "historical_bars" and args["asset_class"] == "stock"
+        assert set(args["instruments"]) == {"NVDA", "TSLA", "QQQ"}
+        return {"data": {"NVDA": up, "TSLA": dn, "QQQ": flat}}
+
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    rows = asyncio.run(bot.build_stocks_screener())
+    assert [r["ticker"] for r in rows] == ["NVDA", "TSLA"]   # sorted by RS desc
+    nvda, tsla = rows
+    # benchmark flat → RS == own 30d change; NVDA up, TSLA down
+    assert nvda["rs30d"] > 0 > tsla["rs30d"]
+    assert nvda["rvwap_bias"] == "LONG" and tsla["rvwap_bias"] == "SHORT"
+    assert nvda["score"] >= 4.0 and tsla["score"] <= -3.0
+    assert len(nvda["spark"]) == 30 and nvda["price"] == float(up[-1]["close"])
+
+
+def test_build_stocks_screener_skips_thin_data(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "STOCKS_SCREENER", ["NVDA", "GHOST"])
+
+    async def fake_call(tool, args, **kw):
+        return {"data": {"NVDA": _ramp_bars(n=60, step=1.0), "GHOST": _ramp_bars(n=5),
+                         "QQQ": _ramp_bars(n=60, step=1.0)}}
+
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    rows = asyncio.run(bot.build_stocks_screener())
+    assert [r["ticker"] for r in rows] == ["NVDA"]           # GHOST: too few bars
+
+
+def test_live_payload_includes_stocks(monkeypatch):
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    monkeypatch.setattr(bot, "_DASH_CACHE", {"stocks": [{"ticker": "NVDA"}]})
+    assert bot.build_live_payload()["stocks"] == [{"ticker": "NVDA"}]

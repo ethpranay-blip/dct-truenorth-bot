@@ -62,6 +62,7 @@ Connect the repo; Railway auto-detects `requirements.txt` + `runtime.txt` + `Pro
 | `CACHE_PATH` | recommended | Mounted volume path for `setups.json` / `last_regime.json` (default `.` = ephemeral) |
 | `CH_OPS` | recommended | Channel for failure alerts (unset → Railway logs only) |
 | `SIGNALS_WATCHLIST` | optional | Comma-separated stock/commodity symbols the auto-signal scan checks each run (default `NVDA,AAPL,TSLA,GOLD,OIL`) — gated by their own RVWAP bias + score ≥ 4.0 |
+| `STOCKS_SCREENER` | optional | Stocks for the dashboard's stocks-vs-Nasdaq screener (default `NVDA,AAPL,TSLA,AMD,ASML,AVGO,AMZN,BABA,BX`), computed every 15 min from daily bars vs QQQ |
 | `CH_SIGNALS` | optional | Auto-signal channel: every 4h (UTC candle close) the scanner's RS leaders/laggards are gated by regime + per-asset RVWAP bias (365d/90d) + high-conviction score (≥ 4.0); qualifying setups post here with 2.5R/4R targets and join the track record tagged `auto`. Unset → the job never runs |
 | `DASHBOARD_URL` | optional | Public dashboard link appended to every brief |
 | `SETUP_ALLOWED_CHANNELS` | optional | Comma-separated channel IDs where `!setup`/`!scan`/`!winrate` work (empty = everywhere) |
