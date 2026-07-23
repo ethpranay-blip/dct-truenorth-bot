@@ -19,6 +19,7 @@ A Discord bot that pipes crypto trading intelligence from **TrueNorth AI** into 
 - **`!setup <ticker>`** — mechanical trade setup: weighted signal score from 4h TA (SMA20/50, MACD, RSI, Bollinger); |score| ≥ 2.5 sets direction, ≥ 4 is High conviction; entry ±0.25 ATR, stop 1.5 ATR, TP1/TP2 at 1.5R/3R. Mixed tape → an honest "No clear setup". Repeat calls within 6 h reuse the open setup instead of double-logging.
 - **Outcome tracking + `!winrate`** — every LONG/SHORT setup is logged and resolved **against 15-minute candle wicks** (not spot checks): first candle through stop → LOSS, through TP1 → WIN, both-in-one-candle → conservative LOSS, 48 h no-trigger → EXPIRED. Resolutions reply to the original setup message; `!winrate` posts the public record (W/L/E, win rate, best/worst, realized R:R).
 - **`!scan [1-25]`** — ANSI-colored top-N by 7-day relative strength vs BTC.
+- **Auto-signals** (optional, `CH_SIGNALS`) — every 4h candle close: RS rotation leaders (longs) / laggards (shorts) aligned with the regime, gated by per-asset rolling-VWAP structural bias (365d + 90d same side) **and** a high-conviction signal score (≥ 4.0 of ±5.5), posted with 2.5R/4R targets and tracked in the same record tagged `auto` (`!winrate` shows a per-engine breakdown once any exist). Most scans post nothing — the triple gate is meant to fire a few times a week.
 - **Typefully auto-drafts** (optional) — a template tweet (hot mover > funding extreme > regime read) lands as a **draft** in Typefully after each brief for human review. Never auto-published.
 - **Dashboard link** — every brief links to the live dashboard (`DASHBOARD_URL`).
 - **Ops** — `!health` diagnostics, `GET /healthz` liveness.
@@ -58,6 +59,7 @@ Connect the repo; Railway auto-detects `requirements.txt` + `runtime.txt` + `Pro
 | `CH_REGIME_OUTLOOK` | ✅ | Regime outlook + shift-alert channel |
 | `CACHE_PATH` | recommended | Mounted volume path for `setups.json` / `last_regime.json` (default `.` = ephemeral) |
 | `CH_OPS` | recommended | Channel for failure alerts (unset → Railway logs only) |
+| `CH_SIGNALS` | optional | Auto-signal channel: every 4h (UTC candle close) the scanner's RS leaders/laggards are gated by regime + per-asset RVWAP bias (365d/90d) + high-conviction score (≥ 4.0); qualifying setups post here with 2.5R/4R targets and join the track record tagged `auto`. Unset → the job never runs |
 | `DASHBOARD_URL` | optional | Public dashboard link appended to every brief |
 | `SETUP_ALLOWED_CHANNELS` | optional | Comma-separated channel IDs where `!setup`/`!scan`/`!winrate` work (empty = everywhere) |
 | `AUTO_DRAFT_ENABLED` | optional | `true` → template tweet drafts to Typefully after briefs |

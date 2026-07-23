@@ -1916,3 +1916,186 @@ def test_unlock_warning_missing_usd_still_warns():
     w = bot._unlock_warning(raw, _UNLOCK_NOW)
     assert w.startswith("unlock in 5d")
     assert "$" not in w
+
+
+# --- auto-signal scan (RVWAP + high-conviction gate → CH_SIGNALS) ------------
+
+def _daily_candles(n=400, close=90.0, volume=1.0):
+    t = bot.datetime.now(bot.ZoneInfo("UTC")).isoformat()
+    return [{"t": t, "open": str(close), "high": str(close), "low": str(close),
+             "close": str(close), "volume": str(volume)} for _ in range(n)]
+
+
+def test_compute_rvwaps_math_and_windows():
+    candles = ([{"close": "10", "volume": "1"}] * 300) + [{"close": "20", "volume": "3"}]
+    rv = bot.compute_rvwaps(candles)
+    # 7d window: 6×10×1 + 1×20×3 → 120/9
+    assert abs(rv[7] - 120 / 9) < 1e-9
+    assert 90 in rv and 365 in rv  # short history → VWAP since listing
+
+
+def test_compute_rvwaps_skips_junk_and_zero_volume():
+    assert bot.compute_rvwaps([{"close": "x", "volume": "1"}]) == {}
+    assert bot.compute_rvwaps([{"close": "10", "volume": "0"}]) == {}
+    assert bot.compute_rvwaps([]) == {}
+
+
+def test_rvwap_bias_rules():
+    assert bot.rvwap_bias(100.0, {90: 95.0, 365: 90.0}) == "LONG"
+    assert bot.rvwap_bias(80.0, {90: 95.0, 365: 90.0}) == "SHORT"
+    assert bot.rvwap_bias(92.0, {90: 95.0, 365: 90.0}) == "MIXED"
+    assert bot.rvwap_bias(100.0, {90: 95.0}) == "MIXED"      # missing window
+    assert bot.rvwap_bias(None, {90: 95.0, 365: 90.0}) == "MIXED"
+
+
+def _ta_strong_4h(price=100.0, atr=4.0):
+    """4h TA that scores the full +5.5 (all bull signals aligned)."""
+    return {"technical_indicators": {
+        "sma20": {"state": "price_above", "value": price * 0.97},
+        "sma50": {"state": "price_above", "value": price * 0.94},
+        "macd_12_26_9": {"state": "bull", "momentum": "rising"},
+        "rsi14": {"value": 62.0, "momentum": "rising"},
+        "boll_20_2": {"mid_relation": "above_mid"},
+        "atr14": {"value": atr},
+    }}
+
+
+def test_build_rule_setup_high_gate_and_custom_tp():
+    info = {"market_data": {"current_price": 100.0}}
+    s = bot.build_rule_setup("X", info, _ta_strong_4h(), None,
+                             min_score=bot.SETUP_SCORE_HIGH, tp_rs=(2.5, 4.0))
+    assert s["has_setup"] and s["direction"] == "LONG" and s["conviction"] == "High"
+    # stop 1.5×ATR = 94, risk 6 → TP1 115 (2.5R), TP2 124 (4R)
+    assert s["stop_loss"] == bot._money(94.0)
+    assert s["take_profit_1"] == bot._money(115.0)
+    assert s["take_profit_2"] == bot._money(124.0)
+    assert s["rr_ratio"] == "2.5 (TP1) / 4.0 (TP2)"
+    assert "2.5R/4R targets" in s["reasoning"]
+
+
+def test_build_rule_setup_min_score_gate_blocks_medium():
+    # Score +2.5 (SMA20 + SMA50 + one half-signal): passes default, fails 4.0 gate
+    ta = {"technical_indicators": {
+        "sma20": {"state": "price_above"}, "sma50": {"state": "price_above"},
+        "macd_12_26_9": {"momentum": "rising"},
+        "atr14": {"value": 4.0},
+    }}
+    info = {"market_data": {"current_price": 100.0}}
+    assert bot.build_rule_setup("X", info, ta, None)["has_setup"]
+    assert not bot.build_rule_setup("X", info, ta, None,
+                                    min_score=bot.SETUP_SCORE_HIGH)["has_setup"]
+
+
+class _StubMsg:
+    def __init__(self):
+        self.id = 111
+
+        class _Ch:
+            id = 222
+        self.channel = _Ch()
+
+
+class _StubChannel:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, embed=None, **kw):
+        self.sent.append(embed)
+        return _StubMsg()
+
+
+def _auto_scan_fake_call(scanner_rows, candle_close=90.0, price=100.0):
+    async def fake_call(tool, args, **kw):
+        if tool == "technical_analysis" and args.get("timeframe") == "1d":
+            return _ta_full(price_rel="price_above", rsi=60.0)   # regime: above MAs
+        if tool == "derivatives_analysis":
+            return _derivs_full(funding=0.003)                   # funding positive
+        if tool == "market_index_price":
+            return {"prices": [{"index": "vix", "latest": {"close": 15.0}}]}
+        if tool == "performance_scanner":
+            return {"leaderboard": scanner_rows}
+        if tool == "basic_market_info":
+            return {"market_data": {"current_price": price}}
+        if tool == "technical_analysis":                          # 4h
+            return _ta_strong_4h(price=price)
+        if tool == "historical_bars":
+            return {"data": {args["instruments"][0]: _daily_candles(close=candle_close)}}
+        return None
+    return fake_call
+
+
+def test_auto_signal_scan_posts_aligned_high_conviction(tmp_path, monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "CACHE_PATH", str(tmp_path))
+    monkeypatch.setattr(bot, "SETUPS_PATH", str(tmp_path / "setups.json"))
+    monkeypatch.setattr(bot, "CH_SIGNALS", 999)
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    ch = _StubChannel()
+    monkeypatch.setattr(bot.bot, "get_channel", lambda _id: ch)
+    monkeypatch.setattr(bot, "tn_call_safe",
+                        _auto_scan_fake_call([{"ticker": "SOLUSDT", "rsVsBenchmark": 12.0}]))
+    asyncio.run(bot.auto_signal_scan())
+    assert len(ch.sent) == 1
+    embed = ch.sent[0]
+    assert embed.title == "🤖 SOL Auto Signal"
+    assert any(f.name == "Basis" and "RISK-ON" in f.value for f in embed.fields)
+    assert len(bot._SETUPS) == 1
+    s = bot._SETUPS[0]
+    assert s["source"] == "auto" and s["direction"] == "LONG"
+    # entry mid 100, stop 94 → 2.5R TP1 at 115
+    assert s["tp1"] == 115.0
+
+
+def test_auto_signal_scan_respects_rvwap_misalignment(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "CH_SIGNALS", 999)
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    ch = _StubChannel()
+    monkeypatch.setattr(bot.bot, "get_channel", lambda _id: ch)
+    # candles close ABOVE price → structural bias SHORT, score says LONG → no post
+    monkeypatch.setattr(bot, "tn_call_safe",
+                        _auto_scan_fake_call([{"ticker": "SOLUSDT"}], candle_close=110.0))
+    asyncio.run(bot.auto_signal_scan())
+    assert ch.sent == [] and bot._SETUPS == []
+
+
+def test_auto_signal_scan_dedupes_open_setup(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "CH_SIGNALS", 999)
+    monkeypatch.setattr(bot, "_SETUPS", [{
+        "ticker": "SOL", "coingecko_id": "solana", "direction": "LONG",
+        "status": "OPEN", "timestamp": bot.datetime.now(bot.IST).isoformat(),
+    }])
+    ch = _StubChannel()
+    monkeypatch.setattr(bot.bot, "get_channel", lambda _id: ch)
+    monkeypatch.setattr(bot, "tn_call_safe",
+                        _auto_scan_fake_call([{"ticker": "SOLUSDT"}]))
+    asyncio.run(bot.auto_signal_scan())
+    assert ch.sent == []
+
+
+def test_auto_signal_scan_disabled_without_channel(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "CH_SIGNALS", None)
+    calls = []
+
+    async def fake_call(tool, args, **kw):
+        calls.append(tool)
+        return None
+
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    asyncio.run(bot.auto_signal_scan())
+    assert calls == []  # no channel → zero API traffic
+
+
+def test_winrate_auto_breakdown_line():
+    setups = [
+        {"status": "WIN", "source": "auto", "entry_price": 100.0, "stop_loss": 94.0,
+         "resolution_price": 115.0, "result_pct": 15.0},
+        {"status": "LOSS", "source": "manual", "entry_price": 100.0, "stop_loss": 94.0,
+         "resolution_price": 94.0, "result_pct": -6.0},
+    ]
+    stats = bot.compute_winrate(setups)
+    assert stats["auto_line"] == "manual 0W/1L · auto 1W/0L"
+    # no autos → no line, embed unchanged
+    assert bot.compute_winrate([s for s in setups if s["source"] != "auto"])["auto_line"] is None

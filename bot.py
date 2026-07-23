@@ -42,7 +42,7 @@ import re
 import json
 import asyncio
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import discord
@@ -71,6 +71,9 @@ CH = {
 # Optional ops channel for failure alerts. Unset → alerts go to logs only
 # (the community channels never see plumbing noise).
 CH_OPS = int(os.environ["CH_OPS"]) if os.environ.get("CH_OPS", "").strip() else None
+
+# Optional auto-signal channel. Unset → the 4h auto-signal scan never runs.
+CH_SIGNALS = int(os.environ["CH_SIGNALS"]) if os.environ.get("CH_SIGNALS", "").strip() else None
 
 # Public dashboard with top setups + screener. When set, every brief links to it.
 DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "").strip()
@@ -622,13 +625,16 @@ NO_SETUP = {
 }
 
 
-def build_rule_setup(ticker: str, info: dict | None, ta: dict | None, derivs: dict | None) -> dict:
+def build_rule_setup(ticker: str, info: dict | None, ta: dict | None, derivs: dict | None,
+                     min_score: float = SETUP_SCORE_MIN,
+                     tp_rs: tuple[float, float] = (1.5, 3.0)) -> dict:
     """Deterministic trade setup from TN data — ATR-based levels, no LLM.
 
     Same output shape the Claude generator produced, so the embed builder and
     outcome tracking are untouched. Direction requires multi-signal alignment
-    (|score| ≥ 2.5 of ±5.5 possible); levels are ATR-derived and coherent by
-    construction: stop 1.5×ATR from entry, TP1/TP2 at 1.5R/3R.
+    (|score| ≥ min_score of ±5.5 possible); levels are ATR-derived and coherent
+    by construction: stop 1.5×ATR from entry, TP1/TP2 at tp_rs R-multiples
+    (defaults 1.5R/3R for !setup; the auto-signal scan passes 2.5R/4R).
     """
     price = ((info or {}).get("market_data") or {}).get("current_price")
     atr = (_ind(ta).get("atr14") or {}).get("value")
@@ -638,23 +644,24 @@ def build_rule_setup(ticker: str, info: dict | None, ta: dict | None, derivs: di
 
     if price is None or atr is None or not atr > 0:
         return {**NO_SETUP, "reasoning": "No clear setup — price/ATR data unavailable."}
-    if abs(score) < SETUP_SCORE_MIN:
+    if abs(score) < min_score:
         detail = ", ".join((bull + bear)[:3]) or "signals flat"
         return {**NO_SETUP,
                 "reasoning": f"No clear setup — ranging/choppy conditions (signal score {score:+.1f}: {detail})."}
 
+    tp1_r, tp2_r = tp_rs
     direction = "LONG" if score > 0 else "SHORT"
     sign = 1 if direction == "LONG" else -1
     entry_lo, entry_hi = price - 0.25 * atr, price + 0.25 * atr
     stop = price - sign * 1.5 * atr
     risk = abs(price - stop)
-    tp1 = price + sign * 1.5 * risk
-    tp2 = price + sign * 3.0 * risk
+    tp1 = price + sign * tp1_r * risk
+    tp2 = price + sign * tp2_r * risk
     signals = bull if direction == "LONG" else bear
     reasoning = f"{'Bullish' if sign > 0 else 'Bearish'} alignment (score {score:+.1f}): " + ", ".join(signals[:4])
     if fund_note:
         reasoning += f"; {fund_note}"
-    reasoning += ". Levels are 1.5×ATR risk with 1.5R/3R targets."
+    reasoning += f". Levels are 1.5×ATR risk with {tp1_r:g}R/{tp2_r:g}R targets."
     return {
         "has_setup": True,
         "direction": direction,
@@ -662,7 +669,7 @@ def build_rule_setup(ticker: str, info: dict | None, ta: dict | None, derivs: di
         "stop_loss": _money(stop),
         "take_profit_1": _money(tp1),
         "take_profit_2": _money(tp2),
-        "rr_ratio": "1.5 (TP1) / 3.0 (TP2)",
+        "rr_ratio": f"{tp1_r} (TP1) / {tp2_r} (TP2)",
         "conviction": "High" if abs(score) >= SETUP_SCORE_HIGH else "Medium",
         "reasoning": reasoning,
     }
@@ -704,6 +711,120 @@ def _unlock_warning(unlock: dict | None, now_ts: float) -> str | None:
 def _setup_channel_allowed(channel_id: int) -> bool:
     """Gate !setup by SETUP_ALLOWED_CHANNELS; empty set ⇒ allowed everywhere."""
     return not SETUP_ALLOWED_CHANNELS or channel_id in SETUP_ALLOWED_CHANNELS
+
+
+# =============================================================================
+# Auto-signal scan — the !setup engine run unattended on a 4h cron
+# =============================================================================
+# Pipeline (mirrors the strategy stored in the TN app's agent memory — keep the
+# two in sync): regime read → RS rotation candidates aligned with regime →
+# per-asset RVWAP structural bias (365d/90d rolling VWAP) → 4h signal score
+# gated at SETUP_SCORE_HIGH → 2.5R/4R levels → post to CH_SIGNALS + track.
+
+AUTO_SIGNAL_UNIVERSE = 15     # scanner universe size (ranked, full list returned)
+AUTO_SIGNAL_PER_SIDE = 3      # leaders considered for longs / laggards for shorts
+AUTO_TP_RS = (2.5, 4.0)       # min 1:2.5 R:R — Pranay's spec, vs !setup's 1.5R/3R
+RVWAP_WINDOWS = (7, 30, 90, 365)
+
+
+def compute_rvwaps(candles: list[dict], windows: tuple = RVWAP_WINDOWS) -> dict[int, float]:
+    """Rolling VWAP over the trailing N daily candles: Σ(close·volume)/Σvolume.
+
+    Live candles may carry string OHLC values; unparseable rows are skipped.
+    A token younger than the window yields the VWAP since listing (the natural
+    anchored reading). Windows with zero total volume are omitted.
+    """
+    rows = []
+    for c in candles or []:
+        try:
+            rows.append((float(c["close"]), float(c.get("volume") or 0)))
+        except (KeyError, TypeError, ValueError):
+            continue
+    out: dict[int, float] = {}
+    for w in windows:
+        tail = rows[-w:]
+        vol = sum(v for _c, v in tail)
+        if vol > 0:
+            out[w] = sum(c * v for c, v in tail) / vol
+    return out
+
+
+def rvwap_bias(price: float | None, rv: dict[int, float]) -> str:
+    """Structural bias per the stored strategy: price above both 365d & 90d
+    RVWAP ⇒ LONG, below both ⇒ SHORT, else MIXED (or missing data)."""
+    lo, hi = rv.get(90), rv.get(365)
+    if price is None or lo is None or hi is None:
+        return "MIXED"
+    if price > lo and price > hi:
+        return "LONG"
+    if price < lo and price < hi:
+        return "SHORT"
+    return "MIXED"
+
+
+async def auto_signal_scan() -> None:
+    """Every 4h (UTC candle close): post high-conviction, regime- and
+    RVWAP-aligned setups to CH_SIGNALS. Silence is the normal outcome —
+    the gate (score ≥ 4.0 + triple alignment) is meant to fire rarely."""
+    if CH_SIGNALS is None:
+        return
+    d = await gather_raw([
+        ("ta_btc",  "technical_analysis",   {"token_address": "bitcoin", "timeframe": "1d"}),
+        ("derivs",  "derivatives_analysis", {"token_address": "bitcoin"}),
+        ("indices", "market_index_price",   {"index": "all"}),
+        ("scanner", "performance_scanner",  {"universe_size": AUTO_SIGNAL_UNIVERSE,
+                                             "top_n": None, "lookback_days": 7}),
+    ])
+    regime, _reasons = detect_regime(d.get("ta_btc"), d.get("derivs"), d.get("indices"))
+    rows = (d.get("scanner") or {}).get("leaderboard") or []
+    if regime == "UNKNOWN" or not rows:
+        print(f"[AUTOSIG] skipped — regime={regime}, scanner rows={len(rows)}")
+        return
+    # Leaders are long candidates unless RISK-OFF; laggards short unless RISK-ON.
+    candidates: list[tuple[dict, str]] = []
+    if regime != "RISK-OFF":
+        candidates += [(r, "LONG") for r in rows[:AUTO_SIGNAL_PER_SIDE]]
+    if regime != "RISK-ON":
+        candidates += [(r, "SHORT") for r in rows[-AUTO_SIGNAL_PER_SIDE:]]
+    posted = 0
+    for row, want in candidates:
+        ticker = _clean_ticker(row.get("ticker") or row.get("token"))
+        if not ticker:
+            continue
+        token_id = _resolve_token(ticker)
+        if _find_recent_open(token_id):
+            continue  # already tracked — never double-signal
+        start = (datetime.now(IST) - timedelta(days=RVWAP_WINDOWS[-1] + 5))
+        info, ta4, bars = await asyncio.gather(
+            tn_call_safe("basic_market_info", {"token_address": token_id}),
+            tn_call_safe("technical_analysis", {"token_address": token_id, "timeframe": "4h"}),
+            tn_call_safe("historical_bars", {
+                "instruments": [token_id], "asset_class": "crypto", "timeframe": "1d",
+                "start": start.astimezone(ZoneInfo("UTC")).isoformat(),
+            }),
+        )
+        price = ((info or {}).get("market_data") or {}).get("current_price")
+        candles = ((bars or {}).get("data") or {}).get(token_id) or []
+        bias = rvwap_bias(price, compute_rvwaps(candles))
+        setup = build_rule_setup(ticker, info, ta4, None,
+                                 min_score=SETUP_SCORE_HIGH, tp_rs=AUTO_TP_RS)
+        if not setup.get("has_setup") or setup["direction"] != want or bias != want:
+            continue
+        channel = bot.get_channel(CH_SIGNALS)
+        if channel is None:
+            print(f"[AUTOSIG] channel {CH_SIGNALS} not found")
+            return
+        embed = build_setup_embed(ticker, float(price), setup)
+        embed.title = f"🤖 {ticker} Auto Signal"
+        embed.add_field(
+            name="Basis",
+            value=f"Regime {regime} · RVWAP bias {bias} · 7d RS rotation",
+            inline=False,
+        )
+        msg = await channel.send(embed=embed)
+        log_setup(setup, ticker, token_id, msg, source="auto")
+        posted += 1
+    print(f"[AUTOSIG] {regime}: {len(candidates)} candidates → {posted} signal(s)")
 
 
 # =============================================================================
@@ -1116,9 +1237,11 @@ def init_setups() -> None:
         print(f"[TRACK] WARNING: could not load setups ({type(e).__name__}: {e}) — starting fresh.")
 
 
-def log_setup(setup: dict, ticker: str, coingecko_id: str, message) -> None:
-    """Record a LONG/SHORT !setup for outcome tracking. No-ops on 'no clear setup'
-    or unparseable/incoherent levels (the embed still posts; it's just not tracked)."""
+def log_setup(setup: dict, ticker: str, coingecko_id: str, message, source: str = "manual") -> None:
+    """Record a LONG/SHORT setup for outcome tracking. No-ops on 'no clear setup'
+    or unparseable/incoherent levels (the embed still posts; it's just not tracked).
+    source: "manual" (!setup) or "auto" (4h auto-signal scan) — kept per-trade so
+    the public record can report the two engines separately."""
     direction = str(setup.get("direction") or "NONE").upper()
     if not setup.get("has_setup") or direction not in ("LONG", "SHORT"):
         return
@@ -1136,6 +1259,7 @@ def log_setup(setup: dict, ticker: str, coingecko_id: str, message) -> None:
         "ticker": ticker, "coingecko_id": coingecko_id, "direction": direction,
         "entry_price": entry, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
         "rr_ratio": str(setup.get("rr_ratio", "")), "conviction": str(setup.get("conviction", "")),
+        "source": source,
         "timestamp": datetime.now(IST).isoformat(),
         "discord_message_id": message.id, "discord_channel_id": message.channel.id,
         "status": "OPEN", "resolution_price": None, "resolved_at": None,
@@ -1338,6 +1462,17 @@ def compute_winrate(setups: list[dict]) -> dict:
         risk = abs(s["entry_price"] - s["stop_loss"])
         if risk > 0 and s.get("resolution_price") is not None:
             realized_rr.append(abs(s["resolution_price"] - s["entry_price"]) / risk)
+    # Manual (!setup) vs auto (4h scan) breakdown — only surfaced once any
+    # auto signal exists, so the embed is unchanged until the feature is used.
+    auto_line = None
+    autos = [s for s in setups if s.get("source") == "auto"]
+    if autos:
+        def _wl(pool):
+            return (sum(1 for s in pool if s.get("status") == "WIN"),
+                    sum(1 for s in pool if s.get("status") == "LOSS"))
+        aw, al = _wl(autos)
+        mw, ml = _wl([s for s in setups if s.get("source") != "auto"])
+        auto_line = f"manual {mw}W/{ml}L · auto {aw}W/{al}L"
     return {
         "total": len(setups),
         "open": open_n,
@@ -1348,6 +1483,7 @@ def compute_winrate(setups: list[dict]) -> dict:
         "best": max(pcts) if pcts else None,
         "worst": min(pcts) if pcts else None,
         "avg_rr": (sum(realized_rr) / len(realized_rr)) if realized_rr else None,
+        "auto_line": auto_line,
     }
 
 
@@ -1371,6 +1507,8 @@ def build_winrate_embed(stats: dict) -> discord.Embed:
         value=(f"{stats['avg_rr']:.2f}" if stats["avg_rr"] is not None else "—"),
         inline=True,
     )
+    if stats.get("auto_line"):
+        e.add_field(name="By engine", value=stats["auto_line"], inline=False)
     e.set_footer(text=FOOTER + " · win rate excludes expired")
     e.timestamp = datetime.now(IST)
     return e
@@ -1672,6 +1810,14 @@ def setup_scheduler() -> None:
         id="regime_15m",
         replace_existing=True,
     )
+    if CH_SIGNALS is not None:
+        # 4h candles close on UTC boundaries; :10 lets the closed candle settle.
+        scheduler.add_job(
+            auto_signal_scan,
+            CronTrigger(hour="0,4,8,12,16,20", minute=10, timezone=ZoneInfo("UTC")),
+            id="auto_signals",
+            replace_existing=True,
+        )
 
 
 # =============================================================================
