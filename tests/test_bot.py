@@ -2320,3 +2320,69 @@ def test_live_endpoint_headers_and_json(monkeypatch):
     assert resp.headers["Access-Control-Allow-Origin"] == "*"
     body = _json.loads(resp.body)
     assert body["open_setups"] == [] and "generated_at" in body
+
+
+# --- user watchlist (!watch) + scan integration -----------------------------
+
+def test_watchlist_persist_and_load(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setattr(bot, "CACHE_PATH", str(tmp_path))
+    monkeypatch.setattr(bot, "WATCHLIST_PATH", str(tmp_path / "watchlist.json"))
+    monkeypatch.setattr(bot, "_WATCHLIST", ["SUI", "ARB"])
+    bot._persist_watchlist()
+    saved = json.loads((tmp_path / "watchlist.json").read_text())
+    assert saved["tickers"] == ["SUI", "ARB"]
+    monkeypatch.setattr(bot, "_WATCHLIST", [])
+    bot.init_watchlist()
+    assert bot._WATCHLIST == ["SUI", "ARB"]
+
+
+def test_init_watchlist_missing_file_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "WATCHLIST_PATH", str(tmp_path / "nope.json"))
+    monkeypatch.setattr(bot, "_WATCHLIST", ["X"])
+    bot.init_watchlist()
+    assert bot._WATCHLIST == []
+
+
+def test_scan_watchlist_merges_env_and_user_and_dedupes(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "CH_SIGNALS", 999)
+    monkeypatch.setattr(bot, "SIGNALS_WATCHLIST", ["NVDA"])
+    monkeypatch.setattr(bot, "_WATCHLIST", ["NVDA", "SUI"])  # NVDA dup, SUI new
+    evaluated = []
+
+    async def fake_eval(sym):
+        evaluated.append(sym)
+        return False
+
+    monkeypatch.setattr(bot, "_eval_watchlist_symbol", fake_eval)
+    asyncio.run(bot._scan_watchlist())
+    assert evaluated == ["NVDA", "SUI"]  # deduped, env-first then user
+
+
+def test_eval_watchlist_crypto_fetches_daily_bars_for_rvwap(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "CH_SIGNALS", 999)
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    ch = _StubChannel()
+    monkeypatch.setattr(bot.bot, "get_channel", lambda _id: ch)
+    up = _ramp_bars(step=1.0)
+    calls = []
+
+    async def fake_call(tool, args, **kw):
+        calls.append((tool, args.get("asset_class"), args.get("timeframe")))
+        if tool == "basic_market_info":
+            return {"market_data": {"current_price": float(up[-1]["close"])}}
+        if tool == "technical_analysis":       # crypto 4h TA → strong long
+            return _ta_strong_4h(price=float(up[-1]["close"]))
+        if tool == "derivatives_analysis":
+            return _derivs_full()
+        if tool == "historical_bars":          # daily bars for RVWAP
+            return {"data": {"bitcoin": up}}
+        return None
+
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    posted = asyncio.run(bot._eval_watchlist_symbol("BTC"))
+    assert posted is True
+    assert ("historical_bars", "crypto", "1d") in calls   # fetched daily bars for RVWAP
+    assert bot._SETUPS[0]["ticker"] == "BTC" and bot._SETUPS[0]["source"] == "auto"

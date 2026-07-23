@@ -140,7 +140,9 @@ TYPEFULLY_SOCIAL_SET_ID = os.environ.get("TYPEFULLY_SOCIAL_SET_ID", "208154").st
 CACHE_PATH = (os.environ.get("CACHE_PATH", ".").rstrip("/") or ".")
 SETUPS_PATH = os.path.join(CACHE_PATH, "setups.json")
 REGIME_PATH = os.path.join(CACHE_PATH, "last_regime.json")
+WATCHLIST_PATH = os.path.join(CACHE_PATH, "watchlist.json")
 SETUP_EXPIRY_HOURS = 48
+WATCHLIST_MAX = 25   # cap the user watchlist so the 4h scan can't balloon
 
 # --- Embed colors ---
 COLOR_RISK   = 0xFFAA00
@@ -176,6 +178,10 @@ tn_state: dict = {
 
 # In-memory authoritative list of tracked setups (mirrors setups.json on disk).
 _SETUPS: list[dict] = []
+
+# User-curated watchlist (via !watch) — tickers the 4h auto-signal scan checks
+# against the same gate. Mirrors watchlist.json on disk.
+_WATCHLIST: list[str] = []
 
 # Most recent rule-based regime read (mirrors last_regime.json on disk).
 _LAST_REGIME: dict = {"regime": "UNKNOWN", "timestamp": None, "reasons": []}
@@ -980,27 +986,45 @@ async def _emit_auto_signal(ticker: str, instrument: str, asset_class: str,
     return True
 
 
+async def _eval_watchlist_symbol(sym: str) -> bool:
+    """Evaluate one watchlist symbol against the auto-signal gate (score ≥ 4.0 +
+    RVWAP bias agreement) and post if it qualifies. Works for any asset class —
+    crypto scores on 4h TA (with daily bars fetched for the RVWAP read), stocks/
+    commodities on daily. Returns True if a signal was posted."""
+    asset_class, instrument = classify_asset(sym)
+    if _find_recent_open(instrument):
+        return False
+    g = await gather_setup_inputs(sym)
+    price = ((g.get("info") or {}).get("market_data") or {}).get("current_price")
+    if price is None or g.get("ta") is None:
+        return False
+    bars = g.get("bars")
+    if bars is None:  # crypto: gather returns 4h TA but no bars — fetch daily for RVWAP
+        start = (datetime.now(IST) - timedelta(days=RVWAP_WINDOWS[-1] + 5)).astimezone(ZoneInfo("UTC")).isoformat()
+        raw = await tn_call_safe("historical_bars",
+                                 {"instruments": [instrument], "asset_class": "crypto",
+                                  "timeframe": "1d", "start": start})
+        bars = ((raw or {}).get("data") or {}).get(instrument) or []
+    bias = rvwap_bias(price, compute_rvwaps(bars))
+    setup = build_rule_setup(sym, g["info"], g["ta"], g.get("derivs"),
+                             min_score=SETUP_SCORE_HIGH, tp_rs=AUTO_TP_RS)
+    if not setup.get("has_setup") or bias == "MIXED" or setup["direction"] != bias:
+        return False
+    tf = "4h" if asset_class == "crypto" else "daily"
+    return await _emit_auto_signal(sym, instrument, asset_class, float(price), setup,
+                                   f"RVWAP bias {bias} · {asset_class} · {tf} score ≥ 4.0 · watchlist")
+
+
 async def _scan_watchlist() -> int:
-    """Non-crypto leg of the auto-signal scan: each SIGNALS_WATCHLIST symbol on
-    the daily, gated by its own RVWAP bias + score ≥ 4.0. Returns count posted."""
-    posted = 0
-    for sym in SIGNALS_WATCHLIST:
-        asset_class, instrument = classify_asset(sym)
-        if asset_class == "crypto":
-            continue  # crypto is covered by the RS-rotation leg
-        if _find_recent_open(instrument):
+    """Watchlist leg of the auto-signal scan: the env defaults + every user-added
+    !watch symbol, each gated by RVWAP bias + score ≥ 4.0. Returns count posted."""
+    posted, seen = 0, set()
+    for sym in list(SIGNALS_WATCHLIST) + list(_WATCHLIST):
+        key = sym.strip().upper()
+        if not key or key in seen:
             continue
-        g = await gather_setup_inputs(sym)
-        price = ((g.get("info") or {}).get("market_data") or {}).get("current_price")
-        if price is None or g.get("ta") is None:
-            continue
-        bias = rvwap_bias(price, compute_rvwaps(g.get("bars") or []))
-        setup = build_rule_setup(sym, g["info"], g["ta"], None,
-                                 min_score=SETUP_SCORE_HIGH, tp_rs=AUTO_TP_RS)
-        if not setup.get("has_setup") or bias == "MIXED" or setup["direction"] != bias:
-            continue
-        if await _emit_auto_signal(sym, instrument, asset_class, float(price), setup,
-                                   f"RVWAP bias {bias} · {asset_class} · daily score ≥ 4.0"):
+        seen.add(key)
+        if await _eval_watchlist_symbol(sym):
             posted += 1
     return posted
 
@@ -1469,6 +1493,36 @@ def init_setups() -> None:
     except Exception as e:
         _SETUPS = []
         print(f"[TRACK] WARNING: could not load setups ({type(e).__name__}: {e}) — starting fresh.")
+
+
+def _persist_watchlist() -> None:
+    """Atomic write of _WATCHLIST. Best-effort."""
+    try:
+        os.makedirs(CACHE_PATH, exist_ok=True)
+        tmp = WATCHLIST_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"tickers": _WATCHLIST}, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, WATCHLIST_PATH)
+    except Exception as e:
+        print(f"[WATCH] WARNING: failed to persist watchlist: {type(e).__name__}: {e}")
+
+
+def init_watchlist() -> None:
+    """Load watchlist.json at startup; missing ⇒ empty."""
+    global _WATCHLIST
+    try:
+        if os.path.exists(WATCHLIST_PATH):
+            with open(WATCHLIST_PATH) as f:
+                data = json.load(f)
+            _WATCHLIST = [str(t).upper() for t in (data.get("tickers") or [])] if isinstance(data, dict) else []
+            print(f"[WATCH] loaded {len(_WATCHLIST)} watched tickers")
+        else:
+            _WATCHLIST = []
+    except Exception as e:
+        _WATCHLIST = []
+        print(f"[WATCH] WARNING: could not load watchlist ({type(e).__name__}: {e}) — starting empty.")
 
 
 def log_setup(setup: dict, ticker: str, coingecko_id: str, message, source: str = "manual",
@@ -2289,6 +2343,7 @@ async def on_ready():
     await start_webhook_server()
     init_setups()  # load tracked setups before the tracker job can fire
     init_regime()  # load the regime baseline before any brief checks it
+    init_watchlist()  # load the user watchlist before the auto-signal scan runs
     setup_scheduler()
     if not scheduler.running:
         scheduler.start()
@@ -2455,6 +2510,75 @@ async def winrate(ctx: commands.Context):
         await ctx.send("No setups tracked yet — use !setup to generate one.")
         return
     await ctx.send(embed=build_winrate_embed(compute_winrate(_SETUPS)))
+
+
+def _is_watch_admin(ctx: commands.Context) -> bool:
+    """Watchlist edits change what auto-posts publicly → restrict to server admins
+    (manage_guild). Read-only !watchlist is open to everyone."""
+    perms = getattr(ctx.author, "guild_permissions", None)
+    return bool(perms and (perms.manage_guild or perms.administrator))
+
+
+@bot.command(name="watch")
+@commands.cooldown(1, 30, commands.BucketType.user)
+async def watch_add(ctx: commands.Context, ticker: str = ""):
+    """Add a token to the auto-signal watchlist. Usage: !watch SUI (admins)"""
+    if not _is_watch_admin(ctx):
+        ctx.command.reset_cooldown(ctx)
+        await ctx.send("❌ Only server admins can edit the watchlist.")
+        return
+    ticker = (ticker or "").strip().upper()
+    if not ticker or len(ticker) > 24 or not re.match(r"^[A-Z0-9\-]+$", ticker):
+        ctx.command.reset_cooldown(ctx)
+        await ctx.send("Usage: `!watch SUI` — a ticker or CoinGecko id.")
+        return
+    if ticker in _WATCHLIST:
+        await ctx.send(f"Already watching **{ticker}**.")
+        return
+    if len(_WATCHLIST) >= WATCHLIST_MAX:
+        await ctx.send(f"Watchlist is full ({WATCHLIST_MAX}). `!unwatch` something first.")
+        return
+    status = await ctx.send(f"⏳ Checking **{ticker}**…")
+    g = await gather_setup_inputs(ticker)  # verify it resolves to real data
+    price = ((g.get("info") or {}).get("market_data") or {}).get("current_price")
+    if price is None:
+        await status.edit(content=f"⚠️ Couldn't find market data for `{ticker}` — not added.")
+        return
+    _WATCHLIST.append(ticker)
+    _persist_watchlist()
+    await status.edit(content=(
+        f"✅ Watching **{ticker}** ({g['asset_class']}, {_money(price)}). "
+        f"Auto-signal scan checks it every 4h and posts to the signals channel when it "
+        f"clears score ≥ 4.0 with RVWAP-bias agreement."))
+
+
+@bot.command(name="unwatch")
+@commands.cooldown(1, 30, commands.BucketType.user)
+async def watch_remove(ctx: commands.Context, ticker: str = ""):
+    """Remove a token from the watchlist. Usage: !unwatch SUI (admins)"""
+    if not _is_watch_admin(ctx):
+        ctx.command.reset_cooldown(ctx)
+        await ctx.send("❌ Only server admins can edit the watchlist.")
+        return
+    ticker = (ticker or "").strip().upper()
+    if ticker not in _WATCHLIST:
+        await ctx.send(f"**{ticker}** isn't on the watchlist. `!watchlist` to see it.")
+        return
+    _WATCHLIST.remove(ticker)
+    _persist_watchlist()
+    await ctx.send(f"🗑️ Removed **{ticker}** from the watchlist.")
+
+
+@bot.command(name="watchlist")
+async def watch_list(ctx: commands.Context):
+    """Show the auto-signal watchlist. Usage: !watchlist"""
+    default = ", ".join(SIGNALS_WATCHLIST) or "—"
+    user = ", ".join(_WATCHLIST) or "—"
+    e = discord.Embed(title="👀 Auto-signal Watchlist", color=COLOR_SCAN)
+    e.add_field(name="Built-in", value=default, inline=False)
+    e.add_field(name=f"Yours (!watch) · {len(_WATCHLIST)}/{WATCHLIST_MAX}", value=user, inline=False)
+    e.set_footer(text="Each is scored every 4h; signals post on score ≥ 4.0 + RVWAP-bias agreement.")
+    await ctx.send(embed=e)
 
 
 def _format_delta(dt: datetime | None) -> str:
