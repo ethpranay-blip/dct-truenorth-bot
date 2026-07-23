@@ -1812,3 +1812,107 @@ def test_healthz_exposes_regime_and_build_error(monkeypatch):
     assert body["regime"] == "RISK-OFF"
     assert body["last_build_error"] == "boom"
     bot.tn_state["last_synth_error"] = None
+
+
+# --- options_report → brief section -----------------------------------------
+
+def _options_raw(**over):
+    """Mirrors the live options_report result shape (Derive BTC options)."""
+    d = {
+        "status": "ok",
+        "spot": 65694.0,
+        "atm_iv": 40.8,
+        "summary": {
+            "sentiment": "bullish",
+            "regime": "negative_gamma",
+            "key_levels": {"max_pain": 75000.0, "gex_flip": 65694.0},
+            "signal_summary": {
+                "risk_reversal": "bearish (-5.69%)",
+                "put_call_ratio": "0.515 by OI",
+                "gex_regime": "negative gamma",
+            },
+        },
+    }
+    d.update(over)
+    return d
+
+
+def test_options_line_composes_all_parts():
+    line = bot._options_line(_options_raw())
+    assert "bullish" in line
+    assert "negative gamma" in line
+    assert "ATM IV 40.8%" in line
+    assert "max pain" in line and "75,000" in line
+    assert "P/C 0.515 (OI)" in line
+    assert "RR bearish (-5.69%)" in line
+
+
+def test_options_line_degrades():
+    assert bot._options_line(None) is None
+    assert bot._options_line({}) is None
+    # partial payload: only ATM IV survives, no crash
+    line = bot._options_line({"atm_iv": 55.2})
+    assert line == "ATM IV 55.2%"
+
+
+def test_brief_sources_include_options():
+    assert "options_report" in {tool for _k, tool, _a in bot.BRIEF_SOURCES}
+
+
+def test_build_rule_brief_options_section_present_and_absent():
+    with_opts = bot.build_rule_brief("us", _brief_data(options=_options_raw()))
+    assert "**Options (BTC)**" in with_opts
+    without = bot.build_rule_brief("us", _brief_data())
+    assert "**Options" not in without
+
+
+def test_build_rule_regime_outlook_includes_options():
+    d = _brief_data(options=_options_raw(), scanner_7d=_scanner_raw(), events_7d=_events_raw())
+    assert "**Options (BTC)**" in bot.build_rule_regime_outlook(d)
+
+
+# --- token_unlock → !setup warning ------------------------------------------
+
+_UNLOCK_NOW = 1784800020.0
+
+
+def _unlock_raw(days_out=5.0, usd_amounts=(2_035_783.15, 5_300_000.0), pct=30.81):
+    return {"status": "success", "unlock_data": {
+        "token_symbol": "APT",
+        "next_unlock_date": _UNLOCK_NOW + days_out * 86400,
+        "total_unlocked_percentage": pct,
+        "next_unlocked_detail": [
+            {"tokenAmount": 1.0, "vestingType": "linear",
+             "allocationName": "Community", "tokenAmountUsd": u}
+            for u in usd_amounts
+        ],
+    }}
+
+
+def test_unlock_warning_within_window():
+    w = bot._unlock_warning(_unlock_raw(), _UNLOCK_NOW)
+    assert w == "unlock in 5d: ~$7.3M (30.8% of supply already unlocked)"
+
+
+def test_unlock_warning_small_amount_uses_k():
+    w = bot._unlock_warning(_unlock_raw(usd_amounts=(450_000.0,)), _UNLOCK_NOW)
+    assert "~$450K" in w
+
+
+def test_unlock_warning_outside_window_or_past_is_none():
+    assert bot._unlock_warning(_unlock_raw(days_out=9.0), _UNLOCK_NOW) is None
+    assert bot._unlock_warning(_unlock_raw(days_out=-1.0), _UNLOCK_NOW) is None
+
+
+def test_unlock_warning_null_data_is_none():
+    # BTC/ETH/SOL etc. — API returns a success envelope with unlock_data: null
+    assert bot._unlock_warning({"status": "success", "unlock_data": None}, _UNLOCK_NOW) is None
+    assert bot._unlock_warning(None, _UNLOCK_NOW) is None
+
+
+def test_unlock_warning_missing_usd_still_warns():
+    raw = _unlock_raw()
+    raw["unlock_data"]["next_unlocked_detail"] = []
+    w = bot._unlock_warning(raw, _UNLOCK_NOW)
+    assert w.startswith("unlock in 5d")
+    assert "$" not in w

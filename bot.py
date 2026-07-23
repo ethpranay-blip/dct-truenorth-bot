@@ -255,6 +255,7 @@ BRIEF_SOURCES = [
     ("info_eth", "basic_market_info",    {"token_address": "ethereum"}),
     ("ta_eth",   "technical_analysis",   {"token_address": "ethereum", "timeframe": "1d"}),
     ("derivs",   "derivatives_analysis", {"token_address": "bitcoin"}),
+    ("options",  "options_report",       {"token_address": "bitcoin"}),
     ("scanner",  "performance_scanner",  {"top": 5, "lookback_days": 1}),
     ("events",   "events",               {"query": "crypto", "time_window": "24h", "sort_by": "relevance"}),
 ]
@@ -456,6 +457,10 @@ def build_rule_brief(session: str, d: dict) -> str:
     if pos:
         out.append("**Positioning**")
         out.extend(f"• {p}" for p in pos)
+    opt = _options_line(d.get("options"))
+    if opt:
+        out.append("**Options (BTC)**")
+        out.append(f"• {opt}")
     movers = _mover_line(d.get("scanner"))
     if movers:
         out.append("**Movers (24h, RS vs BTC)**")
@@ -481,6 +486,32 @@ def _indices_line(indices: dict | None) -> str | None:
     return " · ".join(parts) if parts else None
 
 
+def _options_line(opts: dict | None) -> str | None:
+    """'bullish · negative gamma · ATM IV 40.8% · max pain $75,000 · P/C 0.515 · RR bearish (-5.69%)'
+
+    Composed from options_report's summary block (Derive BTC options). Any
+    missing piece is dropped; returns None if nothing useful is present.
+    """
+    summary = (opts or {}).get("summary") or {}
+    sig = summary.get("signal_summary") or {}
+    levels = summary.get("key_levels") or {}
+    parts = []
+    if summary.get("sentiment"):
+        parts.append(str(summary["sentiment"]))
+    if sig.get("gex_regime"):
+        parts.append(str(sig["gex_regime"]))
+    atm_iv = (opts or {}).get("atm_iv")
+    if atm_iv is not None:
+        parts.append(f"ATM IV {atm_iv:.1f}%")
+    if levels.get("max_pain") is not None:
+        parts.append(f"max pain {_money(levels['max_pain'])}")
+    if sig.get("put_call_ratio"):
+        parts.append(f"P/C {str(sig['put_call_ratio']).replace(' by OI', '')} (OI)")
+    if sig.get("risk_reversal"):
+        parts.append(f"RR {sig['risk_reversal']}")
+    return " · ".join(parts) if parts else None
+
+
 def build_rule_regime_outlook(d: dict) -> str:
     """Mon/Wed/Fri macro outlook, composed from raw data. Pure, no LLM."""
     regime, reasons = detect_regime(d.get("ta_btc"), d.get("derivs"), d.get("indices"))
@@ -498,6 +529,10 @@ def build_rule_regime_outlook(d: dict) -> str:
     if idx:
         out.append("**Cross-asset**")
         out.append(f"• {idx}")
+    opt = _options_line(d.get("options"))
+    if opt:
+        out.append("**Options (BTC)**")
+        out.append(f"• {opt}")
     movers = _mover_line(d.get("scanner_7d"))
     if movers:
         out.append("**Rotation (7d RS vs BTC)**")
@@ -631,6 +666,39 @@ def build_rule_setup(ticker: str, info: dict | None, ta: dict | None, derivs: di
         "conviction": "High" if abs(score) >= SETUP_SCORE_HIGH else "Medium",
         "reasoning": reasoning,
     }
+
+
+UNLOCK_WARN_DAYS = 7
+
+
+def _unlock_warning(unlock: dict | None, now_ts: float) -> str | None:
+    """'unlock in 5d: ~$7.3M (30.8% of supply already unlocked)' or None.
+
+    token_unlock returns {"unlock_data": null} for assets with no vesting
+    schedule (BTC/ETH/SOL…), and next_unlock_date may fall outside the
+    requested window — so the ≤7d check happens here, not in the API args.
+    """
+    data = (unlock or {}).get("unlock_data")
+    if not isinstance(data, dict):
+        return None
+    next_ts = data.get("next_unlock_date")
+    if not isinstance(next_ts, (int, float)):
+        return None
+    days = (next_ts - now_ts) / 86400
+    if not 0 <= days <= UNLOCK_WARN_DAYS:
+        return None
+    usd = sum(
+        d.get("tokenAmountUsd") or 0
+        for d in (data.get("next_unlocked_detail") or [])
+        if isinstance(d, dict)
+    )
+    out = f"unlock in {max(1, round(days))}d"
+    if usd > 0:
+        out += f": ~${usd / 1e6:.1f}M" if usd >= 1e6 else f": ~${usd / 1e3:.0f}K"
+    pct = data.get("total_unlocked_percentage")
+    if isinstance(pct, (int, float)):
+        out += f" ({pct:.1f}% of supply already unlocked)"
+    return out
 
 
 def _setup_channel_allowed(channel_id: int) -> bool:
@@ -1779,10 +1847,16 @@ async def trade_setup(ctx: commands.Context, ticker: str = ""):
     status = await ctx.send(f"⏳ Building **{ticker}** setup…")
 
     # 4h timeframe: signals and ATR-sized levels that fit the 48h tracking window.
-    info, ta, derivs = await asyncio.gather(
+    now_ts = datetime.now(IST).timestamp()
+    info, ta, derivs, unlock = await asyncio.gather(
         tn_call_safe("basic_market_info", {"token_address": token_id}),
         tn_call_safe("technical_analysis", {"token_address": token_id, "timeframe": "4h"}),
         tn_call_safe("derivatives_analysis", {"token_address": token_id}),
+        tn_call_safe("token_unlock", {
+            "token_address": token_id,
+            "event_after_timestamp": int(now_ts),
+            "event_before_timestamp": int(now_ts) + UNLOCK_WARN_DAYS * 86400,
+        }),
     )
     price = (info or {}).get("market_data", {}).get("current_price")
     if price is None:
@@ -1800,7 +1874,13 @@ async def trade_setup(ctx: commands.Context, ticker: str = ""):
         await status.edit(content=f"⚠️ Setup generation failed ({type(e).__name__}). Run `!health`.")
         return
 
-    await status.edit(content=None, embed=build_setup_embed(ticker, float(price), setup))
+    embed = build_setup_embed(ticker, float(price), setup)
+    # Unlock cliff inside the tracking horizon is a risk flag, never a signal —
+    # it must not touch the deterministic score (mirrored in TN app memory).
+    warn = _unlock_warning(unlock, now_ts)
+    if warn:
+        embed.add_field(name="⚠️ Unlock risk", value=warn[:200], inline=False)
+    await status.edit(content=None, embed=embed)
     log_setup(setup, ticker, token_id, status)  # track LONG/SHORT outcomes (no-ops otherwise)
 
 
