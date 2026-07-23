@@ -1664,6 +1664,9 @@ async def track_setups() -> None:
                 if ref is None and asset_class == "crypto":
                     info = await tn_call_safe("basic_market_info", {"token_address": s["coingecko_id"]})
                     ref = (info or {}).get("market_data", {}).get("current_price")
+                if ref is not None:  # keep a live price for the dashboard's open board
+                    s["last_price"] = ref
+                    changed = True
                 outcome = evaluate_setup(s, ref)  # spot-level WIN/LOSS (fallback) + expiry
                 if outcome is None:
                     continue
@@ -1985,6 +1988,8 @@ async def run_session_brief(session: str, phase: str = "Pre-Open Brief") -> bool
         return False
     await channel.send(embed=build_brief_embed(text, session, phase))
     tn_state["last_brief_at"][session] = datetime.now(IST)
+    _DASH_CACHE["brief"] = {"session": SESSION_LABELS.get(session, session),
+                            "text": text, "at": datetime.now(IST).isoformat()}
     print(f"[SCHED] {label} {phase} posted ({available}/{len(BRIEF_SOURCES)} sources)")
     await maybe_autodraft(build_template_tweet(session, d), f"{label} {phase}")
     return True
@@ -2066,6 +2071,13 @@ def setup_scheduler() -> None:
             id="auto_signals",
             replace_existing=True,
         )
+    scheduler.add_job(
+        refresh_dashboard_cache,
+        IntervalTrigger(minutes=15),
+        id="dashboard_cache",
+        next_run_time=datetime.now(IST),   # warm the cache at startup, not 15 min later
+        replace_existing=True,
+    )
 
 
 # =============================================================================
@@ -2091,6 +2103,126 @@ async def _handle_healthz(_request: web.Request) -> web.Response:
 
 
 TRACK_RECORD_RECENT_N = 10
+
+
+# =============================================================================
+# Dashboard feed — /api/live: open signals + cross-asset lead-lag map + brief
+# =============================================================================
+# The bot is the source of truth (it already computes scores/levels/bias); the
+# dashboard renders. Cross-asset map + brief are cached (refreshed on a job) so
+# the endpoint stays fast; open setups come straight from in-memory _SETUPS.
+
+CROSS_ASSET_CRYPTO = [("BTC", "bitcoin"), ("ETH", "ethereum"), ("SOL", "solana")]
+CROSS_ASSET_STOCKS = ["NVDA", "AAPL", "TSLA"]
+CROSS_ASSET_COMMOD = [("GOLD", "gold"), ("OIL", "oil")]
+CROSS_ASSET_INDICES = {"gspc": "SPX", "ndx": "NDX", "dxy": "DXY", "tnx": "US10Y", "vix": "VIX"}
+
+# Cached dashboard snapshot (refreshed every 15 min by refresh_dashboard_cache).
+_DASH_CACHE: dict = {"crossasset": None, "brief": None}
+
+
+def _pct_change(bars: list, n: int = 7) -> float | None:
+    """% change over the trailing n daily bars (last close vs n bars back)."""
+    closes = []
+    for b in sorted(bars or [], key=lambda c: c.get("t") or ""):
+        try:
+            closes.append(float(b["close"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if len(closes) < n + 1 or closes[-1 - n] == 0:
+        return None
+    return (closes[-1] / closes[-1 - n] - 1) * 100
+
+
+async def build_cross_asset_map() -> dict:
+    """Skew-equivalent lead-lag read across crypto / equities / commodities /
+    macro, composed from keyless tools (no proprietary agent). 7d % for anything
+    with daily bars; indices show 24h from market_index_price. Returns tiles +
+    a one-line lead/lag summary. Degrades per-group on tool failure."""
+    start = (datetime.now(IST) - timedelta(days=14)).astimezone(ZoneInfo("UTC")).isoformat()
+    crypto, stocks, commod, indices = await asyncio.gather(
+        tn_call_safe("historical_bars", {"instruments": [i for _l, i in CROSS_ASSET_CRYPTO],
+                                          "asset_class": "crypto", "timeframe": "1d", "start": start}),
+        tn_call_safe("historical_bars", {"instruments": CROSS_ASSET_STOCKS,
+                                         "asset_class": "stock", "timeframe": "1d", "start": start}),
+        tn_call_safe("historical_bars", {"instruments": [i for _l, i in CROSS_ASSET_COMMOD],
+                                         "asset_class": "commodity", "timeframe": "1d", "start": start}),
+        tn_call_safe("market_index_price", {"index": "all"}),
+    )
+    tiles = []
+    for group, series, members in (
+        ("Crypto", (crypto or {}).get("data") or {}, CROSS_ASSET_CRYPTO),
+        ("Commodities", (commod or {}).get("data") or {}, CROSS_ASSET_COMMOD),
+    ):
+        for label, inst in members:
+            pct = _pct_change(series.get(inst) or [])
+            if pct is not None:
+                tiles.append({"group": group, "label": label, "pct": round(pct, 1), "horizon": "7d"})
+    stock_series = (stocks or {}).get("data") or {}
+    for sym in CROSS_ASSET_STOCKS:
+        pct = _pct_change(stock_series.get(sym) or [])
+        if pct is not None:
+            tiles.append({"group": "Equities", "label": sym, "pct": round(pct, 1), "horizon": "7d"})
+    by_index = {p.get("index"): p for p in (indices or {}).get("prices") or []}
+    for idx, label in CROSS_ASSET_INDICES.items():
+        p = by_index.get(idx) or {}
+        latest = p.get("latest") or {}
+        if latest.get("change_percentage") is not None:
+            tiles.append({"group": "Macro", "label": label,
+                          "pct": round(latest["change_percentage"], 1), "horizon": "24h",
+                          "level": latest.get("close")})
+
+    # Lead/lag read over the 7d groups (Macro is context, not ranked).
+    groups = {}
+    for t in tiles:
+        if t["horizon"] == "7d":
+            groups.setdefault(t["group"], []).append(t["pct"])
+    avgs = {g: sum(v) / len(v) for g, v in groups.items() if v}
+    lead = None
+    if avgs:
+        top = max(avgs, key=avgs.get)
+        bot_g = min(avgs, key=avgs.get)
+        lead = f"{top} leading ({avgs[top]:+.1f}% 7d)" + (
+            f" · {bot_g} lagging ({avgs[bot_g]:+.1f}%)" if bot_g != top else "")
+        dxy = next((t["pct"] for t in tiles if t["label"] == "DXY"), None)
+        if dxy is not None and abs(dxy) >= 0.3:
+            lead += f" · DXY {dxy:+.1f}% ({'headwind' if dxy > 0 else 'tailwind'} for risk)"
+    return {"tiles": tiles, "lead": lead, "at": datetime.now(IST).isoformat()}
+
+
+async def refresh_dashboard_cache() -> None:
+    """Recompute the cross-asset map into the cache (every 15 min). Best-effort."""
+    try:
+        _DASH_CACHE["crossasset"] = await build_cross_asset_map()
+        print(f"[DASH] cross-asset map refreshed ({len((_DASH_CACHE['crossasset'] or {}).get('tiles', []))} tiles)")
+    except Exception as e:
+        print(f"[DASH] map refresh failed: {type(e).__name__}: {e}")
+
+
+def build_live_payload() -> dict:
+    """Public JSON for the dashboard's live panels: open setups (from memory),
+    the cached cross-asset map, and the latest session brief snapshot."""
+    open_setups = [{
+        "ticker": s.get("ticker"),
+        "asset_class": s.get("asset_class", "crypto"),
+        "direction": s.get("direction"),
+        "source": s.get("source", "manual"),
+        "conviction": s.get("conviction"),
+        "entry_price": s.get("entry_price"),
+        "stop_loss": s.get("stop_loss"),
+        "tp1": s.get("tp1"),
+        "tp2": s.get("tp2"),
+        "rr_ratio": s.get("rr_ratio"),
+        "opened_at": s.get("timestamp"),
+        "last_price": s.get("last_price"),
+    } for s in _SETUPS if s.get("status") == "OPEN"]
+    open_setups.sort(key=lambda s: s.get("opened_at") or "", reverse=True)
+    return {
+        "generated_at": datetime.now(IST).isoformat(),
+        "open_setups": open_setups,
+        "crossasset": _DASH_CACHE.get("crossasset"),
+        "brief": _DASH_CACHE.get("brief"),
+    }
 
 
 def build_track_record_payload() -> dict:
@@ -2123,6 +2255,13 @@ async def _handle_track_record(_request: web.Request) -> web.Response:
     })
 
 
+async def _handle_live(_request: web.Request) -> web.Response:
+    return web.json_response(build_live_payload(), headers={
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "public, max-age=120",
+    })
+
+
 async def start_webhook_server() -> None:
     """Bring up the aiohttp server on $PORT. Idempotent."""
     global _web_runner
@@ -2131,6 +2270,7 @@ async def start_webhook_server() -> None:
     app = web.Application()
     app.router.add_get("/healthz", _handle_healthz)
     app.router.add_get("/api/track-record", _handle_track_record)
+    app.router.add_get("/api/live", _handle_live)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)

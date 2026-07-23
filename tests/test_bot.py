@@ -402,7 +402,7 @@ def test_setup_scheduler_registers_jobs():
     bot.setup_scheduler()
     job_ids = {j.id for j in bot.scheduler.get_jobs()}
     assert job_ids == {"asia_pre_open", "london_pre_open", "us_pre_open",
-                       "regime_mwf", "setup_tracker", "regime_15m"}
+                       "regime_mwf", "setup_tracker", "regime_15m", "dashboard_cache"}
     # Re-running must not introduce new job ids. (Exact-count idempotency only
     # holds on a *running* scheduler — replace_existing dedupes at start() —
     # and on_ready always starts the scheduler right after the first setup.)
@@ -2248,3 +2248,75 @@ def test_scan_watchlist_posts_aligned_stock(monkeypatch):
     assert n == 1 and len(ch.sent) == 1
     assert ch.sent[0].title == "🤖 NVDA Auto Signal"
     assert bot._SETUPS[0]["asset_class"] == "stock" and bot._SETUPS[0]["source"] == "auto"
+
+
+# --- dashboard /api/live: cross-asset map + open setups ----------------------
+
+def _bars_seq(closes):
+    return [{"t": f"{i:04d}", "close": str(c)} for i, c in enumerate(closes)]
+
+
+def test_pct_change_math_and_insufficient():
+    assert abs(bot._pct_change(_bars_seq([100, 1, 2, 3, 4, 5, 6, 110]), 7) - 10.0) < 1e-9
+    assert bot._pct_change(_bars_seq([100, 110]), 7) is None   # too few bars
+    assert bot._pct_change([], 7) is None
+
+
+def test_build_cross_asset_map_composition(monkeypatch):
+    import asyncio
+    up = _bars_seq([100, 100, 100, 100, 100, 100, 100, 108])   # +8% 7d
+    dn = _bars_seq([100, 100, 100, 100, 100, 100, 100, 96])    # -4% 7d
+
+    async def fake_call(tool, args, **kw):
+        if tool == "historical_bars":
+            ac = args["asset_class"]
+            if ac == "crypto":
+                return {"data": {"bitcoin": up, "ethereum": up, "solana": dn}}
+            if ac == "stock":
+                return {"data": {"NVDA": up, "AAPL": dn, "TSLA": dn}}
+            if ac == "commodity":
+                return {"data": {"gold": up, "oil": up}}
+        if tool == "market_index_price":
+            return {"prices": [
+                {"index": "dxy", "latest": {"close": 101.3, "change_percentage": 0.5}},
+                {"index": "vix", "latest": {"close": 19.9, "change_percentage": 19.4}},
+            ]}
+        return None
+
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    m = asyncio.run(bot.build_cross_asset_map())
+    groups = {t["group"] for t in m["tiles"]}
+    assert {"Crypto", "Equities", "Commodities", "Macro"} <= groups
+    # Commodities both +8 → leading; equities 1 up / 2 down → lagging
+    assert "Commodities leading" in m["lead"]
+    assert "DXY +0.5%" in m["lead"] and "headwind" in m["lead"]
+    dxy = next(t for t in m["tiles"] if t["label"] == "DXY")
+    assert dxy["horizon"] == "24h" and dxy["level"] == 101.3
+
+
+def test_build_live_payload_shape(monkeypatch):
+    monkeypatch.setattr(bot, "_SETUPS", [
+        {"ticker": "NVDA", "asset_class": "stock", "direction": "LONG", "source": "auto",
+         "conviction": "High", "entry_price": 210.0, "stop_loss": 200.0, "tp1": 235.0,
+         "tp2": 250.0, "rr_ratio": "2.5 (TP1) / 4.0 (TP2)", "timestamp": "2026-07-23T18:00:00+05:30",
+         "last_price": 214.0, "status": "OPEN"},
+        {"ticker": "BTC", "status": "WIN", "asset_class": "crypto"},  # resolved → excluded
+    ])
+    monkeypatch.setattr(bot, "_DASH_CACHE", {"crossasset": {"tiles": [], "lead": "x"}, "brief": {"text": "b"}})
+    p = bot.build_live_payload()
+    assert len(p["open_setups"]) == 1
+    o = p["open_setups"][0]
+    assert o["ticker"] == "NVDA" and o["asset_class"] == "stock" and o["last_price"] == 214.0
+    assert o["source"] == "auto" and o["tp1"] == 235.0
+    assert p["crossasset"]["lead"] == "x" and p["brief"]["text"] == "b"
+
+
+def test_live_endpoint_headers_and_json(monkeypatch):
+    import asyncio, json as _json
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    monkeypatch.setattr(bot, "_DASH_CACHE", {"crossasset": None, "brief": None})
+    resp = asyncio.run(bot._handle_live(None))
+    assert resp.status == 200
+    assert resp.headers["Access-Control-Allow-Origin"] == "*"
+    body = _json.loads(resp.body)
+    assert body["open_setups"] == [] and "generated_at" in body
