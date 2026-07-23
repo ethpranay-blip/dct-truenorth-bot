@@ -818,14 +818,15 @@ NO_SETUP = {
 
 def build_rule_setup(ticker: str, info: dict | None, ta: dict | None, derivs: dict | None,
                      min_score: float = SETUP_SCORE_MIN,
-                     tp_rs: tuple[float, float] = (1.5, 3.0)) -> dict:
+                     tp_rs: tuple[float, float] = (2.5, 4.0)) -> dict:
     """Deterministic trade setup from TN data — ATR-based levels, no LLM.
 
     Same output shape the Claude generator produced, so the embed builder and
     outcome tracking are untouched. Direction requires multi-signal alignment
     (|score| ≥ min_score of ±5.5 possible); levels are ATR-derived and coherent
-    by construction: stop 1.5×ATR from entry, TP1/TP2 at tp_rs R-multiples
-    (defaults 1.5R/3R for !setup; the auto-signal scan passes 2.5R/4R).
+    by construction: stop 1.5×ATR from entry, TP1/TP2 at tp_rs R-multiples.
+    Default is 2.5R/4R — the house minimum-1:2.5 standard shared by !setup, the
+    auto-signal scan, and the TN app agent's memory.
     """
     price = ((info or {}).get("market_data") or {}).get("current_price")
     atr = (_ind(ta).get("atr14") or {}).get("value")
@@ -914,7 +915,7 @@ def _setup_channel_allowed(channel_id: int) -> bool:
 
 AUTO_SIGNAL_UNIVERSE = 15     # scanner universe size (ranked, full list returned)
 AUTO_SIGNAL_PER_SIDE = 3      # leaders considered for longs / laggards for shorts
-AUTO_TP_RS = (2.5, 4.0)       # min 1:2.5 R:R — Pranay's spec, vs !setup's 1.5R/3R
+AUTO_TP_RS = (2.5, 4.0)       # min 1:2.5 R:R — the house standard (now also build_rule_setup's default)
 RVWAP_WINDOWS = (7, 30, 90, 365)
 
 # Fixed cross-asset watchlist for auto-signals: stocks/commodities have no RS

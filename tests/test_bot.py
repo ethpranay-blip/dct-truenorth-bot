@@ -630,20 +630,23 @@ def test_rule_setup_long_on_bullish_alignment():
     s = bot.build_rule_setup("BTC", _info(), _bullish_ta(), _derivs_full())
     assert s["has_setup"] is True and s["direction"] == "LONG"
     assert s["conviction"] in ("High", "Medium")
-    assert "1.5R/3R" in s["reasoning"] and "funding" in s["reasoning"]
-    # Levels coherent + ATR math: stop = price − 1.5·ATR, TP1 = +1.5R, TP2 = +3R
+    assert "2.5R/4R" in s["reasoning"] and "funding" in s["reasoning"]
+    assert s["rr_ratio"] == "2.5 (TP1) / 4.0 (TP2)"
+    # Levels coherent + ATR math: stop = price − 1.5·ATR, TP1 = +2.5R, TP2 = +4R
     entry = bot._parse_zone_midpoint(s["entry_zone"])
     stop = bot._parse_price(s["stop_loss"])
     tp1 = bot._parse_price(s["take_profit_1"])
     tp2 = bot._parse_price(s["take_profit_2"])
     assert stop < entry < tp1 < tp2
-    assert abs((entry - stop) - 1.5 * 2111.73) < 2       # risk = 1.5 ATR
-    assert abs((tp1 - entry) - 1.5 * (entry - stop)) < 2  # 1.5R
-    assert abs((tp2 - entry) - 3.0 * (entry - stop)) < 2  # 3R
+    assert abs((entry - stop) - 1.5 * 2111.73) < 5       # risk = 1.5 ATR (± $ rounding)
+    assert abs((tp1 - entry) - 2.5 * (entry - stop)) < 5  # 2.5R
+    assert abs((tp2 - entry) - 4.0 * (entry - stop)) < 5  # 4R
 
 
 def test_rule_setup_short_on_bearish_alignment():
-    s = bot.build_rule_setup("ETH", _info(price=2500.0), _bearish_ta(), None)
+    # Use the default (BTC-scale) price so the fixture's ATR is realistic — a
+    # 2.5R/4R short off a tiny price would push TP1 negative (unrealistic ATR).
+    s = bot.build_rule_setup("BTC", _info(), _bearish_ta(), None)
     assert s["has_setup"] is True and s["direction"] == "SHORT"
     entry = bot._parse_zone_midpoint(s["entry_zone"])
     stop = bot._parse_price(s["stop_loss"])
