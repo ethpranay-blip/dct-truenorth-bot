@@ -2109,3 +2109,14 @@ def test_optional_channel_id_parses_degrades_and_unset(monkeypatch, capsys):
     assert "WARNING: X_CH" in capsys.readouterr().out     # ...but loudly logged
     monkeypatch.delenv("X_CH", raising=False)
     assert bot._optional_channel_id("X_CH") is None
+
+
+def test_storage_status_flags_ephemeral_vs_persistent(tmp_path):
+    assert "EPHEMERAL" in bot._storage_status(path=".")
+    assert "EPHEMERAL" in bot._storage_status(path="")
+    d = str(tmp_path)
+    sf = str(tmp_path / "setups.json")
+    s = bot._storage_status(path=d, setups_file=sf)
+    assert "persistent" in s and "not yet created" in s
+    (tmp_path / "setups.json").write_text("{}")
+    assert "present" in bot._storage_status(path=d, setups_file=sf)

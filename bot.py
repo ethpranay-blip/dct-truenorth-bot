@@ -68,6 +68,21 @@ CH = {
     "us":     int(os.environ["CH_US_SESSION"]),
     "regime": int(os.environ["CH_REGIME_OUTLOOK"]),
 }
+def _storage_status(path: str | None = None, setups_file: str | None = None) -> str:
+    """One-line persistence diagnostic for !health. Ephemeral CACHE_PATH means
+    the track record resets on every redeploy — surface it loudly so a missing
+    volume mount can't silently wipe history unnoticed. Defaults resolve at call
+    time (CACHE_PATH is defined later in the module)."""
+    path = CACHE_PATH if path is None else path
+    setups_file = SETUPS_PATH if setups_file is None else setups_file
+    if path in (".", "", "./"):
+        return "⚠️ EPHEMERAL (CACHE_PATH unset — track record resets on redeploy; mount a volume + set CACHE_PATH)"
+    exists = os.path.exists(setups_file)
+    writable = os.access(path, os.W_OK) if os.path.isdir(path) else False
+    flag = "persistent" if writable else "⚠️ not writable"
+    return f"{flag} · CACHE_PATH={path} · setups.json {'present' if exists else 'not yet created'}"
+
+
 def _optional_channel_id(name: str) -> int | None:
     """Parse an optional channel-ID env var. A malformed value (e.g. a webhook
     URL pasted by mistake) must degrade to 'unset' with a loud log — an optional
@@ -2142,6 +2157,7 @@ async def manual_health(ctx: commands.Context):
                f"({_ts['wins']} wins, {_ts['losses']} losses, {_ts['expired']} expired)"),
         inline=False,
     )
+    e.add_field(name="Storage", value=_storage_status(), inline=False)
     _reg = _LAST_REGIME.get("regime", "UNKNOWN")
     _reg_ts = _LAST_REGIME.get("timestamp")
     if _reg == "UNKNOWN" or not _reg_ts:
