@@ -68,12 +68,28 @@ CH = {
     "us":     int(os.environ["CH_US_SESSION"]),
     "regime": int(os.environ["CH_REGIME_OUTLOOK"]),
 }
+def _optional_channel_id(name: str) -> int | None:
+    """Parse an optional channel-ID env var. A malformed value (e.g. a webhook
+    URL pasted by mistake) must degrade to 'unset' with a loud log — an optional
+    feature's config error can never be allowed to crash-loop the whole bot."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[CONFIG] WARNING: {name} is not a numeric channel ID "
+              f"(got {raw[:40]!r}...) — treating as unset. Use the Discord "
+              f"channel ID (right-click channel → Copy Channel ID), not a webhook URL.")
+        return None
+
+
 # Optional ops channel for failure alerts. Unset → alerts go to logs only
 # (the community channels never see plumbing noise).
-CH_OPS = int(os.environ["CH_OPS"]) if os.environ.get("CH_OPS", "").strip() else None
+CH_OPS = _optional_channel_id("CH_OPS")
 
 # Optional auto-signal channel. Unset → the 4h auto-signal scan never runs.
-CH_SIGNALS = int(os.environ["CH_SIGNALS"]) if os.environ.get("CH_SIGNALS", "").strip() else None
+CH_SIGNALS = _optional_channel_id("CH_SIGNALS")
 
 # Public dashboard with top setups + screener. When set, every brief links to it.
 DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "").strip()

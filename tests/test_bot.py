@@ -2099,3 +2099,13 @@ def test_winrate_auto_breakdown_line():
     assert stats["auto_line"] == "manual 0W/1L · auto 1W/0L"
     # no autos → no line, embed unchanged
     assert bot.compute_winrate([s for s in setups if s["source"] != "auto"])["auto_line"] is None
+
+
+def test_optional_channel_id_parses_degrades_and_unset(monkeypatch, capsys):
+    monkeypatch.setenv("X_CH", "123456789012345678")
+    assert bot._optional_channel_id("X_CH") == 123456789012345678
+    monkeypatch.setenv("X_CH", "https://discord.com/api/webhooks/152/qMNRO")
+    assert bot._optional_channel_id("X_CH") is None       # bad value → unset, no crash
+    assert "WARNING: X_CH" in capsys.readouterr().out     # ...but loudly logged
+    monkeypatch.delenv("X_CH", raising=False)
+    assert bot._optional_channel_id("X_CH") is None
