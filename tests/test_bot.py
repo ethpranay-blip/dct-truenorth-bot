@@ -1160,7 +1160,7 @@ def test_resolution_embed_expired_grey():
     s = _resolved("EXPIRED", resolution_price=96000.0, result_pct=0.2, outcome_label="EXPIRED")
     e = bot.build_resolution_embed(s)
     assert e.color.value == bot.COLOR_EXPIRED
-    assert "EXPIRED" in e.title and "no trigger in 48h" in e.description
+    assert "CLOSED AT MARKET" in e.title
 
 
 def test_compute_winrate_math():
@@ -1460,9 +1460,12 @@ def test_find_recent_open_window_and_filters(monkeypatch):
     other = {**_open_long(ts=now.isoformat()), "coingecko_id": "ethereum"}
     monkeypatch.setattr(bot, "_SETUPS", [stale, resolved, other, fresh])
     hit = bot._find_recent_open("bitcoin")
-    assert hit is fresh                       # newest OPEN bitcoin inside 6h
+    assert hit is fresh                       # newest OPEN bitcoin
     monkeypatch.setattr(bot, "_SETUPS", [stale, resolved])
-    assert bot._find_recent_open("bitcoin") is None   # stale + resolved don't count
+    # Any OPEN position blocks by default — one asset, one open trade.
+    assert bot._find_recent_open("bitcoin") is stale
+    # A recency window still works when asked for explicitly.
+    assert bot._find_recent_open("bitcoin", hours=6) is None
     assert bot._find_recent_open("solana") is None
 
 
@@ -2539,14 +2542,21 @@ def test_build_stocks_screener_rows_and_rs(monkeypatch):
     flat = [{"t": f"{i:04d}", "open": "100", "high": "100.5", "low": "99.5",
              "close": "100", "volume": "5"} for i in range(60)]
 
+    monkeypatch.setattr(bot, "ETFS_SCREENER", ["SMH"])
+    monkeypatch.setattr(bot, "SECTOR_ETFS", {"XLE": "Energy"})
+
     async def fake_call(tool, args, **kw):
         assert tool == "historical_bars" and args["asset_class"] == "stock"
-        assert set(args["instruments"]) == {"NVDA", "TSLA", "QQQ"}
-        return {"data": {"NVDA": up, "TSLA": dn, "QQQ": flat}}
+        assert {"NVDA", "TSLA", "QQQ", "SMH", "XLE", "SPY"} <= set(args["instruments"])
+        return {"data": {"NVDA": up, "TSLA": dn, "QQQ": flat, "SPY": flat,
+                         "SMH": up, "XLE": dn}}
 
     monkeypatch.setattr(bot, "tn_call_safe", fake_call)
-    rows = asyncio.run(bot.build_stocks_screener())
+    eq = asyncio.run(bot.build_stocks_screener())
+    rows = eq["stocks"]
     assert [r["ticker"] for r in rows] == ["NVDA", "TSLA"]   # sorted by RS desc
+    assert eq["etfs"][0]["ticker"] == "SMH" and eq["etfs"][0]["rs30d"] > 0
+    assert eq["sectors"][0]["label"] == "Energy" and eq["sectors"][0]["rs30d"] < 0
     nvda, tsla = rows
     # benchmark flat → RS == own 30d change; NVDA up, TSLA down
     assert nvda["rs30d"] > 0 > tsla["rs30d"]
@@ -2563,8 +2573,10 @@ def test_build_stocks_screener_skips_thin_data(monkeypatch):
         return {"data": {"NVDA": _ramp_bars(n=60, step=1.0), "GHOST": _ramp_bars(n=5),
                          "QQQ": _ramp_bars(n=60, step=1.0)}}
 
+    monkeypatch.setattr(bot, "ETFS_SCREENER", [])
+    monkeypatch.setattr(bot, "SECTOR_ETFS", {})
     monkeypatch.setattr(bot, "tn_call_safe", fake_call)
-    rows = asyncio.run(bot.build_stocks_screener())
+    rows = asyncio.run(bot.build_stocks_screener())["stocks"]
     assert [r["ticker"] for r in rows] == ["NVDA"]           # GHOST: too few bars
 
 
@@ -2628,3 +2640,47 @@ def test_flow_post_rejects_disabled_oversize_badjson(monkeypatch):
     assert asyncio.run(bot._handle_flow_post(_Req(hdr, b"not json"))).status == 400
     assert asyncio.run(bot._handle_flow_post(_Req(hdr, b"[1,2]"))).status == 400
     assert "flow" not in bot._DASH_CACHE
+
+
+# --- $100-per-signal accounting + duplicate prevention -----------------------
+
+def test_winrate_closed_accounting():
+    setups = [
+        {"status": "WIN", "entry_price": 100.0, "stop_loss": 94.0,
+         "resolution_price": 115.0, "result_pct": 15.0},
+        {"status": "LOSS", "entry_price": 100.0, "stop_loss": 94.0,
+         "resolution_price": 94.0, "result_pct": -6.0},
+        {"status": "EXPIRED", "entry_price": 100.0, "stop_loss": 94.0,
+         "resolution_price": 102.0, "result_pct": 2.0},   # market-price close counts
+        {"status": "OPEN", "entry_price": 100.0, "stop_loss": 94.0,
+         "resolution_price": None, "result_pct": None},
+    ]
+    s = bot.compute_winrate(setups)
+    assert s["closed"] == 3
+    assert abs(s["net_pct"] - 11.0) < 1e-9    # +15 − 6 + 2 per $100 each
+    assert s["win_rate"] == 50.0              # TP1 win-rate still excludes expiry closes
+
+
+def test_auto_signal_never_duplicates_open_asset(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "CH_SIGNALS", 999)
+    # An OPEN TSLA short from 20 hours ago — well past the old 6h window.
+    from datetime import timedelta
+    old_ts = (bot.datetime.now(bot.IST) - timedelta(hours=20)).isoformat()
+    monkeypatch.setattr(bot, "_SETUPS", [{
+        "ticker": "TSLA", "coingecko_id": "TSLA", "asset_class": "stock",
+        "direction": "SHORT", "status": "OPEN", "timestamp": old_ts,
+    }])
+    ch = _StubChannel()
+    monkeypatch.setattr(bot.bot, "get_channel", lambda _id: ch)
+    calls = []
+
+    async def fake_call(tool, args, **kw):
+        calls.append(tool)
+        return None
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    monkeypatch.setattr(bot, "SIGNALS_WATCHLIST", ["TSLA"])
+    monkeypatch.setattr(bot, "_WATCHLIST", [])
+    asyncio.run(bot._scan_watchlist())
+    assert ch.sent == []          # open position blocks a new signal outright
+    assert calls == []            # ...without even fetching data for it

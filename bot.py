@@ -1609,10 +1609,11 @@ def build_resolution_embed(s: dict) -> discord.Embed:
         title = "❌ STOPPED"
         desc = f"**{s['ticker']} {d}** from {_money(entry)} → SL {_money(s['stop_loss'])} hit ({_signed_pct(pct)})\n⏱ {elapsed} since entry"
         color = COLOR_SHORT
-    else:  # EXPIRED
-        title = "⏰ EXPIRED"
-        tail = f" (last {_signed_pct(pct)})" if pct is not None else ""
-        desc = f"**{s['ticker']} {d}** from {_money(entry)} → no trigger in {SETUP_EXPIRY_HOURS}h{tail}"
+    else:  # EXPIRED — window ran out; position closes at market like a real trade
+        title = "⏰ CLOSED AT MARKET"
+        tail = f" → closed {_money(res)} ({_signed_pct(pct)})" if res is not None else " → closed at market"
+        desc = (f"**{s['ticker']} {d}** from {_money(entry)}{tail}\n"
+                f"No trigger inside the tracking window — position closed like a real trade.")
         color = COLOR_EXPIRED
     e = discord.Embed(title=title, description=desc, color=color)
     e.set_footer(text=FOOTER + " · tracked setup · not financial advice")
@@ -1746,13 +1747,17 @@ async def track_setups() -> None:
 SETUP_REUSE_HOURS = 6
 
 
-def _find_recent_open(coingecko_id: str, hours: float = SETUP_REUSE_HOURS) -> dict | None:
-    """An OPEN setup for this asset younger than `hours`, if any — !setup reuses
-    it instead of double-logging near-identical trades into the track record."""
+def _find_recent_open(coingecko_id: str, hours: float | None = None) -> dict | None:
+    """An OPEN setup for this asset — any age by default. One asset = one open
+    position: every shown signal is treated as a real trade, so a new signal on
+    an asset with an open trade would silently double the exposure. (Pass hours
+    to restrict to a recency window; None = any open blocks.)"""
     now = datetime.now(IST)
     for s in reversed(_SETUPS):  # newest first
         if s.get("status") != "OPEN" or s.get("coingecko_id") != coingecko_id:
             continue
+        if hours is None:
+            return s
         ts = _parse_ts(s.get("timestamp"))
         if ts and (now - ts).total_seconds() < hours * 3600:
             return s
@@ -1772,6 +1777,14 @@ def compute_winrate(setups: list[dict]) -> dict:
         risk = abs(s["entry_price"] - s["stop_loss"])
         if risk > 0 and s.get("resolution_price") is not None:
             realized_rr.append(abs(s["resolution_price"] - s["entry_price"]) / risk)
+    # Every closed trade counts: TP1 wins, stops, and window-expiry closes at
+    # market price all carry a result_pct. net_pct = sum over closed trades —
+    # i.e. dollars made per $100 staked on every signal shown.
+    closed = len(wins) + len(losses) + len(expired)
+    closed_pcts = [s["result_pct"] for s in setups
+                   if s.get("status") in ("WIN", "LOSS", "EXPIRED") and s.get("result_pct") is not None]
+    net_pct = sum(closed_pcts) if closed_pcts else None
+
     # Manual (!setup) vs auto (4h scan) breakdown — only surfaced once any
     # auto signal exists, so the embed is unchanged until the feature is used.
     auto_line = None
@@ -1793,6 +1806,8 @@ def compute_winrate(setups: list[dict]) -> dict:
         "best": max(pcts) if pcts else None,
         "worst": min(pcts) if pcts else None,
         "avg_rr": (sum(realized_rr) / len(realized_rr)) if realized_rr else None,
+        "closed": closed,
+        "net_pct": round(net_pct, 2) if net_pct is not None else None,
         "auto_line": auto_line,
     }
 
@@ -1817,6 +1832,13 @@ def build_winrate_embed(stats: dict) -> discord.Embed:
         value=(f"{stats['avg_rr']:.2f}" if stats["avg_rr"] is not None else "—"),
         inline=True,
     )
+    if stats.get("net_pct") is not None and stats.get("closed"):
+        sign = "+" if stats["net_pct"] >= 0 else ""
+        e.add_field(
+            name="$100 per signal",
+            value=f"net {sign}${stats['net_pct']:.2f} across {stats['closed']} closed trades",
+            inline=False,
+        )
     if stats.get("auto_line"):
         e.add_field(name="By engine", value=stats["auto_line"], inline=False)
     e.set_footer(text=FOOTER + " · win rate excludes expired")
@@ -2184,6 +2206,18 @@ STOCKS_SCREENER = [
 ]
 STOCKS_BENCHMARK = "QQQ"
 
+# ETFs (indices + semis + metals) and the 11 SPDR sector funds, both vs SPY —
+# the sector table answers "which sector is money flowing into." Env-overridable.
+ETFS_SCREENER = [
+    t.strip().upper() for t in os.environ.get(
+        "ETFS_SCREENER", "QQQ,SPY,IWM,SMH,SOXL,GLD").split(",") if t.strip()
+]
+SECTOR_ETFS = {
+    "XLK": "Technology", "XLE": "Energy", "XLF": "Financials", "XLV": "Health Care",
+    "XLI": "Industrials", "XLY": "Cons. Discretionary", "XLP": "Cons. Staples",
+    "XLU": "Utilities", "XLB": "Materials", "XLRE": "Real Estate", "XLC": "Comm. Services",
+}
+
 # Cached dashboard snapshot (refreshed every 15 min by refresh_dashboard_cache).
 _DASH_CACHE: dict = {"crossasset": None, "brief": None}
 
@@ -2239,6 +2273,12 @@ async def build_cross_asset_map() -> dict:
                           "pct": round(latest["change_percentage"], 1), "horizon": "24h",
                           "level": latest.get("close")})
 
+    # US sector tiles ride the equities cache (7d %) — sector money flow at a glance.
+    for r in (_DASH_CACHE.get("sectors") or []):
+        if r.get("chg7d") is not None:
+            tiles.append({"group": "Sectors", "label": r["ticker"],
+                          "pct": round(r["chg7d"], 1), "horizon": "7d"})
+
     # Lead/lag read over the 7d groups (Macro is context, not ranked).
     groups = {}
     for t in tiles:
@@ -2257,48 +2297,70 @@ async def build_cross_asset_map() -> dict:
     return {"tiles": tiles, "lead": lead, "at": datetime.now(IST).isoformat()}
 
 
-async def build_stocks_screener() -> list[dict]:
-    """Stocks screener rows for the dashboard: one batched daily-bars call for
-    the curated list + QQQ benchmark → price, 24h/30d %, 30d RS vs Nasdaq-100,
-    RVWAP structural bias, daily signal score, and a 30-close spark. 30d uses
-    21 trading bars (~one month of sessions)."""
+def _equity_row(sym: str, bars: list, bench30: float | None, label: str | None = None) -> dict | None:
+    """One screener row from sorted daily bars: price, 1d/7d/30d %, 30d RS vs
+    the benchmark, RVWAP bias, daily signal score, 30-close spark."""
+    bars = sorted(bars or [], key=lambda c: c.get("t") or "")
+    if len(bars) < 25:
+        return None
+    try:
+        price = float(bars[-1]["close"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    ta = compute_indicators_from_bars(bars)
+    score, _b, _be = _setup_score(ta) if ta else (None, [], [])
+    chg30 = _pct_change(bars, 21)
+    spark = []
+    for c in bars[-30:]:
+        try:
+            spark.append(float(c["close"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return {
+        "ticker": sym,
+        "label": label,
+        "price": price,
+        "chg1d": _pct_change(bars, 1),
+        "chg7d": _pct_change(bars, 5),
+        "chg30d": chg30,
+        "rs30d": (chg30 - bench30) if (chg30 is not None and bench30 is not None) else None,
+        "rvwap_bias": rvwap_bias(price, compute_rvwaps(bars)),
+        "score": round(score, 1) if score is not None else None,
+        "spark": spark,
+    }
+
+
+async def build_stocks_screener() -> dict:
+    """Stocks + ETFs + sector funds in ONE batched daily-bars call. Stocks are
+    benchmarked vs QQQ; ETFs and the 11 SPDR sectors vs SPY (sector flow reads
+    against the broad market). 30d uses 21 trading bars. Returns
+    {stocks, etfs, sectors} row lists."""
+    universe = (STOCKS_SCREENER + [STOCKS_BENCHMARK] + ETFS_SCREENER
+                + list(SECTOR_ETFS) + ["SPY"])
     start = (datetime.now(IST) - timedelta(days=380)).astimezone(ZoneInfo("UTC")).isoformat()
     raw = await tn_call_safe("historical_bars", {
-        "instruments": STOCKS_SCREENER + [STOCKS_BENCHMARK],
+        "instruments": sorted(set(universe)),
         "asset_class": "stock", "timeframe": "1d", "start": start,
     })
     data = (raw or {}).get("data") or {}
-    bench30 = _pct_change(data.get(STOCKS_BENCHMARK) or [], 21)
-    rows = []
-    for sym in STOCKS_SCREENER:
-        bars = sorted(data.get(sym) or [], key=lambda c: c.get("t") or "")
-        if len(bars) < 25:
-            continue
-        try:
-            price = float(bars[-1]["close"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        ta = compute_indicators_from_bars(bars)
-        score, _b, _be = _setup_score(ta) if ta else (None, [], [])
-        chg30 = _pct_change(bars, 21)
-        spark = []
-        for c in bars[-30:]:
-            try:
-                spark.append(float(c["close"]))
-            except (KeyError, TypeError, ValueError):
-                continue
-        rows.append({
-            "ticker": sym,
-            "price": price,
-            "chg1d": _pct_change(bars, 1),
-            "chg30d": chg30,
-            "rs30d": (chg30 - bench30) if (chg30 is not None and bench30 is not None) else None,
-            "rvwap_bias": rvwap_bias(price, compute_rvwaps(bars)),
-            "score": round(score, 1) if score is not None else None,
-            "spark": spark,
-        })
-    rows.sort(key=lambda r: r["rs30d"] if r["rs30d"] is not None else -999, reverse=True)
-    return rows
+    qqq30 = _pct_change(data.get(STOCKS_BENCHMARK) or [], 21)
+    spy30 = _pct_change(data.get("SPY") or [], 21)
+
+    def rows_for(symbols, bench30, labels=None):
+        out = []
+        for sym in symbols:
+            r = _equity_row(sym, data.get(sym) or [], bench30,
+                            (labels or {}).get(sym))
+            if r:
+                out.append(r)
+        out.sort(key=lambda r: r["rs30d"] if r["rs30d"] is not None else -999, reverse=True)
+        return out
+
+    return {
+        "stocks": rows_for(STOCKS_SCREENER, qqq30),
+        "etfs": rows_for(ETFS_SCREENER, spy30),
+        "sectors": rows_for(list(SECTOR_ETFS), spy30, SECTOR_ETFS),
+    }
 
 
 async def refresh_dashboard_cache() -> None:
@@ -2306,7 +2368,10 @@ async def refresh_dashboard_cache() -> None:
     15 min). Best-effort."""
     try:
         _DASH_CACHE["crossasset"] = await build_cross_asset_map()
-        _DASH_CACHE["stocks"] = await build_stocks_screener()
+        eq = await build_stocks_screener()
+        _DASH_CACHE["stocks"] = eq["stocks"]
+        _DASH_CACHE["etfs"] = eq["etfs"]
+        _DASH_CACHE["sectors"] = eq["sectors"]
         sc = await tn_call_safe("performance_scanner",
                                 {"universe_size": 30, "top_n": 30, "lookback_days": 7})
         _DASH_CACHE["scanner_tickers"] = [
@@ -2353,6 +2418,8 @@ def build_live_payload() -> dict:
         "crossasset": _DASH_CACHE.get("crossasset"),
         "brief": _DASH_CACHE.get("brief"),
         "stocks": _DASH_CACHE.get("stocks"),
+        "etfs": _DASH_CACHE.get("etfs"),
+        "sectors": _DASH_CACHE.get("sectors"),
         "flow": _flow_if_fresh(),
     }
 
