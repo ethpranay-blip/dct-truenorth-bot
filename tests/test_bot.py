@@ -2572,3 +2572,59 @@ def test_live_payload_includes_stocks(monkeypatch):
     monkeypatch.setattr(bot, "_SETUPS", [])
     monkeypatch.setattr(bot, "_DASH_CACHE", {"stocks": [{"ticker": "NVDA"}]})
     assert bot.build_live_payload()["stocks"] == [{"ticker": "NVDA"}]
+
+
+# --- flow intel push (whales + Polymarket snapshot) --------------------------
+
+def test_flow_post_auth_and_roundtrip(tmp_path, monkeypatch):
+    import asyncio, json as _json
+    monkeypatch.setattr(bot, "CACHE_PATH", str(tmp_path))
+    monkeypatch.setattr(bot, "FLOW_PATH", str(tmp_path / "flow.json"))
+    monkeypatch.setattr(bot, "WATCHLIST_SECRET", "s3cret")
+    monkeypatch.setattr(bot, "_DASH_CACHE", {})
+
+    class _Req:
+        def __init__(self, headers, raw):
+            self.headers = headers
+            self._raw = raw
+        async def read(self):
+            return self._raw
+
+    body = _json.dumps({"whales": {"BTC": {"sentiment": "BEARISH", "ls_ratio": 0.27}},
+                        "as_of": "1999-01-01T00:00:00+05:30"}).encode()  # client stamp must be ignored
+    r = asyncio.run(bot._handle_flow_post(_Req({"X-Watchlist-Secret": "nope"}, body)))
+    assert r.status == 401
+    r = asyncio.run(bot._handle_flow_post(_Req({"X-Watchlist-Secret": "s3cret"}, body)))
+    assert r.status == 200
+    flow = bot._DASH_CACHE["flow"]
+    assert flow["whales"]["BTC"]["sentiment"] == "BEARISH"
+    assert not flow["as_of"].startswith("1999")          # server re-stamped
+    # persisted + reload
+    monkeypatch.setattr(bot, "_DASH_CACHE", {})
+    bot.init_flow()
+    assert bot._DASH_CACHE["flow"]["whales"]["BTC"]["ls_ratio"] == 0.27
+    # fresh → served; stale → hidden
+    assert bot._flow_if_fresh() is not None
+    bot._DASH_CACHE["flow"]["as_of"] = "2020-01-01T00:00:00+05:30"
+    assert bot._flow_if_fresh() is None
+
+
+def test_flow_post_rejects_disabled_oversize_badjson(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "_DASH_CACHE", {})
+
+    class _Req:
+        def __init__(self, headers, raw):
+            self.headers = headers
+            self._raw = raw
+        async def read(self):
+            return self._raw
+
+    monkeypatch.setattr(bot, "WATCHLIST_SECRET", "")
+    assert asyncio.run(bot._handle_flow_post(_Req({}, b"{}"))).status == 403
+    monkeypatch.setattr(bot, "WATCHLIST_SECRET", "s")
+    hdr = {"X-Watchlist-Secret": "s"}
+    assert asyncio.run(bot._handle_flow_post(_Req(hdr, b"x" * 70_000))).status == 400
+    assert asyncio.run(bot._handle_flow_post(_Req(hdr, b"not json"))).status == 400
+    assert asyncio.run(bot._handle_flow_post(_Req(hdr, b"[1,2]"))).status == 400
+    assert "flow" not in bot._DASH_CACHE

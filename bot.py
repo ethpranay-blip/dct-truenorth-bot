@@ -2353,6 +2353,7 @@ def build_live_payload() -> dict:
         "crossasset": _DASH_CACHE.get("crossasset"),
         "brief": _DASH_CACHE.get("brief"),
         "stocks": _DASH_CACHE.get("stocks"),
+        "flow": _flow_if_fresh(),
     }
 
 
@@ -2476,6 +2477,70 @@ async def _handle_watchlist_options(_request: web.Request) -> web.Response:
     return web.Response(status=204, headers=_WL_CORS)
 
 
+# Flow intel (whales + Polymarket) — pushed by a scheduled Claude session that
+# holds the TN MCP auth (this data is NOT on the keyless REST; the bot never
+# holds TN credentials). Same shared secret as the watchlist writes.
+FLOW_PATH = os.path.join(CACHE_PATH, "flow.json")
+FLOW_STALE_HOURS = 13   # hide from /api/live after ~3 missed 4h pushes
+
+
+def _persist_flow() -> None:
+    try:
+        os.makedirs(CACHE_PATH, exist_ok=True)
+        tmp = FLOW_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_DASH_CACHE.get("flow"), f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, FLOW_PATH)
+    except Exception as e:
+        print(f"[FLOW] WARNING: persist failed: {type(e).__name__}: {e}")
+
+
+def init_flow() -> None:
+    """Load the last flow snapshot at startup (survives redeploys)."""
+    try:
+        if os.path.exists(FLOW_PATH):
+            with open(FLOW_PATH) as f:
+                _DASH_CACHE["flow"] = json.load(f)
+            print("[FLOW] loaded snapshot from disk")
+    except Exception as e:
+        print(f"[FLOW] WARNING: could not load snapshot: {type(e).__name__}: {e}")
+
+
+def _flow_if_fresh() -> dict | None:
+    """The cached flow snapshot, or None once it's stale (pushes stopped)."""
+    flow = _DASH_CACHE.get("flow")
+    ts = _parse_ts((flow or {}).get("as_of"))
+    if not flow or ts is None:
+        return None
+    age_h = (datetime.now(IST) - ts).total_seconds() / 3600
+    return flow if age_h <= FLOW_STALE_HOURS else None
+
+
+async def _handle_flow_post(request: web.Request) -> web.Response:
+    """Secret-gated snapshot write. Body is stored as-is under a size cap —
+    the dashboard renders known fields and ignores the rest."""
+    if not WATCHLIST_SECRET:
+        return web.json_response({"error": "writes disabled"}, status=403, headers=_WL_CORS)
+    supplied = request.headers.get("X-Watchlist-Secret", "")
+    if not hmac.compare_digest(supplied, WATCHLIST_SECRET):
+        return web.json_response({"error": "unauthorized"}, status=401, headers=_WL_CORS)
+    raw = await request.read()
+    if len(raw) > 64_000:
+        return web.json_response({"error": "too large"}, status=400, headers=_WL_CORS)
+    try:
+        body = json.loads(raw)
+        assert isinstance(body, dict)
+    except Exception:
+        return web.json_response({"error": "bad json"}, status=400, headers=_WL_CORS)
+    body["as_of"] = datetime.now(IST).isoformat()   # server-stamped, not client-claimed
+    _DASH_CACHE["flow"] = body
+    _persist_flow()
+    print(f"[FLOW] snapshot updated ({len(raw)} bytes)")
+    return web.json_response({"ok": True, "as_of": body["as_of"]}, headers=_WL_CORS)
+
+
 async def _handle_watchlist_get(_request: web.Request) -> web.Response:
     """Public read: current watched tickers + the add-search candidate list."""
     return web.json_response({
@@ -2530,6 +2595,8 @@ async def start_webhook_server() -> None:
     app.router.add_get("/api/watchlist", _handle_watchlist_get)
     app.router.add_post("/api/watchlist", _handle_watchlist_post)
     app.router.add_route("OPTIONS", "/api/watchlist", _handle_watchlist_options)
+    app.router.add_post("/api/flow", _handle_flow_post)
+    app.router.add_route("OPTIONS", "/api/flow", _handle_watchlist_options)
     app.router.add_get("/api/setup", _handle_setup)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -2550,6 +2617,7 @@ async def on_ready():
     init_setups()  # load tracked setups before the tracker job can fire
     init_regime()  # load the regime baseline before any brief checks it
     init_watchlist()  # load the user watchlist before the auto-signal scan runs
+    init_flow()  # last whale/Polymarket snapshot (pushed by the Claude routine)
     setup_scheduler()
     if not scheduler.running:
         scheduler.start()
