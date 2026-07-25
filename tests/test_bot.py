@@ -2760,3 +2760,24 @@ def test_live_payload_has_tape_and_crowd(monkeypatch):
     p = bot.build_live_payload()
     assert p["tape"]["above_ema50_4h"] is False
     assert p["crowd"]["lean"] == "CROWDED LONG"
+
+
+def test_setup_endpoint_does_not_cache_errors(monkeypatch):
+    import asyncio, json as _json
+    monkeypatch.setattr(bot, "_SETUP_CACHE", {})
+    monkeypatch.setattr(bot, "_SETUP_REQ_TIMES", [])
+    calls = {"n": 0}
+
+    async def flaky(ticker):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"ticker": ticker, "error": "no market data"}   # transient
+        return {"ticker": ticker, "direction": "LONG", "has_setup": True}
+
+    monkeypatch.setattr(bot, "compute_setup_for", flaky)
+    r1 = asyncio.run(bot._handle_setup(_SetupReq("BTC")))
+    assert _json.loads(r1.body)["error"] == "no market data"
+    assert "BTC" not in bot._SETUP_CACHE          # failure was not cached
+    r2 = asyncio.run(bot._handle_setup(_SetupReq("BTC")))
+    assert _json.loads(r2.body)["direction"] == "LONG"   # recomputed, recovered
+    assert calls["n"] == 2

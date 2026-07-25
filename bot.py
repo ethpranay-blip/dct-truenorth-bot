@@ -2730,7 +2730,10 @@ async def _handle_setup(request: web.Request) -> web.Response:
         print(f"[SETUP-API] {ticker} failed: {type(e).__name__}: {e}")
         return web.json_response({"ticker": ticker, "error": "setup generation failed"},
                                  status=500, headers=hdr)
-    _SETUP_CACHE[ticker] = (payload, now)
+    # Only cache successes — a transient upstream failure must not be served
+    # from cache for the next 90 seconds.
+    if not payload.get("error"):
+        _SETUP_CACHE[ticker] = (payload, now)
     return web.json_response(payload, headers=hdr)
 
 
