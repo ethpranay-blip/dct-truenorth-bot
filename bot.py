@@ -145,6 +145,11 @@ REGIME_PATH = os.path.join(CACHE_PATH, "last_regime.json")
 WATCHLIST_PATH = os.path.join(CACHE_PATH, "watchlist.json")
 SETUP_EXPIRY_HOURS = 48
 WATCHLIST_MAX = 25   # cap the user watchlist so the 4h scan can't balloon
+# Bump when the scoring rules change: setups logged under an older version are
+# archived at startup and the public record restarts, so the track record always
+# measures ONE strategy. v2 = EMA20/50 scoring MAs (was SMA), 2026-07-24.
+STRATEGY_VERSION = 2
+ARCHIVE_PATH = os.path.join(CACHE_PATH, "setups_archive.json")
 # Shared secret for the dashboard's watchlist write API (POST /api/watchlist).
 # Unset ⇒ the write endpoint is disabled (read + Discord !watch still work).
 WATCHLIST_SECRET = os.environ.get("WATCHLIST_SECRET", "").strip()
@@ -697,6 +702,32 @@ def _rsi_series(closes: list[float], length: int = 14) -> list[float]:
     return out
 
 
+def _ema_states(bars: list[dict], spans=(20, 50)) -> dict:
+    """{"ema20": {"state": "price_above"|"price_below", "value": float}, ...} from
+    raw OHLCV. EMAs react faster than SMAs at the same length — the scoring MAs
+    are EMA so a momentum shift shows up on the bar it happens, not days later."""
+    closes = []
+    for b in sorted(bars or [], key=lambda c: c.get("t") or ""):
+        try:
+            closes.append(float(b["close"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    out: dict = {}
+    if not closes:
+        return out
+    price = closes[-1]
+    for span in spans:
+        series = _ema(closes, span)
+        if not series:
+            continue
+        val = series[-1]
+        out[f"ema{span}"] = {
+            "state": "price_above" if price > val else "price_below",
+            "value": val,
+        }
+    return out
+
+
 def compute_indicators_from_bars(bars: list[dict]) -> dict | None:
     """Return technical_analysis-compatible {'technical_indicators': {...}} from
     raw OHLCV bars, so build_rule_setup / _setup_score consume it unchanged.
@@ -712,8 +743,10 @@ def compute_indicators_from_bars(bars: list[dict]) -> dict | None:
     if len(closes) < 51:
         return None
     price = closes[-1]
-    sma20 = sum(closes[-20:]) / 20
-    sma50 = sum(closes[-50:]) / 50
+    ema20_series, ema50_series = _ema(closes, 20), _ema(closes, 50)
+    ema20 = ema20_series[-1] if ema20_series else sum(closes[-20:]) / 20
+    ema50 = ema50_series[-1] if ema50_series else sum(closes[-50:]) / 50
+    sma20 = sum(closes[-20:]) / 20   # kept for the Bollinger mid reference
 
     macd_line = [f - s for f, s in zip(_ema(closes, 12)[-len(_ema(closes, 26)):], _ema(closes, 26))]
     signal = _ema(macd_line, 9)
@@ -735,8 +768,8 @@ def compute_indicators_from_bars(bars: list[dict]) -> dict | None:
     atr = sum(trs[-14:]) / 14 if len(trs) >= 14 else None
 
     return {"technical_indicators": {
-        "sma20": {"state": "price_above" if price > sma20 else "price_below", "value": sma20},
-        "sma50": {"state": "price_above" if price > sma50 else "price_below", "value": sma50},
+        "ema20": {"state": "price_above" if price > ema20 else "price_below", "value": ema20},
+        "ema50": {"state": "price_above" if price > ema50 else "price_below", "value": ema50},
         "macd_12_26_9": {"state": macd_state, "momentum": macd_momo},
         "rsi14": {"value": rsi_val, "momentum": rsi_momo},
         "boll_20_2": {"mid_relation": "above_mid" if price > sma20 else "below_mid"},
@@ -756,11 +789,20 @@ async def gather_setup_inputs(ticker: str) -> dict:
     asset_class, instrument = classify_asset(ticker)
     cfg = ASSET_CFG[asset_class]
     if asset_class == "crypto":
-        info, ta, derivs = await asyncio.gather(
+        # TrueNorth's TA tool exposes SMA only, so the EMA scoring MAs are computed
+        # from 4h bars here and merged over the tool's indicators. MACD/RSI/BB/ATR
+        # still come from the tool (MACD is EMA-based already).
+        tf_start = (datetime.now(IST) - timedelta(days=30)).astimezone(ZoneInfo("UTC")).isoformat()
+        info, ta, derivs, tf_bars = await asyncio.gather(
             tn_call_safe("basic_market_info", {"token_address": instrument}),
             tn_call_safe("technical_analysis", {"token_address": instrument, "timeframe": cfg["tf"]}),
             tn_call_safe("derivatives_analysis", {"token_address": instrument}),
+            tn_call_safe("historical_bars", {"instruments": [instrument], "asset_class": "crypto",
+                                             "timeframe": cfg["tf"], "start": tf_start}),
         )
+        emas = _ema_states(((tf_bars or {}).get("data") or {}).get(instrument) or [])
+        if emas and isinstance(ta, dict) and isinstance(ta.get("technical_indicators"), dict):
+            ta = {**ta, "technical_indicators": {**ta["technical_indicators"], **emas}}
         return {"asset_class": asset_class, "instrument": instrument, "timeframe": cfg["tf"],
                 "info": info, "ta": ta, "derivs": derivs, "bars": None}
     # Stocks / commodities: daily bars → local indicators, price from last close.
@@ -802,10 +844,13 @@ def _setup_score(ta: dict | None) -> tuple[float, list[str], list[str]]:
             score -= weight
             bear.append(betext)
 
-    s20 = (ind.get("sma20") or {}).get("state")
-    s50 = (ind.get("sma50") or {}).get("state")
-    _hit(s20 == "price_above", s20 == "price_below", 1.0, "above SMA20", "below SMA20")
-    _hit(s50 == "price_above", s50 == "price_below", 1.0, "above SMA50", "below SMA50")
+    # EMA over SMA: same lengths, faster response — a lost trend reads on the bar
+    # it turns. Falls back to the SMA states if only those are present.
+    e20 = (ind.get("ema20") or ind.get("sma20") or {}).get("state")
+    e50 = (ind.get("ema50") or ind.get("sma50") or {}).get("state")
+    lbl = "EMA" if ind.get("ema20") or ind.get("ema50") else "SMA"
+    _hit(e20 == "price_above", e20 == "price_below", 1.0, f"above {lbl}20", f"below {lbl}20")
+    _hit(e50 == "price_above", e50 == "price_below", 1.0, f"above {lbl}50", f"below {lbl}50")
     macd = ind.get("macd_12_26_9") or {}
     _hit(macd.get("state") == "bull", macd.get("state") == "bear", 1.0, "MACD bull", "MACD bear")
     _hit(macd.get("momentum") == "rising", macd.get("momentum") == "falling", 0.5,
@@ -1479,6 +1524,26 @@ def _persist_setups() -> None:
         print(f"[TRACK] WARNING: failed to persist setups: {type(e).__name__}: {e}")
 
 
+def _archive_setups(rows: list[dict]) -> None:
+    """Append rows to setups_archive.json — history is never deleted, just retired
+    out of the live record so win rate always describes one strategy."""
+    try:
+        os.makedirs(CACHE_PATH, exist_ok=True)
+        prior = []
+        if os.path.exists(ARCHIVE_PATH):
+            with open(ARCHIVE_PATH) as f:
+                blob = json.load(f)
+            prior = blob.get("setups", []) if isinstance(blob, dict) else (blob or [])
+        tmp = ARCHIVE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"setups": prior + rows}, f, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, ARCHIVE_PATH)
+    except Exception as e:
+        print(f"[TRACK] WARNING: archive write failed: {type(e).__name__}: {e}")
+
+
 def init_setups() -> None:
     """Load setups.json at startup. Missing file ⇒ start fresh + warn (covers an
     unmounted Railway volume where the file doesn't survive restarts)."""
@@ -1487,7 +1552,26 @@ def init_setups() -> None:
         if os.path.exists(SETUPS_PATH):
             with open(SETUPS_PATH) as f:
                 data = json.load(f)
-            _SETUPS = data.get("setups", []) if isinstance(data, dict) else (data or [])
+            loaded = data.get("setups", []) if isinstance(data, dict) else (data or [])
+            stale = [s for s in loaded if s.get("strategy_version") != STRATEGY_VERSION]
+            _SETUPS = [s for s in loaded if s.get("strategy_version") == STRATEGY_VERSION]
+            if stale:
+                # A scoring change means the old calls measured a different system.
+                # Open ones close at their last known price (a real position doesn't
+                # evaporate); everything moves to the archive and the record restarts.
+                now_iso = datetime.now(IST).isoformat()
+                for old in stale:
+                    if old.get("status") == "OPEN":
+                        ref = old.get("last_price")
+                        old["status"] = "EXPIRED"
+                        old["outcome_label"] = "STRATEGY CHANGE"
+                        old["resolution_price"] = ref
+                        old["resolved_at"] = now_iso
+                        old["result_pct"] = _trade_pct(old, ref) if ref is not None else None
+                _archive_setups(stale)
+                _persist_setups()
+                print(f"[TRACK] archived {len(stale)} setup(s) from an earlier strategy "
+                      f"version → {ARCHIVE_PATH}; public record restarts at zero")
             open_n = sum(1 for s in _SETUPS if s.get("status") == "OPEN")
             print(f"[TRACK] loaded {len(_SETUPS)} setups ({open_n} open) from {SETUPS_PATH}")
         else:
@@ -1555,6 +1639,7 @@ def log_setup(setup: dict, ticker: str, coingecko_id: str, message, source: str 
         "entry_price": entry, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
         "rr_ratio": str(setup.get("rr_ratio", "")), "conviction": str(setup.get("conviction", "")),
         "source": source, "asset_class": asset_class,
+        "strategy_version": STRATEGY_VERSION,
         "timestamp": datetime.now(IST).isoformat(),
         "discord_message_id": message.id, "discord_channel_id": message.channel.id,
         "status": "OPEN", "resolution_price": None, "resolved_at": None,
@@ -2363,11 +2448,87 @@ async def build_stocks_screener() -> dict:
     }
 
 
+async def build_tape_read() -> dict:
+    """BTC's two lenses, so the headline can never claim momentum the tape denies:
+      structure — price vs the daily SMA50 (multi-week trend context)
+      tape      — price vs the 4h EMA50 and the 7d rolling VWAP (near-term momentum)
+    Both are reported; the dashboard headline is composed from the pair."""
+    tf_start = (datetime.now(IST) - timedelta(days=30)).astimezone(ZoneInfo("UTC")).isoformat()
+    d_start = (datetime.now(IST) - timedelta(days=400)).astimezone(ZoneInfo("UTC")).isoformat()
+    bars4h, bars1d = await asyncio.gather(
+        tn_call_safe("historical_bars", {"instruments": ["bitcoin"], "asset_class": "crypto",
+                                         "timeframe": "4h", "start": tf_start}),
+        tn_call_safe("historical_bars", {"instruments": ["bitcoin"], "asset_class": "crypto",
+                                         "timeframe": "1d", "start": d_start}),
+    )
+    h4 = ((bars4h or {}).get("data") or {}).get("bitcoin") or []
+    d1 = sorted(((bars1d or {}).get("data") or {}).get("bitcoin") or [],
+                key=lambda c: c.get("t") or "")
+    ema = _ema_states(h4, spans=(50,)).get("ema50") or {}
+    price = None
+    if d1:
+        try:
+            price = float(d1[-1]["close"])
+        except (KeyError, TypeError, ValueError):
+            price = None
+    rv = compute_rvwaps(d1)
+    closes = []
+    for c in d1:
+        try:
+            closes.append(float(c["close"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    sma50d = sum(closes[-50:]) / 50 if len(closes) >= 50 else None
+    return {
+        "price": price,
+        "ema50_4h": ema.get("value"),
+        "above_ema50_4h": None if not ema else ema.get("state") == "price_above",
+        "rvwap7d": rv.get(7),
+        "above_rvwap7d": None if (price is None or rv.get(7) is None) else price > rv[7],
+        "sma50_1d": sma50d,
+        "above_sma50_1d": None if (price is None or sma50d is None) else price > sma50d,
+        "at": datetime.now(IST).isoformat(),
+    }
+
+
+def build_crowd_read(derivs: dict | None) -> dict | None:
+    """Crowd/retail positioning proxy from aggregated derivatives (keyless, always
+    fresh): funding rate + its 7d percentile, open interest + its 7d percentile and
+    1d change. High funding percentile with high OI = crowd crowded long."""
+    dd = ((derivs or {}).get("derivative_data") or {}).get("BTC") or {}
+    fund = dd.get("1h Aggregated OI weighted funding rate") or {}
+    oi = dd.get("Aggregated open interest") or {}
+    pct = fund.get("current_funding_percentile_7d")
+    apr = fund.get("annualized_funding_cost_est_in_percentage")
+    # Direction falls back to the raw rate if the annualized estimate is absent.
+    sign_src = apr if apr is not None else fund.get("current_funding_rate_in_percentage")
+    oi_pct = (oi.get("percentile_analysis") or {}).get("current_oi_percentile_7d")
+    if pct is None and sign_src is None and oi_pct is None:
+        return None
+    lean = "NEUTRAL"
+    if sign_src is not None:
+        if sign_src > 0:
+            lean = "CROWDED LONG" if (pct or 0) >= 60 else "LEANING LONG"
+        elif sign_src < 0:
+            lean = "CROWDED SHORT" if pct is not None and pct <= 20 else "LEANING SHORT"
+    return {
+        "lean": lean,
+        "funding_apr": apr,
+        "funding_pctile_7d": pct,
+        "oi_usd": oi.get("current_open_interest"),
+        "oi_chg_1d_usd": (oi.get("rolling_changes") or {}).get("oi_change_1d_abs"),
+        "oi_pctile_7d": oi_pct,
+    }
+
+
 async def refresh_dashboard_cache() -> None:
     """Recompute the cross-asset map + trending tickers into the cache (every
     15 min). Best-effort."""
     try:
         _DASH_CACHE["crossasset"] = await build_cross_asset_map()
+        _DASH_CACHE["tape"] = await build_tape_read()
+        _DASH_CACHE["crowd"] = build_crowd_read(
+            await tn_call_safe("derivatives_analysis", {"token_address": "bitcoin"}))
         eq = await build_stocks_screener()
         _DASH_CACHE["stocks"] = eq["stocks"]
         _DASH_CACHE["etfs"] = eq["etfs"]
@@ -2420,6 +2581,8 @@ def build_live_payload() -> dict:
         "stocks": _DASH_CACHE.get("stocks"),
         "etfs": _DASH_CACHE.get("etfs"),
         "sectors": _DASH_CACHE.get("sectors"),
+        "tape": _DASH_CACHE.get("tape"),
+        "crowd": _DASH_CACHE.get("crowd"),
         "flow": _flow_if_fresh(),
     }
 
@@ -2495,9 +2658,17 @@ async def compute_setup_for(ticker: str) -> dict:
                                  {"instruments": [instrument], "asset_class": "crypto",
                                   "timeframe": "1d", "start": start})
         bars = ((raw or {}).get("data") or {}).get(instrument) or []
-    bias = rvwap_bias(price, compute_rvwaps(bars))
+    rv = compute_rvwaps(bars)
+    bias = rvwap_bias(price, rv)
     setup = build_rule_setup(ticker, g["info"], g["ta"], g.get("derivs"))  # 2.5R/4R, dir at |score|≥2.5
     score, _b, _be = _setup_score(g["ta"])
+    # The momentum pair: scoring-timeframe EMA50 + the 7d rolling VWAP. Fast reads
+    # that show a lost trend on the bar it turns, unlike the slower structure MAs.
+    ind = _ind(g["ta"])
+    ema50 = (ind.get("ema50") or {}).get("state")
+    ema50_above = None if ema50 is None else ema50 == "price_above"
+    rvwap7 = rv.get(7)
+    rvwap7_above = None if (price is None or rvwap7 is None) else price > rvwap7
     regime = _LAST_REGIME.get("regime", "UNKNOWN")
     gate_cleared = bool(setup.get("has_setup")) and abs(score) >= SETUP_SCORE_HIGH and setup["direction"] == bias
     return {
@@ -2509,6 +2680,9 @@ async def compute_setup_for(ticker: str) -> dict:
         "rvwap_bias": bias,
         "regime": regime,
         "gate_cleared": gate_cleared,   # would this also fire as an auto-signal?
+        "ema50_above": ema50_above,     # price vs the scoring-timeframe EMA50
+        "rvwap7d": rvwap7,
+        "rvwap7d_above": rvwap7_above,
         **{k: setup.get(k) for k in ("has_setup", "direction", "conviction", "entry_zone",
                                      "stop_loss", "take_profit_1", "take_profit_2",
                                      "rr_ratio", "reasoning")},

@@ -1256,8 +1256,10 @@ def test_init_setups_missing_file_starts_fresh(tmp_path, monkeypatch):
 def test_init_setups_loads_existing(tmp_path, monkeypatch):
     import json
     path = tmp_path / "setups.json"
+    v = bot.STRATEGY_VERSION
     path.write_text(json.dumps({"version": 1, "setups": [
-        {"ticker": "ETH", "status": "OPEN"}, {"ticker": "BTC", "status": "WIN"}]}))
+        {"ticker": "ETH", "status": "OPEN", "strategy_version": v},
+        {"ticker": "BTC", "status": "WIN", "strategy_version": v}]}))
     monkeypatch.setattr(bot, "CACHE_PATH", str(tmp_path))
     monkeypatch.setattr(bot, "SETUPS_PATH", str(path))
     monkeypatch.setattr(bot, "_SETUPS", [])
@@ -1322,6 +1324,12 @@ def _candle(t, hi, lo, close=None):
     return {"t": t, "t_close": t.replace("T00:", "T00:").replace("Z", "Z"),
             "open": str(lo), "high": str(hi), "low": str(lo), "close": str(close or hi),
             "volume": "1"}
+
+
+def _versioned_open(**kw):
+    """An open setup stamped with the CURRENT strategy version — init_setups
+    archives anything from an older version, so persistence tests must stamp."""
+    return {**_open_long(**kw), "strategy_version": bot.STRATEGY_VERSION}
 
 
 def _open_long(entry=100.0, stop=95.0, tp1=110.0, ts="2026-07-06T00:00:00+00:00"):
@@ -2156,8 +2164,8 @@ def _ramp_bars(n=80, start=100.0, step=1.0, vol=1000.0):
 def test_compute_indicators_shape_and_uptrend_scores_long():
     ta = bot.compute_indicators_from_bars(_ramp_bars(step=1.0))
     ind = ta["technical_indicators"]
-    assert set(ind) == {"sma20", "sma50", "macd_12_26_9", "rsi14", "boll_20_2", "atr14"}
-    assert ind["sma20"]["state"] == "price_above" and ind["sma50"]["state"] == "price_above"
+    assert set(ind) == {"ema20", "ema50", "macd_12_26_9", "rsi14", "boll_20_2", "atr14"}
+    assert ind["ema20"]["state"] == "price_above" and ind["ema50"]["state"] == "price_above"
     assert ind["atr14"]["value"] is not None and ind["atr14"]["value"] > 0
     score, bull, bear = bot._setup_score(ta)
     assert score >= 4.0 and not bear          # clean uptrend → high-conviction long
@@ -2201,7 +2209,7 @@ def test_gather_setup_inputs_stock_path(monkeypatch):
     monkeypatch.setattr(bot, "tn_call_safe", fake_call)
     g = asyncio.run(bot.gather_setup_inputs("AAPL"))
     assert g["asset_class"] == "stock" and g["instrument"] == "AAPL" and g["timeframe"] == "1d"
-    assert g["ta"]["technical_indicators"]["sma20"]["state"] == "price_above"
+    assert g["ta"]["technical_indicators"]["ema20"]["state"] == "price_above"
     assert g["info"]["market_data"]["current_price"] == float(bars[-1]["close"])
     assert g["derivs"] is None and g["bars"] == bars
 
@@ -2684,3 +2692,67 @@ def test_auto_signal_never_duplicates_open_asset(monkeypatch):
     asyncio.run(bot._scan_watchlist())
     assert ch.sent == []          # open position blocks a new signal outright
     assert calls == []            # ...without even fetching data for it
+
+
+
+# --- v2 strategy: EMA scoring, tape read, crowd, archive reset ---------------
+
+def test_ema_states_and_score_prefers_ema():
+    bars = _ramp_bars(n=80, step=1.0)          # compounding uptrend
+    st = bot._ema_states(bars)
+    assert st["ema20"]["state"] == "price_above" and st["ema50"]["state"] == "price_above"
+    assert st["ema20"]["value"] > st["ema50"]["value"]   # faster EMA leads in an uptrend
+    # scorer reads EMA keys and labels them EMA
+    ta = {"technical_indicators": {**st, "atr14": {"value": 4.0}}}
+    score, bull, _bear = bot._setup_score(ta)
+    assert score == 2.0 and any("EMA20" in b for b in bull)
+    # …and still falls back to SMA states when that is all a payload has
+    ta_sma = {"technical_indicators": {"sma20": {"state": "price_above"},
+                                       "sma50": {"state": "price_above"}}}
+    score2, bull2, _ = bot._setup_score(ta_sma)
+    assert score2 == 2.0 and any("SMA20" in b for b in bull2)
+
+
+def test_build_crowd_read_lean_and_none():
+    d = _derivs_full(funding=0.003, pctile=72.0)
+    c = bot.build_crowd_read(d)
+    assert c["lean"] in ("CROWDED LONG", "LEANING LONG")
+    assert c["funding_pctile_7d"] == 72.0 and c["oi_usd"] is not None
+    assert bot.build_crowd_read(None) is None
+    assert bot.build_crowd_read({"derivative_data": {"BTC": {}}}) is None
+
+
+def test_init_setups_archives_prior_strategy_version(tmp_path, monkeypatch):
+    import json
+    path = tmp_path / "setups.json"
+    arch = tmp_path / "setups_archive.json"
+    path.write_text(json.dumps({"version": 1, "setups": [
+        # v1 open position with a stamped last price → closes at market on archive
+        {"ticker": "OLD", "status": "OPEN", "strategy_version": 1, "direction": "LONG",
+         "entry_price": 100.0, "last_price": 108.0, "timestamp": "2026-07-01T00:00:00+05:30"},
+        {"ticker": "OLDWIN", "status": "WIN", "strategy_version": 1, "result_pct": 5.0},
+        # current-version row survives
+        {"ticker": "NEW", "status": "OPEN", "strategy_version": bot.STRATEGY_VERSION},
+    ]}))
+    monkeypatch.setattr(bot, "CACHE_PATH", str(tmp_path))
+    monkeypatch.setattr(bot, "SETUPS_PATH", str(path))
+    monkeypatch.setattr(bot, "ARCHIVE_PATH", str(arch))
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    bot.init_setups()
+    assert [s["ticker"] for s in bot._SETUPS] == ["NEW"]      # record restarts clean
+    archived = json.loads(arch.read_text())["setups"]
+    assert {a["ticker"] for a in archived} == {"OLD", "OLDWIN"}
+    closed = next(a for a in archived if a["ticker"] == "OLD")
+    assert closed["status"] == "EXPIRED" and closed["outcome_label"] == "STRATEGY CHANGE"
+    assert abs(closed["result_pct"] - 8.0) < 1e-9            # closed at last price
+    # nothing lost: the live file no longer carries them
+    assert {s["ticker"] for s in json.loads(path.read_text())["setups"]} == {"NEW"}
+
+
+def test_live_payload_has_tape_and_crowd(monkeypatch):
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    monkeypatch.setattr(bot, "_DASH_CACHE", {"tape": {"above_ema50_4h": False},
+                                             "crowd": {"lean": "CROWDED LONG"}})
+    p = bot.build_live_payload()
+    assert p["tape"]["above_ema50_4h"] is False
+    assert p["crowd"]["lean"] == "CROWDED LONG"
