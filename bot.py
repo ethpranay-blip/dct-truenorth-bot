@@ -304,6 +304,10 @@ BRIEF_SOURCES = [
     ("ta_btc",   "technical_analysis",   {"token_address": "bitcoin", "timeframe": "1d"}),
     ("info_eth", "basic_market_info",    {"token_address": "ethereum"}),
     ("ta_eth",   "technical_analysis",   {"token_address": "ethereum", "timeframe": "1d"}),
+    ("bars_btc", "historical_bars",      {"instruments": ["bitcoin"], "asset_class": "crypto",
+                                          "timeframe": "1d", "limit": 200}),
+    ("bars_eth", "historical_bars",      {"instruments": ["ethereum"], "asset_class": "crypto",
+                                          "timeframe": "1d", "limit": 200}),
     ("derivs",   "derivatives_analysis", {"token_address": "bitcoin"}),
     ("options",  "options_report",       {"token_address": "bitcoin"}),
     ("scanner",  "performance_scanner",  {"top": 5, "lookback_days": 1}),
@@ -319,9 +323,24 @@ REGIME_EXTRA_SOURCES = [
 
 
 async def gather_raw(sources: list[tuple]) -> dict:
-    """Fetch all sources in parallel; return {key: raw dict or None}."""
+    """Fetch all sources in parallel; return {key: raw dict or None}.
+
+    TrueNorth's TA tool exposes SMA only, and this system uses no simple moving
+    averages, so any `ta_<name>` whose companion `bars_<name>` was also fetched
+    gets EMA20/EMA50 (and their stack) computed from those bars and merged in.
+    """
     results = await asyncio.gather(*(tn_call_safe(tool, args) for _k, tool, args in sources))
-    return {key: result for (key, _t, _a), result in zip(sources, results)}
+    d = {key: result for (key, _t, _a), result in zip(sources, results)}
+    for key in [k for k in d if k.startswith("ta_")]:
+        bars_key = "bars_" + key[3:]
+        ta, raw = d.get(key), d.get(bars_key)
+        if not isinstance(ta, dict) or not isinstance(raw, dict):
+            continue
+        series = next(iter((raw.get("data") or {}).values()), None)
+        emas = _ema_states(series or [])
+        if emas and isinstance(ta.get("technical_indicators"), dict):
+            d[key] = {**ta, "technical_indicators": {**ta["technical_indicators"], **emas}}
+    return d
 
 
 def _ind(ta: dict | None) -> dict:
@@ -371,12 +390,12 @@ def clean_event_titles(events: dict | None, limit: int = 3) -> list[str]:
 
 
 def _trend_line(ta: dict | None) -> str | None:
-    """'below 20d ($62,941) & 50d ($69,454) MA · MACD bull rising · RSI 34 rising'"""
+    """'below 20d ($62,941) & 50d ($69,454) EMA · MACD bull rising · RSI 34 rising'"""
     ind = _ind(ta)
     parts = []
-    s20, s50 = ind.get("sma20") or {}, ind.get("sma50") or {}
+    e20, e50 = ind.get("ema20") or {}, ind.get("ema50") or {}
     pos = []
-    for label, s in (("20d", s20), ("50d", s50)):
+    for label, s in (("20d", e20), ("50d", e50)):
         if s.get("state") == "price_above":
             pos.append((label, s.get("value"), True))
         elif s.get("state") == "price_below":
@@ -389,7 +408,7 @@ def _trend_line(ta: dict | None) -> str | None:
             seg.append("above " + " & ".join(f"{l} ({_money(v)})" for l, v, _ in above))
         if below:
             seg.append("below " + " & ".join(f"{l} ({_money(v)})" for l, v, _ in below))
-        parts.append(" / ".join(seg) + " MA")
+        parts.append(" / ".join(seg) + " EMA")
     macd = ind.get("macd_12_26_9") or {}
     if macd.get("state"):
         parts.append(f"MACD {macd['state']}" + (f" {macd['momentum']}" if macd.get("momentum") else ""))
@@ -725,6 +744,12 @@ def _ema_states(bars: list[dict], spans=(20, 50)) -> dict:
             "state": "price_above" if price > val else "price_below",
             "value": val,
         }
+    # Stack: fast EMA over slow = bull structure. Distinct from price-vs-EMA
+    # (position) — this is slope/alignment, so it never duplicates a component.
+    if "ema20" in out and "ema50" in out:
+        out["ema_stack"] = {
+            "state": "bull" if out["ema20"]["value"] > out["ema50"]["value"] else "bear"
+        }
     return out
 
 
@@ -744,9 +769,9 @@ def compute_indicators_from_bars(bars: list[dict]) -> dict | None:
         return None
     price = closes[-1]
     ema20_series, ema50_series = _ema(closes, 20), _ema(closes, 50)
-    ema20 = ema20_series[-1] if ema20_series else sum(closes[-20:]) / 20
-    ema50 = ema50_series[-1] if ema50_series else sum(closes[-50:]) / 50
-    sma20 = sum(closes[-20:]) / 20   # kept for the Bollinger mid reference
+    if not ema20_series or not ema50_series:
+        return None
+    ema20, ema50 = ema20_series[-1], ema50_series[-1]
 
     macd_line = [f - s for f, s in zip(_ema(closes, 12)[-len(_ema(closes, 26)):], _ema(closes, 26))]
     signal = _ema(macd_line, 9)
@@ -770,9 +795,9 @@ def compute_indicators_from_bars(bars: list[dict]) -> dict | None:
     return {"technical_indicators": {
         "ema20": {"state": "price_above" if price > ema20 else "price_below", "value": ema20},
         "ema50": {"state": "price_above" if price > ema50 else "price_below", "value": ema50},
+        "ema_stack": {"state": "bull" if ema20 > ema50 else "bear"},
         "macd_12_26_9": {"state": macd_state, "momentum": macd_momo},
         "rsi14": {"value": rsi_val, "momentum": rsi_momo},
-        "boll_20_2": {"mid_relation": "above_mid" if price > sma20 else "below_mid"},
         "atr14": {"value": atr},
     }}
 
@@ -844,13 +869,11 @@ def _setup_score(ta: dict | None) -> tuple[float, list[str], list[str]]:
             score -= weight
             bear.append(betext)
 
-    # EMA over SMA: same lengths, faster response — a lost trend reads on the bar
-    # it turns. Falls back to the SMA states if only those are present.
-    e20 = (ind.get("ema20") or ind.get("sma20") or {}).get("state")
-    e50 = (ind.get("ema50") or ind.get("sma50") or {}).get("state")
-    lbl = "EMA" if ind.get("ema20") or ind.get("ema50") else "SMA"
-    _hit(e20 == "price_above", e20 == "price_below", 1.0, f"above {lbl}20", f"below {lbl}20")
-    _hit(e50 == "price_above", e50 == "price_below", 1.0, f"above {lbl}50", f"below {lbl}50")
+    # EMA only — no simple moving averages anywhere in the scoring path.
+    e20 = (ind.get("ema20") or {}).get("state")
+    e50 = (ind.get("ema50") or {}).get("state")
+    _hit(e20 == "price_above", e20 == "price_below", 1.0, "above EMA20", "below EMA20")
+    _hit(e50 == "price_above", e50 == "price_below", 1.0, "above EMA50", "below EMA50")
     macd = ind.get("macd_12_26_9") or {}
     _hit(macd.get("state") == "bull", macd.get("state") == "bear", 1.0, "MACD bull", "MACD bear")
     _hit(macd.get("momentum") == "rising", macd.get("momentum") == "falling", 0.5,
@@ -860,9 +883,11 @@ def _setup_score(ta: dict | None) -> tuple[float, list[str], list[str]]:
         _hit(rsi > 55, rsi < 45, 1.0, f"RSI {rsi:.0f} strong", f"RSI {rsi:.0f} weak")
     rsi_m = (ind.get("rsi14") or {}).get("momentum")
     _hit(rsi_m == "rising", rsi_m == "falling", 0.5, "RSI rising", "RSI falling")
-    boll = ind.get("boll_20_2") or {}
-    _hit(boll.get("mid_relation") == "above_mid", boll.get("mid_relation") == "below_mid", 0.5,
-         "above BB mid", "below BB mid")
+    # EMA stack (20 over 50) replaces the old Bollinger-mid component — a
+    # Bollinger midline is an SMA20 by definition, and price-vs-EMA20 is already
+    # scored above, so the stack adds alignment instead of a duplicate.
+    stack = (ind.get("ema_stack") or {}).get("state")
+    _hit(stack == "bull", stack == "bear", 0.5, "EMA20>EMA50", "EMA20<EMA50")
     return score, bull, bear
 
 
@@ -1169,8 +1194,8 @@ def build_template_tweet(session: str, d: dict) -> str | None:
     regime, _reasons = detect_regime(d.get("ta_btc"), d.get("derivs"))
     ind = _ind(d.get("ta_btc"))
     rsi = (ind.get("rsi14") or {}).get("value")
-    s20 = (ind.get("sma20") or {}).get("state")
-    trend = "under the 20d" if s20 == "price_below" else "over the 20d" if s20 == "price_above" else "at the 20d"
+    e20 = (ind.get("ema20") or {}).get("state")
+    trend = "under the 20d" if e20 == "price_below" else "over the 20d" if e20 == "price_above" else "at the 20d"
 
     rows = (d.get("scanner") or {}).get("leaderboard") or []
     hot = max(rows, key=lambda r: abs(r.get("rsVsBenchmark") or 0), default=None)
@@ -1965,15 +1990,15 @@ def _vix_value(indices: dict) -> float | None:
 def detect_regime(ta: dict, derivs: dict, indices: dict | None = None):
     """Rule-based regime from raw TN data → (regime, reasons). No LLM.
 
-    RISK-OFF if 2+ of: BTC below 20d/50d MA, funding negative, VIX>20, RSI<40.
-    RISK-ON  if 2+ of: BTC above 20d AND 50d MA, funding positive, VIX<18, RSI>55.
+    RISK-OFF if 2+ of: BTC below 20d/50d EMA, funding negative, VIX>20, RSI<40.
+    RISK-ON  if 2+ of: BTC above 20d AND 50d EMA, funding positive, VIX<18, RSI>55.
     Returns UNKNOWN if fewer than 2 signals are evaluable (e.g. data outage), so a
     missing-data check never masquerades as a regime flip.
     """
     ind = (ta or {}).get("technical_indicators") or {}
-    s20 = (ind.get("sma20") or {}).get("state") if isinstance(ind.get("sma20"), dict) else None
-    s50 = (ind.get("sma50") or {}).get("state") if isinstance(ind.get("sma50"), dict) else None
-    v20 = (ind.get("sma20") or {}).get("value") if isinstance(ind.get("sma20"), dict) else None
+    s20 = (ind.get("ema20") or {}).get("state") if isinstance(ind.get("ema20"), dict) else None
+    s50 = (ind.get("ema50") or {}).get("state") if isinstance(ind.get("ema50"), dict) else None
+    v20 = (ind.get("ema20") or {}).get("value") if isinstance(ind.get("ema20"), dict) else None
     rsi = (ind.get("rsi14") or {}).get("value") if isinstance(ind.get("rsi14"), dict) else None
     funding = _btc_funding(derivs)
     vix = _vix_value(indices)
@@ -1987,9 +2012,9 @@ def detect_regime(ta: dict, derivs: dict, indices: dict | None = None):
     below = [w for w, st in (("20d", s20), ("50d", s50)) if st == "price_below"]
     if below:
         lvl = f" (${v20:,.0f})" if (s20 == "price_below" and isinstance(v20, (int, float))) else ""
-        off.append(f"BTC below {'/'.join(below)} MA{lvl}")
+        off.append(f"BTC below {'/'.join(below)} EMA{lvl}")
     elif s20 == "price_above" and s50 == "price_above":
-        on.append("BTC above 20d & 50d MA")
+        on.append("BTC above 20d & 50d EMA")
     if funding is not None and funding != 0:
         if funding < 0:
             off.append(f"funding negative ({funding:+.3f}%)")
@@ -2450,7 +2475,7 @@ async def build_stocks_screener() -> dict:
 
 async def build_tape_read() -> dict:
     """BTC's two lenses, so the headline can never claim momentum the tape denies:
-      structure — price vs the daily SMA50 (multi-week trend context)
+      structure — price vs the daily EMA50 (multi-week trend context)
       tape      — price vs the 4h EMA50 and the 7d rolling VWAP (near-term momentum)
     Both are reported; the dashboard headline is composed from the pair."""
     tf_start = (datetime.now(IST) - timedelta(days=30)).astimezone(ZoneInfo("UTC")).isoformat()
@@ -2472,21 +2497,16 @@ async def build_tape_read() -> dict:
         except (KeyError, TypeError, ValueError):
             price = None
     rv = compute_rvwaps(d1)
-    closes = []
-    for c in d1:
-        try:
-            closes.append(float(c["close"]))
-        except (KeyError, TypeError, ValueError):
-            continue
-    sma50d = sum(closes[-50:]) / 50 if len(closes) >= 50 else None
+    daily = _ema_states(d1, spans=(50,)).get("ema50") or {}
+    ema50d = daily.get("value")
     return {
         "price": price,
         "ema50_4h": ema.get("value"),
         "above_ema50_4h": None if not ema else ema.get("state") == "price_above",
         "rvwap7d": rv.get(7),
         "above_rvwap7d": None if (price is None or rv.get(7) is None) else price > rv[7],
-        "sma50_1d": sma50d,
-        "above_sma50_1d": None if (price is None or sma50d is None) else price > sma50d,
+        "ema50_1d": ema50d,
+        "above_ema50_1d": None if not daily else daily.get("state") == "price_above",
         "at": datetime.now(IST).isoformat(),
     }
 

@@ -119,12 +119,14 @@ def test_gather_raw_returns_raw_dicts_and_tolerates_failure(monkeypatch):
 # =============================================================================
 
 def _ta_full(price_rel="price_below", rsi=33.8, sma20=62941.02, sma50=69453.55):
+    # names kept for call sites; the engine reads EMA only
     return {
         "technical_indicators": {
             "rsi14": {"value": rsi, "state": "neutral", "momentum": "rising"},
             "macd_12_26_9": {"dif": -1292.8, "dea": -1873.3, "hist": 580.4, "state": "bull", "momentum": "rising"},
-            "sma20": {"value": sma20, "slope": "down", "state": price_rel},
-            "sma50": {"value": sma50, "slope": "down", "state": price_rel},
+            "ema20": {"value": sma20, "slope": "down", "state": price_rel},
+            "ema50": {"value": sma50, "slope": "down", "state": price_rel},
+            "ema_stack": {"state": "bear" if price_rel == "price_below" else "bull"},
             "boll_20_2": {"upper": 65946.1, "mid": 61994.3, "lower": 58042.5, "pb": 0.576,
                           "mid_relation": "above_mid"},
             "atr14": {"value": 2111.73, "atr_pct": 0.0337, "state": "normal"},
@@ -264,7 +266,7 @@ def test_build_rule_brief_raises_without_btc_data():
 def test_build_rule_brief_uses_only_snapshot_numbers():
     # Every $ level in the output must come from the fixture — no invented data.
     text = bot.build_rule_brief("us", _brief_data())
-    assert "$69,454" in text            # sma50 from fixture
+    assert "$69,454" in text            # 50d EMA level from fixture
     assert "$57,759" in text            # 7d low from fixture
     assert "$2,112" in text             # ATR from fixture
 
@@ -622,7 +624,7 @@ def _bearish_ta():
     ind = ta["technical_indicators"]
     ind["macd_12_26_9"].update(state="bear", momentum="falling")
     ind["rsi14"]["momentum"] = "falling"
-    ind["boll_20_2"]["mid_relation"] = "below_mid"
+    ind["ema_stack"]["state"] = "bear"
     return ta
 
 
@@ -660,7 +662,7 @@ def test_rule_setup_none_on_mixed_signals():
     ind = ta["technical_indicators"]
     ind["macd_12_26_9"].update(state="bear", momentum="falling")
     ind["rsi14"]["momentum"] = "falling"
-    ind["boll_20_2"]["mid_relation"] = "below_mid"
+    ind["ema_stack"]["state"] = "bear"
     s = bot.build_rule_setup("SOL", _info(price=65.0), ta, None)
     assert s["has_setup"] is False and s["direction"] == "NONE"
     assert "ranging/choppy" in s["reasoning"]
@@ -1507,9 +1509,10 @@ def test_setup_tracker_job_registered():
 # =============================================================================
 
 def _ta(sma20_state, sma50_state, rsi, sma20_value=62000):
+    # arg names kept; emits EMA keys because the engine is EMA-only
     return {"technical_indicators": {
-        "sma20": {"value": sma20_value, "state": sma20_state},
-        "sma50": {"value": 69000, "state": sma50_state},
+        "ema20": {"value": sma20_value, "state": sma20_state},
+        "ema50": {"value": 69000, "state": sma50_state},
         "rsi14": {"value": rsi, "state": "neutral"},
     }}
 
@@ -1965,11 +1968,11 @@ def test_rvwap_bias_rules():
 def _ta_strong_4h(price=100.0, atr=4.0):
     """4h TA that scores the full +5.5 (all bull signals aligned)."""
     return {"technical_indicators": {
-        "sma20": {"state": "price_above", "value": price * 0.97},
-        "sma50": {"state": "price_above", "value": price * 0.94},
+        "ema20": {"state": "price_above", "value": price * 0.97},
+        "ema50": {"state": "price_above", "value": price * 0.94},
+        "ema_stack": {"state": "bull"},
         "macd_12_26_9": {"state": "bull", "momentum": "rising"},
         "rsi14": {"value": 62.0, "momentum": "rising"},
-        "boll_20_2": {"mid_relation": "above_mid"},
         "atr14": {"value": atr},
     }}
 
@@ -1990,7 +1993,7 @@ def test_build_rule_setup_high_gate_and_custom_tp():
 def test_build_rule_setup_min_score_gate_blocks_medium():
     # Score +2.5 (SMA20 + SMA50 + one half-signal): passes default, fails 4.0 gate
     ta = {"technical_indicators": {
-        "sma20": {"state": "price_above"}, "sma50": {"state": "price_above"},
+        "ema20": {"state": "price_above"}, "ema50": {"state": "price_above"},
         "macd_12_26_9": {"momentum": "rising"},
         "atr14": {"value": 4.0},
     }}
@@ -2164,7 +2167,7 @@ def _ramp_bars(n=80, start=100.0, step=1.0, vol=1000.0):
 def test_compute_indicators_shape_and_uptrend_scores_long():
     ta = bot.compute_indicators_from_bars(_ramp_bars(step=1.0))
     ind = ta["technical_indicators"]
-    assert set(ind) == {"ema20", "ema50", "macd_12_26_9", "rsi14", "boll_20_2", "atr14"}
+    assert set(ind) == {"ema20", "ema50", "ema_stack", "macd_12_26_9", "rsi14", "atr14"}
     assert ind["ema20"]["state"] == "price_above" and ind["ema50"]["state"] == "price_above"
     assert ind["atr14"]["value"] is not None and ind["atr14"]["value"] > 0
     score, bull, bear = bot._setup_score(ta)
@@ -2702,15 +2705,16 @@ def test_ema_states_and_score_prefers_ema():
     st = bot._ema_states(bars)
     assert st["ema20"]["state"] == "price_above" and st["ema50"]["state"] == "price_above"
     assert st["ema20"]["value"] > st["ema50"]["value"]   # faster EMA leads in an uptrend
-    # scorer reads EMA keys and labels them EMA
+    assert st["ema_stack"]["state"] == "bull"            # …so the stack reads bull
+    # scorer reads EMA keys: +1 EMA20, +1 EMA50, +0.5 stack
     ta = {"technical_indicators": {**st, "atr14": {"value": 4.0}}}
     score, bull, _bear = bot._setup_score(ta)
-    assert score == 2.0 and any("EMA20" in b for b in bull)
-    # …and still falls back to SMA states when that is all a payload has
+    assert score == 2.5
+    assert any("EMA20" in b for b in bull) and any("EMA20>EMA50" in b for b in bull)
+    # SMA payloads score nothing — the engine is EMA-only by design.
     ta_sma = {"technical_indicators": {"sma20": {"state": "price_above"},
                                        "sma50": {"state": "price_above"}}}
-    score2, bull2, _ = bot._setup_score(ta_sma)
-    assert score2 == 2.0 and any("SMA20" in b for b in bull2)
+    assert bot._setup_score(ta_sma)[0] == 0.0
 
 
 def test_build_crowd_read_lean_and_none():
