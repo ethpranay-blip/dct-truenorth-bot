@@ -143,12 +143,14 @@ CACHE_PATH = (os.environ.get("CACHE_PATH", ".").rstrip("/") or ".")
 SETUPS_PATH = os.path.join(CACHE_PATH, "setups.json")
 REGIME_PATH = os.path.join(CACHE_PATH, "last_regime.json")
 WATCHLIST_PATH = os.path.join(CACHE_PATH, "watchlist.json")
-SETUP_EXPIRY_HOURS = 48
 WATCHLIST_MAX = 25   # cap the user watchlist so the 4h scan can't balloon
 # Bump when the scoring rules change: setups logged under an older version are
 # archived at startup and the public record restarts, so the track record always
 # measures ONE strategy. v2 = EMA20/50 scoring MAs (was SMA), 2026-07-24.
-STRATEGY_VERSION = 2
+# v3 = long-only autos + 10d crypto expiry + funding-crowding veto, 2026-07-31
+# (backtest: quant-bot/backtest/corgi_v2/REPORT.md — shorts scored t≈0 over
+# 1,888 signals; 48h window was the bleed; veto removes −0.11%/trade of chase).
+STRATEGY_VERSION = 3
 ARCHIVE_PATH = os.path.join(CACHE_PATH, "setups_archive.json")
 # Shared secret for the dashboard's watchlist write API (POST /api/watchlist).
 # Unset ⇒ the write endpoint is disabled (read + Discord !watch still work).
@@ -661,7 +663,7 @@ COMMODITY_ALIASES = {"GOLD", "SILVER", "OIL", "GAS", "NATGAS", "COPPER",
 # Crypto keeps 4h/15m/48h; non-crypto runs daily with a longer window because a
 # daily setup can't resolve inside 48h.
 ASSET_CFG = {
-    "crypto":    {"tf": "4h", "res_tf": "15m", "expiry_h": 48},
+    "crypto":    {"tf": "4h", "res_tf": "15m", "expiry_h": 240},
     "stock":     {"tf": "1d", "res_tf": "1d",  "expiry_h": 168},
     "commodity": {"tf": "1d", "res_tf": "1d",  "expiry_h": 168},
 }
@@ -938,6 +940,7 @@ def build_rule_setup(ticker: str, info: dict | None, ta: dict | None, derivs: di
     return {
         "has_setup": True,
         "direction": direction,
+        "score": score,   # signed — a SHORT reads negative (persisted for /api/v1)
         "entry_zone": f"{_money(entry_lo)} – {_money(entry_hi)}",
         "stop_loss": _money(stop),
         "take_profit_1": _money(tp1),
@@ -998,6 +1001,58 @@ AUTO_SIGNAL_UNIVERSE = 15     # scanner universe size (ranked, full list returne
 AUTO_SIGNAL_PER_SIDE = 3      # leaders considered for longs / laggards for shorts
 AUTO_TP_RS = (2.5, 4.0)       # min 1:2.5 R:R — the house standard (now also build_rule_setup's default)
 RVWAP_WINDOWS = (7, 30, 90, 365)
+
+# --- v3 gates (backtested 2026-07-31, corgi_v2/REPORT.md) ---
+# Long-only: short-side alignment scored t≈0 over 1,888 backtest signals — no
+# predictive power — while longs carried the entire edge (t≈+6 barrier-free).
+AUTO_LONG_ONLY = True
+# Crypto-only: the stock/commodity auto leg has never been backtested and its
+# 2.5R targets sit 17–19% away on daily ATRs. Manual !setup still covers them.
+AUTO_CRYPTO_ONLY = True
+# Skew crowding veto: never buy when longs are already crowded — funding in the
+# top of its trailing week is squeeze fuel against the trade. Removing those
+# entries took backtest expectancy from +0.14 to +0.48 per $100 signal.
+FUNDING_VETO_PCTILE = 80.0
+# Circuit breaker: this many consecutive auto losses pauses the auto scan and
+# alerts ops — a bleeding engine should stop firing, not average down.
+AUTO_PAUSE_AFTER_LOSSES = 3
+
+
+def _funding_pctile_7d(derivs: dict | None) -> float | None:
+    """current_funding_percentile_7d from a derivatives_analysis payload
+    (symbol-keyed sections with human names), or None if absent."""
+    dd = (derivs or {}).get("derivative_data", {})
+    sections = next((v for v in dd.values() if isinstance(v, dict)), {}) if isinstance(dd, dict) else {}
+    fund = next((s for n, s in sections.items() if isinstance(s, dict) and "funding" in n.lower()), {})
+    p = fund.get("current_funding_percentile_7d")
+    return float(p) if isinstance(p, (int, float)) else None
+
+
+def _veto_crowded_long(direction: str, derivs: dict | None) -> bool:
+    """True ⇒ block this LONG: funding sits in the crowded top of its trailing
+    week (≥ FUNDING_VETO_PCTILE). Missing data never vetoes — the gate only
+    acts on evidence of crowding, not on outages."""
+    if direction != "LONG":
+        return False
+    p = _funding_pctile_7d(derivs)
+    return p is not None and p >= FUNDING_VETO_PCTILE
+
+
+def _auto_loss_streak(setups: list[dict], now=None) -> int:
+    """Consecutive most-recent auto LOSSes resolved within the last 7 days.
+    A WIN or EXPIRED breaks the streak; manual trades are ignored. The recency
+    window is the unpause path: with no open trades left to resolve, a pure
+    loss streak would otherwise pause the scan forever."""
+    cutoff = ((now or datetime.now(IST)) - timedelta(days=7)).isoformat()
+    resolved = sorted(
+        (s for s in setups if s.get("source") == "auto" and s.get("resolved_at")),
+        key=lambda s: s["resolved_at"], reverse=True)
+    streak = 0
+    for s in resolved:
+        if s.get("status") != "LOSS" or s["resolved_at"] < cutoff:
+            break
+        streak += 1
+    return streak
 
 # Fixed cross-asset watchlist for auto-signals: stocks/commodities have no RS
 # scanner, so we scan a named list each run. Gate = RVWAP bias + score ≥ 4.0
@@ -1067,6 +1122,8 @@ async def _eval_watchlist_symbol(sym: str) -> bool:
     crypto scores on 4h TA (with daily bars fetched for the RVWAP read), stocks/
     commodities on daily. Returns True if a signal was posted."""
     asset_class, instrument = classify_asset(sym)
+    if AUTO_CRYPTO_ONLY and asset_class != "crypto":
+        return False
     if _find_recent_open(instrument):
         return False
     g = await gather_setup_inputs(sym)
@@ -1085,9 +1142,15 @@ async def _eval_watchlist_symbol(sym: str) -> bool:
                              min_score=SETUP_SCORE_HIGH, tp_rs=AUTO_TP_RS)
     if not setup.get("has_setup") or bias == "MIXED" or setup["direction"] != bias:
         return False
+    if AUTO_LONG_ONLY and setup["direction"] != "LONG":
+        return False
+    if _veto_crowded_long(setup["direction"], g.get("derivs")):
+        print(f"[AUTOSIG] {sym}: crowding veto (funding ≥ {FUNDING_VETO_PCTILE:.0f}th pctile)")
+        return False
     tf = "4h" if asset_class == "crypto" else "daily"
     return await _emit_auto_signal(sym, instrument, asset_class, float(price), setup,
-                                   f"RVWAP bias {bias} · {asset_class} · {tf} score ≥ 4.0 · watchlist")
+                                   f"RVWAP bias {bias} · {asset_class} · {tf} score ≥ 4.0 · "
+                                   f"funding uncrowded · watchlist")
 
 
 async def _scan_watchlist() -> int:
@@ -1110,6 +1173,14 @@ async def auto_signal_scan() -> None:
     (stocks/commodities) via RVWAP + score. Silence is the normal outcome."""
     if CH_SIGNALS is None:
         return
+    streak = _auto_loss_streak(_SETUPS)
+    if streak >= AUTO_PAUSE_AFTER_LOSSES:
+        print(f"[AUTOSIG] paused — {streak} consecutive auto losses")
+        if streak == AUTO_PAUSE_AFTER_LOSSES:  # alert once, not every 4h
+            await alert_ops("Auto-signals paused",
+                            f"{streak} consecutive auto losses. The scan stays paused until "
+                            f"a tracked auto trade resolves WIN/EXPIRED (or the record resets).")
+        return
     d = await gather_raw([
         ("ta_btc",  "technical_analysis",   {"token_address": "bitcoin", "timeframe": "1d"}),
         ("derivs",  "derivatives_analysis", {"token_address": "bitcoin"}),
@@ -1122,11 +1193,12 @@ async def auto_signal_scan() -> None:
     if regime == "UNKNOWN" or not rows:
         print(f"[AUTOSIG] skipped — regime={regime}, scanner rows={len(rows)}")
         return
-    # Leaders are long candidates unless RISK-OFF; laggards short unless RISK-ON.
+    # Leaders are long candidates unless RISK-OFF. v3: no auto shorts — the
+    # short side scored t≈0 in the 3-year backtest (see AUTO_LONG_ONLY).
     candidates: list[tuple[dict, str]] = []
     if regime != "RISK-OFF":
         candidates += [(r, "LONG") for r in rows[:AUTO_SIGNAL_PER_SIDE]]
-    if regime != "RISK-ON":
+    if not AUTO_LONG_ONLY and regime != "RISK-ON":
         candidates += [(r, "SHORT") for r in rows[-AUTO_SIGNAL_PER_SIDE:]]
     posted = 0
     for row, want in candidates:
@@ -1137,23 +1209,28 @@ async def auto_signal_scan() -> None:
         if _find_recent_open(token_id):
             continue  # already tracked — never double-signal
         start = (datetime.now(IST) - timedelta(days=RVWAP_WINDOWS[-1] + 5))
-        info, ta4, bars = await asyncio.gather(
+        info, ta4, bars, asset_derivs = await asyncio.gather(
             tn_call_safe("basic_market_info", {"token_address": token_id}),
             tn_call_safe("technical_analysis", {"token_address": token_id, "timeframe": "4h"}),
             tn_call_safe("historical_bars", {
                 "instruments": [token_id], "asset_class": "crypto", "timeframe": "1d",
                 "start": start.astimezone(ZoneInfo("UTC")).isoformat(),
             }),
+            tn_call_safe("derivatives_analysis", {"token_address": token_id}),
         )
         price = ((info or {}).get("market_data") or {}).get("current_price")
         candles = ((bars or {}).get("data") or {}).get(token_id) or []
         bias = rvwap_bias(price, compute_rvwaps(candles))
-        setup = build_rule_setup(ticker, info, ta4, None,
+        setup = build_rule_setup(ticker, info, ta4, asset_derivs,
                                  min_score=SETUP_SCORE_HIGH, tp_rs=AUTO_TP_RS)
         if not setup.get("has_setup") or setup["direction"] != want or bias != want:
             continue
+        if _veto_crowded_long(setup["direction"], asset_derivs):
+            print(f"[AUTOSIG] {ticker}: crowding veto (funding ≥ {FUNDING_VETO_PCTILE:.0f}th pctile)")
+            continue
         if await _emit_auto_signal(ticker, token_id, "crypto", float(price), setup,
-                                   f"Regime {regime} · RVWAP bias {bias} · 7d RS rotation"):
+                                   f"Regime {regime} · RVWAP bias {bias} · funding uncrowded · "
+                                   f"7d RS rotation"):
             posted += 1
     wl_posted = await _scan_watchlist()
     print(f"[AUTOSIG] {regime}: {len(candidates)} crypto candidates → {posted} · "
@@ -1664,6 +1741,7 @@ def log_setup(setup: dict, ticker: str, coingecko_id: str, message, source: str 
         "entry_price": entry, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
         "rr_ratio": str(setup.get("rr_ratio", "")), "conviction": str(setup.get("conviction", "")),
         "source": source, "asset_class": asset_class,
+        "score": setup.get("score"), "reason": str(setup.get("reasoning") or "") or None,
         "strategy_version": STRATEGY_VERSION,
         "timestamp": datetime.now(IST).isoformat(),
         "discord_message_id": message.id, "discord_channel_id": message.channel.id,
@@ -2644,6 +2722,135 @@ async def _handle_live(_request: web.Request) -> web.Response:
     })
 
 
+# =============================================================================
+# /api/v1 — authenticated read API (BRIEF-2026-08-03-pranay-api.md)
+#
+# A read layer over state already persisted: no route may trigger an upstream
+# TrueNorth call, recompute an indicator, or invent data to stay 200. An honest
+# error beats a plausible body — the consumer treats failures as "no opinion".
+# No CORS on purpose: server-to-server.
+# =============================================================================
+
+SIGNALS_API_KEY = os.environ.get("SIGNALS_API_KEY", "").strip()
+
+
+def _v1_authorized(request: web.Request) -> bool:
+    """Bearer check, constant-time. Unset key ⇒ everything 401s (feature off)."""
+    supplied = request.headers.get("Authorization", "")
+    if not SIGNALS_API_KEY:
+        print(f"[APIv1] reject {request.path} — SIGNALS_API_KEY unset")
+        return False
+    ok = hmac.compare_digest(supplied, f"Bearer {SIGNALS_API_KEY}")
+    if not ok:
+        print(f"[APIv1] reject {request.path} from {request.remote}")
+    return ok
+
+
+_V1_401 = {"status": 401}
+
+
+def _v1_utc(ts: str | None) -> str | None:
+    """Persisted IST isoformat → UTC ISO8601 with Z. None-safe."""
+    dt = _parse_ts(ts)
+    if dt is None:
+        return None
+    return dt.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+
+
+def _v1_signal(row: dict) -> dict:
+    """Shape one persisted setup row for /api/v1/signals.
+
+    id is derived from persisted fields (engine, ticker, creation time), so it
+    is immutable, survives restarts, and is never reused: a re-evaluation logs
+    a new row with a new timestamp ⇒ a new id. Rows logged before this API
+    existed lack score/reason — those serve as null, never fabricated."""
+    created = _v1_utc(row.get("timestamp"))
+    cls = row.get("asset_class") or "crypto"
+    cfg = ASSET_CFG.get(cls, ASSET_CFG["crypto"])
+    return {
+        "id": f"{row.get('source') or 'manual'}-{row.get('ticker')}-{created}",
+        "createdAt": created,
+        "source": "tn-auto" if row.get("source") == "auto" else "tn-manual",
+        "assetClass": cls,
+        "asset": row.get("ticker"),
+        "direction": row.get("direction"),
+        "score": row.get("score"),
+        "conviction": row.get("conviction") or None,
+        "horizonHours": cfg["expiry_h"],   # matches what the resolver applies
+        "timeframe": cfg["tf"],
+        "entry": row.get("entry_price"),
+        "stop": row.get("stop_loss"),
+        "tp1": row.get("tp1"),
+        "tp2": row.get("tp2"),
+        "reason": row.get("reason") or None,
+    }
+
+
+def _v1_archived_rows() -> list[dict]:
+    """Rows archived by a strategy-version bump. They were real signals when
+    they fired, so a `since` query that covers them must still return them.
+    Unreadable/missing archive ⇒ empty list (the live rows still serve)."""
+    try:
+        with open(ARCHIVE_PATH) as f:
+            rows = json.load(f)
+        return rows if isinstance(rows, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+async def _handle_v1_signals(request: web.Request) -> web.Response:
+    if not _v1_authorized(request):
+        return web.Response(**_V1_401)
+    raw = request.query.get("since")
+    if raw is not None:
+        since = _parse_ts(raw)
+        if since is None:
+            return web.json_response({"error": "since must be ISO 8601"}, status=400)
+    else:
+        since = datetime.now(IST) - timedelta(days=7)
+    out = []
+    for row in list(_SETUPS) + _v1_archived_rows():
+        ts = _parse_ts(row.get("timestamp"))
+        if ts is not None and ts > since:      # strictly after, per contract
+            out.append(_v1_signal(row))
+    out.sort(key=lambda s: s["createdAt"] or "")
+    return web.json_response(out)
+
+
+async def _handle_v1_regime(request: web.Request) -> web.Response:
+    if not _v1_authorized(request):
+        return web.Response(**_V1_401)
+    # UNKNOWN passes through untouched — "unknown" and "neutral" are different
+    # facts and this endpoint must never round one up to the other.
+    tape = _DASH_CACHE.get("tape") or {}
+    above7 = tape.get("above_rvwap7d")
+    return web.json_response({
+        "asOf": _v1_utc(_LAST_REGIME.get("timestamp")),
+        "regime": _LAST_REGIME.get("regime", "UNKNOWN"),
+        "signals": list(_LAST_REGIME.get("reasons") or []),
+        # Shaped to actual internals: the 15-min tape cache carries BTC vs the
+        # 7d rolling VWAP only. Longer windows aren't cached ⇒ not served.
+        "rvwap": {"BTC": {"vs7d": None if above7 is None else ("above" if above7 else "below")}},
+    })
+
+
+async def _handle_v1_record(request: web.Request) -> web.Response:
+    if not _v1_authorized(request):
+        return web.Response(**_V1_401)
+    engines: dict[str, dict] = {}
+    for s in _SETUPS:
+        eng = "tn-auto" if s.get("source") == "auto" else "tn-manual"
+        e = engines.setdefault(eng, {"wins": 0, "losses": 0, "open": 0, "expired": 0})
+        status = s.get("status")
+        key = {"WIN": "wins", "LOSS": "losses", "OPEN": "open", "EXPIRED": "expired"}.get(status)
+        if key:
+            e[key] += 1
+    return web.json_response({
+        "asOf": datetime.now(IST).astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z"),
+        "engines": engines,
+    })
+
+
 _WL_CORS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -2862,6 +3069,9 @@ async def start_webhook_server() -> None:
     app.router.add_post("/api/flow", _handle_flow_post)
     app.router.add_route("OPTIONS", "/api/flow", _handle_watchlist_options)
     app.router.add_get("/api/setup", _handle_setup)
+    app.router.add_get("/api/v1/signals", _handle_v1_signals)
+    app.router.add_get("/api/v1/regime", _handle_v1_regime)
+    app.router.add_get("/api/v1/record", _handle_v1_record)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)

@@ -681,8 +681,9 @@ def test_rule_setup_none_without_atr_or_price():
 def test_rule_setup_output_shape_matches_tracker_contract():
     # log_setup + build_setup_embed consume this dict — keys must all be present.
     s = bot.build_rule_setup("BTC", _info(), _bullish_ta(), _derivs_full())
-    assert set(s) == {"has_setup", "direction", "entry_zone", "stop_loss", "take_profit_1",
-                      "take_profit_2", "rr_ratio", "conviction", "reasoning"}
+    assert set(s) == {"has_setup", "direction", "score", "entry_zone", "stop_loss",
+                      "take_profit_1", "take_profit_2", "rr_ratio", "conviction", "reasoning"}
+    assert isinstance(s["score"], float)   # signed — persisted for /api/v1
     assert all(isinstance(s[k], str) for k in
                ("entry_zone", "stop_loss", "take_profit_1", "take_profit_2", "rr_ratio", "conviction"))
 
@@ -1118,7 +1119,7 @@ def test_evaluate_setup_short():
 
 def test_evaluate_setup_expiry_time_based():
     from datetime import timedelta
-    old = (bot.datetime.now(bot.IST) - timedelta(hours=49)).isoformat()
+    old = (bot.datetime.now(bot.IST) - timedelta(hours=241)).isoformat()   # past the 240h crypto window
     s = {"direction": "LONG", "entry_price": 100, "stop_loss": 95, "tp1": 110, "timestamp": old}
     assert bot.evaluate_setup(s, 102) == ("EXPIRED", "EXPIRED")   # no trigger, aged out
     # Price trigger still wins over expiry.
@@ -2193,10 +2194,10 @@ def test_compute_indicators_insufficient_bars_returns_none():
 
 
 def test_expiry_hours_per_asset_class():
-    assert bot._expiry_hours({"asset_class": "crypto"}) == 48
+    assert bot._expiry_hours({"asset_class": "crypto"}) == 240   # v3: 48h was the measured bleed
     assert bot._expiry_hours({"asset_class": "stock"}) == 168
     assert bot._expiry_hours({"asset_class": "commodity"}) == 168
-    assert bot._expiry_hours({}) == 48   # default/back-compat
+    assert bot._expiry_hours({}) == 240   # default/back-compat (missing class ⇒ crypto)
 
 
 def test_gather_setup_inputs_stock_path(monkeypatch):
@@ -2244,24 +2245,25 @@ def test_track_setups_routes_stock_to_daily_bars(monkeypatch):
     assert calls[0] == ("historical_bars", "stock", "1d")   # routed to daily stock bars
 
 
-def test_scan_watchlist_posts_aligned_stock(monkeypatch):
+def test_scan_watchlist_blocks_stock_under_crypto_only(monkeypatch):
+    """v3: an aligned stock that v2 would have posted is skipped — the stock leg
+    is unbacktested and its 2.5R daily-ATR targets sit 17–19% away. The gate
+    fires before any network fetch."""
     import asyncio
     monkeypatch.setattr(bot, "CH_SIGNALS", 999)
     monkeypatch.setattr(bot, "SIGNALS_WATCHLIST", ["NVDA"])
     monkeypatch.setattr(bot, "_SETUPS", [])
     ch = _StubChannel()
     monkeypatch.setattr(bot.bot, "get_channel", lambda _id: ch)
-    bars = _ramp_bars(step=1.0)  # uptrend → LONG + RVWAP LONG (price above VWAPs)
+    calls = []
 
     async def fake_call(tool, args, **kw):
-        if tool == "historical_bars":
-            return {"data": {"NVDA": bars}}
+        calls.append(tool)
         return None
     monkeypatch.setattr(bot, "tn_call_safe", fake_call)
     n = asyncio.run(bot._scan_watchlist())
-    assert n == 1 and len(ch.sent) == 1
-    assert ch.sent[0].title == "🤖 NVDA Auto Signal"
-    assert bot._SETUPS[0]["asset_class"] == "stock" and bot._SETUPS[0]["source"] == "auto"
+    assert n == 0 and ch.sent == [] and bot._SETUPS == []
+    assert calls == []          # skipped before fetching anything
 
 
 # --- dashboard /api/live: cross-asset map + open setups ----------------------
@@ -2781,3 +2783,255 @@ def test_setup_endpoint_does_not_cache_errors(monkeypatch):
     r2 = asyncio.run(bot._handle_setup(_SetupReq("BTC")))
     assert _json.loads(r2.body)["direction"] == "LONG"   # recomputed, recovered
     assert calls["n"] == 2
+
+
+# =============================================================================
+# v3 gates: long-only, crypto-only, funding-crowding veto, circuit breaker
+# =============================================================================
+
+def _ta_strong_bear_4h(price=100.0, atr=4.0):
+    """4h TA that scores the full −5.5 (all bear signals aligned)."""
+    return {"technical_indicators": {
+        "ema20": {"state": "price_below", "value": price * 1.03},
+        "ema50": {"state": "price_below", "value": price * 1.06},
+        "ema_stack": {"state": "bear"},
+        "macd_12_26_9": {"state": "bear", "momentum": "falling"},
+        "rsi14": {"value": 35.0, "momentum": "falling"},
+        "atr14": {"value": atr},
+    }}
+
+
+def test_auto_loss_streak_counts_and_windows():
+    now = bot.datetime.now(bot.IST)
+
+    def row(status, hours_ago, source="auto"):
+        return {"source": source, "status": status,
+                "resolved_at": (now - timedelta(hours=hours_ago)).isoformat()}
+
+    setups = [row("LOSS", 2), row("LOSS", 5), row("LOSS", 9), row("WIN", 20), row("LOSS", 30)]
+    assert bot._auto_loss_streak(setups, now=now) == 3
+    assert bot._auto_loss_streak([row("WIN", 1)] + setups, now=now) == 0
+    assert bot._auto_loss_streak([row("LOSS", 1, source="manual")], now=now) == 0
+    # Losses older than 7d stop counting → a pause self-heals instead of deadlocking.
+    assert bot._auto_loss_streak([row("LOSS", 24 * 8), row("LOSS", 24 * 9)], now=now) == 0
+    assert bot._auto_loss_streak([{"source": "auto", "status": "OPEN", "resolved_at": None}], now=now) == 0
+
+
+def test_funding_veto_crowded_long():
+    assert bot._funding_pctile_7d(_derivs_full(pctile=85.0)) == 85.0
+    assert bot._funding_pctile_7d(None) is None
+    assert bot._funding_pctile_7d({"derivative_data": {}}) is None
+    assert bot._veto_crowded_long("LONG", _derivs_full(pctile=85.0))
+    assert bot._veto_crowded_long("LONG", _derivs_full(pctile=80.0))   # boundary is crowded
+    assert not bot._veto_crowded_long("LONG", _derivs_full(pctile=33.9))
+    assert not bot._veto_crowded_long("SHORT", _derivs_full(pctile=85.0))  # long-side gate only
+    assert not bot._veto_crowded_long("LONG", None)                    # outage never vetoes
+
+
+def test_auto_signal_scan_vetoes_crowded_funding(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "CH_SIGNALS", 999)
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    ch = _StubChannel()
+    monkeypatch.setattr(bot.bot, "get_channel", lambda _id: ch)
+    base = _auto_scan_fake_call([{"ticker": "SOLUSDT", "rsVsBenchmark": 12.0}])
+
+    async def fake_call(tool, args, **kw):
+        if tool == "derivatives_analysis" and args.get("token_address") != "bitcoin":
+            return _derivs_full(pctile=92.0)      # the candidate's own funding is crowded
+        return await base(tool, args, **kw)
+
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    asyncio.run(bot.auto_signal_scan())
+    assert ch.sent == [] and bot._SETUPS == []
+
+
+def test_auto_signal_scan_pauses_after_loss_streak(monkeypatch):
+    import asyncio
+    now = bot.datetime.now(bot.IST)
+    losses = [{"source": "auto", "status": "LOSS",
+               "resolved_at": (now - timedelta(hours=h)).isoformat()} for h in (2, 6, 10)]
+    monkeypatch.setattr(bot, "CH_SIGNALS", 999)
+    monkeypatch.setattr(bot, "_SETUPS", losses)
+    calls, alerts = [], []
+
+    async def fake_call(tool, args, **kw):
+        calls.append(tool)
+        return None
+
+    async def fake_alert(title, detail):
+        alerts.append(title)
+
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    monkeypatch.setattr(bot, "alert_ops", fake_alert)
+    asyncio.run(bot.auto_signal_scan())
+    assert calls == []                    # paused before any market fetch
+    assert alerts == ["Auto-signals paused"]
+
+
+def test_watchlist_crypto_only_gate(monkeypatch):
+    import asyncio
+    fetched = []
+
+    async def fake_gather(sym):
+        fetched.append(sym)
+        return {}
+
+    monkeypatch.setattr(bot, "gather_setup_inputs", fake_gather)
+    assert asyncio.run(bot._eval_watchlist_symbol("AAPL")) is False
+    assert asyncio.run(bot._eval_watchlist_symbol("GOLD")) is False
+    assert fetched == []                  # gate fires before any network work
+
+
+def test_watchlist_long_only_blocks_aligned_short(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "CH_SIGNALS", 999)
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    ch = _StubChannel()
+    monkeypatch.setattr(bot.bot, "get_channel", lambda _id: ch)
+
+    async def fake_gather(sym):
+        return {"info": {"market_data": {"current_price": 100.0}},
+                "ta": _ta_strong_bear_4h(), "derivs": _derivs_full(), "bars": None}
+
+    async def fake_call(tool, args, **kw):
+        if tool == "historical_bars":     # daily candles close above price → bias SHORT
+            return {"data": {args["instruments"][0]: _daily_candles(close=110.0)}}
+        return None
+
+    monkeypatch.setattr(bot, "gather_setup_inputs", fake_gather)
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    # Perfect bear alignment + SHORT bias — v2 would post this; v3 must not.
+    assert asyncio.run(bot._eval_watchlist_symbol("BTC")) is False
+    assert ch.sent == []
+
+
+# =============================================================================
+# /api/v1 read API (BRIEF-2026-08-03) — acceptance checklist as tests
+# =============================================================================
+
+class _V1Req:
+    def __init__(self, key=None, since=None, path="/api/v1/signals"):
+        self.headers = {"Authorization": f"Bearer {key}"} if key is not None else {}
+        self.query = {"since": since} if since is not None else {}
+        self.path = path
+        self.remote = "203.0.113.7"
+
+
+def _v1_row(ticker="BTC", direction="LONG", source="auto", hours_ago=1.0,
+            score=4.5, status="OPEN"):
+    ts = (bot.datetime.now(bot.IST) - timedelta(hours=hours_ago)).isoformat()
+    return {"ticker": ticker, "coingecko_id": ticker.lower(), "direction": direction,
+            "entry_price": 118250.0, "stop_loss": 116900.0, "tp1": 121600.0, "tp2": 123800.0,
+            "conviction": "High", "source": source, "asset_class": "crypto",
+            "score": score, "reason": "score +4.5: above EMA20/50, MACD bull",
+            "strategy_version": bot.STRATEGY_VERSION, "timestamp": ts,
+            "status": status, "resolved_at": None}
+
+
+def _v1_json(resp):
+    return json.loads(resp.body.decode())
+
+
+def test_v1_auth_all_routes(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "SIGNALS_API_KEY", "sekrit")
+    for handler in (bot._handle_v1_signals, bot._handle_v1_regime, bot._handle_v1_record):
+        assert asyncio.run(handler(_V1Req())).status == 401              # no header
+        assert asyncio.run(handler(_V1Req(key="wrong"))).status == 401   # wrong key
+        assert asyncio.run(handler(_V1Req(key="sekrit"))).status == 200
+    # Unset key ⇒ the API is off: even a matching-empty bearer is rejected.
+    monkeypatch.setattr(bot, "SIGNALS_API_KEY", "")
+    assert asyncio.run(bot._handle_v1_signals(_V1Req(key=""))).status == 401
+
+
+def test_v1_signals_since_strictly_after_and_empty(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "SIGNALS_API_KEY", "k")
+    monkeypatch.setattr(bot, "ARCHIVE_PATH", "/nonexistent/archive.json")
+    old = _v1_row(ticker="ETH", hours_ago=48.0)
+    new = _v1_row(ticker="BTC", hours_ago=1.0)
+    monkeypatch.setattr(bot, "_SETUPS", [old, new])
+    cutoff = (bot.datetime.now(bot.IST) - timedelta(hours=2)).isoformat()
+    got = _v1_json(asyncio.run(bot._handle_v1_signals(_V1Req(key="k", since=cutoff))))
+    assert [s["asset"] for s in got] == ["BTC"]
+    # since = now ⇒ JSON [] (not null, not an error)
+    now = bot.datetime.now(bot.IST).isoformat()
+    resp = asyncio.run(bot._handle_v1_signals(_V1Req(key="k", since=now)))
+    assert resp.status == 200 and _v1_json(resp) == []
+    # bad since ⇒ 400, never a silent full dump
+    assert asyncio.run(bot._handle_v1_signals(_V1Req(key="k", since="lol"))).status == 400
+
+
+def test_v1_signal_shape_types_and_sign(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "SIGNALS_API_KEY", "k")
+    monkeypatch.setattr(bot, "ARCHIVE_PATH", "/nonexistent/archive.json")
+    monkeypatch.setattr(bot, "_SETUPS", [_v1_row(direction="SHORT", score=-4.5, source="manual")])
+    (s,) = _v1_json(asyncio.run(bot._handle_v1_signals(_V1Req(key="k"))))
+    assert s["source"] == "tn-manual" and s["assetClass"] == "crypto"
+    assert isinstance(s["entry"], float) and isinstance(s["tp2"], float)
+    assert s["score"] == -4.5                       # sign survives; no abs()
+    assert s["createdAt"].endswith("Z")             # UTC, explicit
+    assert s["horizonHours"] == 240 and s["timeframe"] == "4h"
+    assert s["reason"].startswith("score +4.5")
+
+
+def test_v1_signal_id_stable_and_never_reused(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "SIGNALS_API_KEY", "k")
+    monkeypatch.setattr(bot, "ARCHIVE_PATH", "/nonexistent/archive.json")
+    row = _v1_row(hours_ago=3.0)
+    # Restart ⇒ same persisted fields ⇒ same id (id is derived, not stored).
+    assert bot._v1_signal(dict(row))["id"] == bot._v1_signal(dict(row))["id"]
+    # Re-evaluation logs a NEW row with a new timestamp ⇒ new id, old still served.
+    newer = _v1_row(hours_ago=0.5)
+    monkeypatch.setattr(bot, "_SETUPS", [row, newer])
+    got = _v1_json(asyncio.run(bot._handle_v1_signals(_V1Req(key="k"))))
+    ids = [s["id"] for s in got]
+    assert len(ids) == 2 and len(set(ids)) == 2
+
+
+def test_v1_signals_include_archived_rows(monkeypatch, tmp_path):
+    import asyncio
+    monkeypatch.setattr(bot, "SIGNALS_API_KEY", "k")
+    arch = tmp_path / "setups_archive.json"
+    arch.write_text(json.dumps([_v1_row(ticker="NEAR", hours_ago=24.0, status="LOSS")]))
+    monkeypatch.setattr(bot, "ARCHIVE_PATH", str(arch))
+    monkeypatch.setattr(bot, "_SETUPS", [_v1_row(ticker="BTC", hours_ago=1.0)])
+    got = _v1_json(asyncio.run(bot._handle_v1_signals(_V1Req(key="k"))))
+    assert {s["asset"] for s in got} == {"BTC", "NEAR"}   # version bump loses nothing
+
+
+def test_v1_regime_unknown_passthrough_and_null_rvwap(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "SIGNALS_API_KEY", "k")
+    monkeypatch.setattr(bot, "_LAST_REGIME", {"regime": "UNKNOWN", "timestamp": None, "reasons": []})
+    monkeypatch.setattr(bot, "_DASH_CACHE", {})
+    got = _v1_json(asyncio.run(bot._handle_v1_regime(_V1Req(key="k", path="/api/v1/regime"))))
+    assert got["regime"] == "UNKNOWN"                # never rounded up to a reading
+    assert got["asOf"] is None
+    assert got["rvwap"]["BTC"]["vs7d"] is None       # cache empty ⇒ null, not a guess
+
+
+def test_v1_record_per_engine_counts(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "SIGNALS_API_KEY", "k")
+    monkeypatch.setattr(bot, "_SETUPS", [
+        _v1_row(source="auto", status="WIN"), _v1_row(source="auto", status="LOSS"),
+        _v1_row(source="auto", status="OPEN"), _v1_row(source="manual", status="EXPIRED"),
+    ])
+    got = _v1_json(asyncio.run(bot._handle_v1_record(_V1Req(key="k", path="/api/v1/record"))))
+    assert got["engines"]["tn-auto"] == {"wins": 1, "losses": 1, "open": 1, "expired": 0}
+    assert got["engines"]["tn-manual"] == {"wins": 0, "losses": 0, "open": 0, "expired": 1}
+
+
+def test_log_setup_persists_score_and_reason(monkeypatch, tmp_path):
+    monkeypatch.setattr(bot, "SETUPS_PATH", str(tmp_path / "setups.json"))
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    setup = bot.build_rule_setup("X", {"market_data": {"current_price": 100.0}},
+                                 _ta_strong_4h(), None)
+    bot.log_setup(setup, "X", "x-token", _StubMsg(), source="auto")
+    row = bot._SETUPS[0]
+    assert row["score"] == 5.5                        # full bull alignment, signed
+    assert row["reason"].startswith("Bullish alignment")
