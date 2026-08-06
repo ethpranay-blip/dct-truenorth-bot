@@ -2245,27 +2245,6 @@ def test_track_setups_routes_stock_to_daily_bars(monkeypatch):
     assert calls[0] == ("historical_bars", "stock", "1d")   # routed to daily stock bars
 
 
-def test_scan_watchlist_blocks_stock_under_crypto_only(monkeypatch):
-    """v3: an aligned stock that v2 would have posted is skipped — the stock leg
-    is unbacktested and its 2.5R daily-ATR targets sit 17–19% away. The gate
-    fires before any network fetch."""
-    import asyncio
-    monkeypatch.setattr(bot, "CH_SIGNALS", 999)
-    monkeypatch.setattr(bot, "SIGNALS_WATCHLIST", ["NVDA"])
-    monkeypatch.setattr(bot, "_SETUPS", [])
-    ch = _StubChannel()
-    monkeypatch.setattr(bot.bot, "get_channel", lambda _id: ch)
-    calls = []
-
-    async def fake_call(tool, args, **kw):
-        calls.append(tool)
-        return None
-    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
-    n = asyncio.run(bot._scan_watchlist())
-    assert n == 0 and ch.sent == [] and bot._SETUPS == []
-    assert calls == []          # skipped before fetching anything
-
-
 # --- dashboard /api/live: cross-asset map + open setups ----------------------
 
 def _bars_seq(closes):
@@ -2367,7 +2346,7 @@ def test_scan_watchlist_merges_env_and_user_and_dedupes(monkeypatch):
     monkeypatch.setattr(bot, "_WATCHLIST", ["NVDA", "SUI"])  # NVDA dup, SUI new
     evaluated = []
 
-    async def fake_eval(sym):
+    async def fake_eval(sym, shadow=False):
         evaluated.append(sym)
         return False
 
@@ -2828,9 +2807,10 @@ def test_funding_veto_crowded_long():
     assert not bot._veto_crowded_long("LONG", None)                    # outage never vetoes
 
 
-def test_auto_signal_scan_vetoes_crowded_funding(monkeypatch):
+def test_auto_signal_scan_vetoes_crowded_funding(monkeypatch, tmp_path):
     import asyncio
     monkeypatch.setattr(bot, "CH_SIGNALS", 999)
+    monkeypatch.setattr(bot, "SETUPS_PATH", str(tmp_path / "setups.json"))
     monkeypatch.setattr(bot, "_SETUPS", [])
     ch = _StubChannel()
     monkeypatch.setattr(bot.bot, "get_channel", lambda _id: ch)
@@ -2843,47 +2823,67 @@ def test_auto_signal_scan_vetoes_crowded_funding(monkeypatch):
 
     monkeypatch.setattr(bot, "tn_call_safe", fake_call)
     asyncio.run(bot.auto_signal_scan())
-    assert ch.sent == [] and bot._SETUPS == []
+    assert ch.sent == []                          # nothing posts…
+    (row,) = [s for s in bot._SETUPS if s["status"] == "SUPPRESSED"]
+    assert row["suppressed_by"] == "funding_crowding" and row["would_trade"] is False
+    assert not [s for s in bot._SETUPS if s["status"] == "OPEN"]   # …and nothing trades
 
 
-def test_auto_signal_scan_pauses_after_loss_streak(monkeypatch):
+def test_auto_signal_scan_breaker_shadow_logs_instead_of_posting(monkeypatch, tmp_path):
+    """Paused for trading, not for evidence: with the breaker tripped, a signal
+    that would have posted logs as SUPPRESSED(circuit_breaker) and Discord
+    stays silent. Ops is alerted exactly once (streak == threshold)."""
     import asyncio
     now = bot.datetime.now(bot.IST)
-    losses = [{"source": "auto", "status": "LOSS",
-               "resolved_at": (now - timedelta(hours=h)).isoformat()} for h in (2, 6, 10)]
+    losses = [{"source": "auto", "status": "LOSS", "coingecko_id": f"x{i}",
+               "resolved_at": (now - timedelta(hours=h)).isoformat()}
+              for i, h in enumerate((2, 6, 10))]
     monkeypatch.setattr(bot, "CH_SIGNALS", 999)
-    monkeypatch.setattr(bot, "_SETUPS", losses)
-    calls, alerts = [], []
-
-    async def fake_call(tool, args, **kw):
-        calls.append(tool)
-        return None
+    monkeypatch.setattr(bot, "SETUPS_PATH", str(tmp_path / "setups.json"))
+    monkeypatch.setattr(bot, "_SETUPS", list(losses))
+    ch = _StubChannel()
+    monkeypatch.setattr(bot.bot, "get_channel", lambda _id: ch)
+    alerts = []
 
     async def fake_alert(title, detail):
         alerts.append(title)
 
-    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
     monkeypatch.setattr(bot, "alert_ops", fake_alert)
+    monkeypatch.setattr(bot, "tn_call_safe",
+                        _auto_scan_fake_call([{"ticker": "SOLUSDT", "rsVsBenchmark": 12.0}]))
     asyncio.run(bot.auto_signal_scan())
-    assert calls == []                    # paused before any market fetch
+    assert ch.sent == []                                  # no Discord post while paused
     assert alerts == ["Auto-signals paused"]
+    (row,) = [s for s in bot._SETUPS if s.get("status") == "SUPPRESSED"]
+    assert row["suppressed_by"] == "circuit_breaker" and row["direction"] == "LONG"
 
 
-def test_watchlist_crypto_only_gate(monkeypatch):
+def test_watchlist_stock_suppressed_not_posted(monkeypatch, tmp_path):
+    """An aligned stock is evaluated in shadow and logged SUPPRESSED(non_crypto)
+    — same levels and score a v2 post would have carried — but never posts."""
     import asyncio
-    fetched = []
+    monkeypatch.setattr(bot, "CH_SIGNALS", 999)
+    monkeypatch.setattr(bot, "SETUPS_PATH", str(tmp_path / "setups.json"))
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    ch = _StubChannel()
+    monkeypatch.setattr(bot.bot, "get_channel", lambda _id: ch)
+    bars = _ramp_bars(step=1.0)   # uptrend → LONG score + RVWAP LONG
 
-    async def fake_gather(sym):
-        fetched.append(sym)
-        return {}
+    async def fake_call(tool, args, **kw):
+        if tool == "historical_bars":
+            return {"data": {"NVDA": bars}}
+        return None
 
-    monkeypatch.setattr(bot, "gather_setup_inputs", fake_gather)
-    assert asyncio.run(bot._eval_watchlist_symbol("AAPL")) is False
-    assert asyncio.run(bot._eval_watchlist_symbol("GOLD")) is False
-    assert fetched == []                  # gate fires before any network work
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    assert asyncio.run(bot._eval_watchlist_symbol("NVDA")) is False
+    assert ch.sent == []
+    (row,) = bot._SETUPS
+    assert row["status"] == "SUPPRESSED" and row["suppressed_by"] == "non_crypto"
+    assert row["asset_class"] == "stock" and row["direction"] == "LONG"
+    assert row["would_trade"] is False and row["score"] is not None
 
 
-def test_watchlist_long_only_blocks_aligned_short(monkeypatch):
+def test_watchlist_long_only_blocks_aligned_short(monkeypatch, tmp_path):
     import asyncio
     monkeypatch.setattr(bot, "CH_SIGNALS", 999)
     monkeypatch.setattr(bot, "_SETUPS", [])
@@ -2901,9 +2901,13 @@ def test_watchlist_long_only_blocks_aligned_short(monkeypatch):
 
     monkeypatch.setattr(bot, "gather_setup_inputs", fake_gather)
     monkeypatch.setattr(bot, "tn_call_safe", fake_call)
-    # Perfect bear alignment + SHORT bias — v2 would post this; v3 must not.
+    monkeypatch.setattr(bot, "SETUPS_PATH", str(tmp_path / "setups.json"))
+    # Perfect bear alignment + SHORT bias — v2 would post this; v3 suppresses it.
     assert asyncio.run(bot._eval_watchlist_symbol("BTC")) is False
     assert ch.sent == []
+    (row,) = bot._SETUPS
+    assert row["status"] == "SUPPRESSED" and row["suppressed_by"] == "long_only"
+    assert row["direction"] == "SHORT" and row["score"] < 0
 
 
 # =============================================================================
@@ -3035,3 +3039,96 @@ def test_log_setup_persists_score_and_reason(monkeypatch, tmp_path):
     row = bot._SETUPS[0]
     assert row["score"] == 5.5                        # full bull alignment, signed
     assert row["reason"].startswith("Bullish alignment")
+
+
+# =============================================================================
+# Suppressed-signal feed (consumer request, 2026-08-05): evidence, not deletion
+# =============================================================================
+
+def test_main_scan_laggard_short_suppressed_long_only(monkeypatch, tmp_path):
+    """A laggard passing the full v2 short gate (score ≤ −4, RVWAP SHORT, regime
+    agrees) logs as SUPPRESSED(long_only) instead of posting."""
+    import asyncio
+    monkeypatch.setattr(bot, "CH_SIGNALS", 999)
+    monkeypatch.setattr(bot, "SETUPS_PATH", str(tmp_path / "setups.json"))
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    monkeypatch.setattr(bot, "SIGNALS_WATCHLIST", [])
+    monkeypatch.setattr(bot, "_WATCHLIST", [])
+    ch = _StubChannel()
+    monkeypatch.setattr(bot.bot, "get_channel", lambda _id: ch)
+
+    async def fake_call(tool, args, **kw):
+        if tool == "technical_analysis" and args.get("timeframe") == "1d":
+            return _ta_full(price_rel="price_above", rsi=60.0)     # regime NEUTRAL-ish
+        if tool == "derivatives_analysis":
+            return _derivs_full()                                  # uncrowded
+        if tool == "market_index_price":
+            return {"prices": [{"index": "vix", "latest": {"close": 15.0}}]}
+        if tool == "performance_scanner":
+            return {"leaderboard": [{"ticker": "NEARUSDT", "rsVsBenchmark": -14.0}]}
+        if tool == "basic_market_info":
+            return {"market_data": {"current_price": 100.0}}
+        if tool == "technical_analysis":                           # 4h — full bear
+            return _ta_strong_bear_4h(price=100.0)
+        if tool == "historical_bars":                              # closes above → bias SHORT
+            return {"data": {args["instruments"][0]: _daily_candles(close=110.0)}}
+        return None
+
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    monkeypatch.setattr(bot, "detect_regime", lambda *a, **k: ("NEUTRAL", []))
+    asyncio.run(bot.auto_signal_scan())
+    assert ch.sent == []
+    (row,) = bot._SETUPS
+    assert row["status"] == "SUPPRESSED" and row["suppressed_by"] == "long_only"
+    assert row["direction"] == "SHORT" and row["would_trade"] is False
+
+
+def test_log_suppressed_dedupes_per_asset_reason(monkeypatch, tmp_path):
+    monkeypatch.setattr(bot, "SETUPS_PATH", str(tmp_path / "setups.json"))
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    setup = bot.build_rule_setup("X", {"market_data": {"current_price": 100.0}},
+                                 _ta_strong_4h(), None)
+    bot.log_suppressed(setup, "X", "x-token", "crypto", "funding_crowding")
+    bot.log_suppressed(setup, "X", "x-token", "crypto", "funding_crowding")   # same window
+    assert len(bot._SETUPS) == 1
+    bot.log_suppressed(setup, "X", "x-token", "crypto", "long_only")          # other reason logs
+    assert len(bot._SETUPS) == 2
+
+
+def test_v1_serves_suppression_and_version_fields(monkeypatch, tmp_path):
+    import asyncio
+    monkeypatch.setattr(bot, "SIGNALS_API_KEY", "k")
+    monkeypatch.setattr(bot, "SETUPS_PATH", str(tmp_path / "setups.json"))
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    # archive carries a v2-era row
+    arch = tmp_path / "arch.json"
+    v2row = _v1_row(ticker="ETH", hours_ago=30.0)
+    v2row["strategy_version"] = 2
+    arch.write_text(json.dumps([v2row]))
+    monkeypatch.setattr(bot, "ARCHIVE_PATH", str(arch))
+    # one real v3 row + one suppressed v3 row
+    setup = bot.build_rule_setup("SOL", {"market_data": {"current_price": 100.0}},
+                                 _ta_strong_4h(), None)
+    bot.log_setup(setup, "SOL", "solana", _StubMsg(), source="auto")
+    bot.log_suppressed(setup, "BTC", "bitcoin", "crypto", "circuit_breaker")
+    got = _v1_json(asyncio.run(bot._handle_v1_signals(_V1Req(key="k"))))
+    by_asset = {s["asset"]: s for s in got}
+    assert by_asset["ETH"]["strategyVersion"] == "v2" and by_asset["ETH"]["wouldTrade"] is True
+    assert by_asset["SOL"]["strategyVersion"] == "v3" and by_asset["SOL"]["suppressedBy"] is None
+    b = by_asset["BTC"]
+    assert b["wouldTrade"] is False and b["suppressedBy"] == "circuit_breaker"
+    assert b["strategyVersion"] == "v3" and b["score"] == 5.5   # same score/levels as a real row
+    assert b["entry"] is not None and b["reason"].startswith("Bullish")
+
+
+def test_suppressed_rows_invisible_everywhere(monkeypatch, tmp_path):
+    monkeypatch.setattr(bot, "SETUPS_PATH", str(tmp_path / "setups.json"))
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    setup = bot.build_rule_setup("X", {"market_data": {"current_price": 100.0}},
+                                 _ta_strong_4h(), None)
+    bot.log_suppressed(setup, "X", "x-token", "crypto", "long_only")
+    stats = bot.compute_winrate(bot._SETUPS)
+    assert stats["total"] == 0 or (stats.get("open", 0) == 0 and stats["wins"] == 0
+                                   and stats["losses"] == 0)     # not in the record
+    assert bot._find_recent_open("x-token") is None              # never blocks a real signal
+    assert [s for s in bot.build_live_payload()["open_setups"]] == []   # not on the dashboard

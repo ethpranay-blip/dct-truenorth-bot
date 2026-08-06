@@ -1116,14 +1116,12 @@ async def _emit_auto_signal(ticker: str, instrument: str, asset_class: str,
     return True
 
 
-async def _eval_watchlist_symbol(sym: str) -> bool:
+async def _eval_watchlist_symbol(sym: str, shadow: bool = False) -> bool:
     """Evaluate one watchlist symbol against the auto-signal gate (score ≥ 4.0 +
-    RVWAP bias agreement) and post if it qualifies. Works for any asset class —
-    crypto scores on 4h TA (with daily bars fetched for the RVWAP read), stocks/
-    commodities on daily. Returns True if a signal was posted."""
+    RVWAP bias agreement). Survivors post to Discord; signals a v3 gate drops
+    are logged as SUPPRESSED rows for /api/v1 instead of deleted — the gates
+    stop the trade, not the evidence. Returns True only if a signal posted."""
     asset_class, instrument = classify_asset(sym)
-    if AUTO_CRYPTO_ONLY and asset_class != "crypto":
-        return False
     if _find_recent_open(instrument):
         return False
     g = await gather_setup_inputs(sym)
@@ -1142,10 +1140,20 @@ async def _eval_watchlist_symbol(sym: str) -> bool:
                              min_score=SETUP_SCORE_HIGH, tp_rs=AUTO_TP_RS)
     if not setup.get("has_setup") or bias == "MIXED" or setup["direction"] != bias:
         return False
-    if AUTO_LONG_ONLY and setup["direction"] != "LONG":
-        return False
-    if _veto_crowded_long(setup["direction"], g.get("derivs")):
-        print(f"[AUTOSIG] {sym}: crowding veto (funding ≥ {FUNDING_VETO_PCTILE:.0f}th pctile)")
+    # Gate order names the (single) suppression tag: the outermost v3 gate that
+    # would have dropped the signal wins. "window" never appears — the 240h
+    # expiry shapes resolution, it never drops an entry.
+    reason = None
+    if AUTO_CRYPTO_ONLY and asset_class != "crypto":
+        reason = "non_crypto"
+    elif AUTO_LONG_ONLY and setup["direction"] != "LONG":
+        reason = "long_only"
+    elif _veto_crowded_long(setup["direction"], g.get("derivs")):
+        reason = "funding_crowding"
+    elif shadow:
+        reason = "circuit_breaker"
+    if reason:
+        log_suppressed(setup, sym, instrument, asset_class, reason)
         return False
     tf = "4h" if asset_class == "crypto" else "daily"
     return await _emit_auto_signal(sym, instrument, asset_class, float(price), setup,
@@ -1153,7 +1161,7 @@ async def _eval_watchlist_symbol(sym: str) -> bool:
                                    f"funding uncrowded · watchlist")
 
 
-async def _scan_watchlist() -> int:
+async def _scan_watchlist(shadow: bool = False) -> int:
     """Watchlist leg of the auto-signal scan: the env defaults + every user-added
     !watch symbol, each gated by RVWAP bias + score ≥ 4.0. Returns count posted."""
     posted, seen = 0, set()
@@ -1162,7 +1170,7 @@ async def _scan_watchlist() -> int:
         if not key or key in seen:
             continue
         seen.add(key)
-        if await _eval_watchlist_symbol(sym):
+        if await _eval_watchlist_symbol(sym, shadow):
             posted += 1
     return posted
 
@@ -1174,13 +1182,16 @@ async def auto_signal_scan() -> None:
     if CH_SIGNALS is None:
         return
     streak = _auto_loss_streak(_SETUPS)
-    if streak >= AUTO_PAUSE_AFTER_LOSSES:
-        print(f"[AUTOSIG] paused — {streak} consecutive auto losses")
+    shadow = streak >= AUTO_PAUSE_AFTER_LOSSES
+    if shadow:
+        # Paused for trading, not for evidence: the scan still runs and logs
+        # would-have-posted signals as SUPPRESSED(circuit_breaker) for /api/v1.
+        print(f"[AUTOSIG] paused — {streak} consecutive auto losses (shadow scan continues)")
         if streak == AUTO_PAUSE_AFTER_LOSSES:  # alert once, not every 4h
             await alert_ops("Auto-signals paused",
-                            f"{streak} consecutive auto losses. The scan stays paused until "
-                            f"a tracked auto trade resolves WIN/EXPIRED (or the record resets).")
-        return
+                            f"{streak} consecutive auto losses. Posting stays paused until a "
+                            f"tracked auto trade resolves WIN/EXPIRED or the streak ages out; "
+                            f"shadow signals keep flowing to /api/v1.")
     d = await gather_raw([
         ("ta_btc",  "technical_analysis",   {"token_address": "bitcoin", "timeframe": "1d"}),
         ("derivs",  "derivatives_analysis", {"token_address": "bitcoin"}),
@@ -1193,12 +1204,13 @@ async def auto_signal_scan() -> None:
     if regime == "UNKNOWN" or not rows:
         print(f"[AUTOSIG] skipped — regime={regime}, scanner rows={len(rows)}")
         return
-    # Leaders are long candidates unless RISK-OFF. v3: no auto shorts — the
-    # short side scored t≈0 in the 3-year backtest (see AUTO_LONG_ONLY).
+    # Leaders are long candidates unless RISK-OFF. v3 posts no auto shorts (the
+    # short side scored t≈0 in the 3-year backtest), but laggards are still
+    # evaluated so the drop is recorded as SUPPRESSED evidence, not deleted.
     candidates: list[tuple[dict, str]] = []
     if regime != "RISK-OFF":
         candidates += [(r, "LONG") for r in rows[:AUTO_SIGNAL_PER_SIDE]]
-    if not AUTO_LONG_ONLY and regime != "RISK-ON":
+    if regime != "RISK-ON":
         candidates += [(r, "SHORT") for r in rows[-AUTO_SIGNAL_PER_SIDE:]]
     posted = 0
     for row, want in candidates:
@@ -1225,14 +1237,22 @@ async def auto_signal_scan() -> None:
                                  min_score=SETUP_SCORE_HIGH, tp_rs=AUTO_TP_RS)
         if not setup.get("has_setup") or setup["direction"] != want or bias != want:
             continue
-        if _veto_crowded_long(setup["direction"], asset_derivs):
-            print(f"[AUTOSIG] {ticker}: crowding veto (funding ≥ {FUNDING_VETO_PCTILE:.0f}th pctile)")
+        # Same gate-order rule as the watchlist leg: outermost gate names the tag.
+        reason = None
+        if AUTO_LONG_ONLY and want != "LONG":
+            reason = "long_only"
+        elif _veto_crowded_long(setup["direction"], asset_derivs):
+            reason = "funding_crowding"
+        elif shadow:
+            reason = "circuit_breaker"
+        if reason:
+            log_suppressed(setup, ticker, token_id, "crypto", reason)
             continue
         if await _emit_auto_signal(ticker, token_id, "crypto", float(price), setup,
                                    f"Regime {regime} · RVWAP bias {bias} · funding uncrowded · "
                                    f"7d RS rotation"):
             posted += 1
-    wl_posted = await _scan_watchlist()
+    wl_posted = await _scan_watchlist(shadow)
     print(f"[AUTOSIG] {regime}: {len(candidates)} crypto candidates → {posted} · "
           f"watchlist → {wl_posted} signal(s)")
 
@@ -1717,12 +1737,17 @@ def init_watchlist() -> None:
 
 
 def log_setup(setup: dict, ticker: str, coingecko_id: str, message, source: str = "manual",
-              asset_class: str = "crypto") -> None:
+              asset_class: str = "crypto", suppressed_by: str | None = None) -> None:
     """Record a LONG/SHORT setup for outcome tracking. No-ops on 'no clear setup'
     or unparseable/incoherent levels (the embed still posts; it's just not tracked).
     source: "manual" (!setup) or "auto" (auto-signal scan) — kept per-trade so the
     public record can report the two engines separately. asset_class routes outcome
-    resolution to the right bars (crypto 15m vs stock/commodity daily)."""
+    resolution to the right bars (crypto 15m vs stock/commodity daily).
+
+    suppressed_by ⇒ a signal a v3 gate dropped: logged with status SUPPRESSED
+    (never OPEN — invisible to tracking, the win rate, the dashboard and the
+    one-position rule) so /api/v1 can serve the evidence instead of deleting it.
+    Suppressed rows have no Discord message (pass message=None)."""
     direction = str(setup.get("direction") or "NONE").upper()
     if not setup.get("has_setup") or direction not in ("LONG", "SHORT"):
         return
@@ -1742,14 +1767,18 @@ def log_setup(setup: dict, ticker: str, coingecko_id: str, message, source: str 
         "rr_ratio": str(setup.get("rr_ratio", "")), "conviction": str(setup.get("conviction", "")),
         "source": source, "asset_class": asset_class,
         "score": setup.get("score"), "reason": str(setup.get("reasoning") or "") or None,
+        "would_trade": suppressed_by is None, "suppressed_by": suppressed_by,
         "strategy_version": STRATEGY_VERSION,
         "timestamp": datetime.now(IST).isoformat(),
-        "discord_message_id": message.id, "discord_channel_id": message.channel.id,
-        "status": "OPEN", "resolution_price": None, "resolved_at": None,
+        "discord_message_id": getattr(message, "id", None),
+        "discord_channel_id": message.channel.id if message is not None else None,
+        "status": "SUPPRESSED" if suppressed_by else "OPEN",
+        "resolution_price": None, "resolved_at": None,
         "result_pct": None, "outcome_label": None,
     })
     _persist_setups()
-    print(f"[TRACK] logged {ticker} {direction} entry={_money(entry)} stop={_money(stop)} tp1={_money(tp1)}")
+    tag = f" [SUPPRESSED:{suppressed_by}]" if suppressed_by else ""
+    print(f"[TRACK] logged {ticker} {direction}{tag} entry={_money(entry)} stop={_money(stop)} tp1={_money(tp1)}")
 
 
 def _expiry_hours(setup: dict) -> int:
@@ -1933,6 +1962,31 @@ async def track_setups() -> None:
 
 
 SETUP_REUSE_HOURS = 6
+
+
+def _recent_suppressed(coingecko_id: str, reason: str, hours: float) -> dict | None:
+    """A SUPPRESSED row for this asset+reason inside the window — stops the 4h
+    scan from re-logging the same suppressed signal six times a day."""
+    now = datetime.now(IST)
+    for s in reversed(_SETUPS):
+        if (s.get("status") != "SUPPRESSED" or s.get("coingecko_id") != coingecko_id
+                or s.get("suppressed_by") != reason):
+            continue
+        ts = _parse_ts(s.get("timestamp"))
+        if ts and (now - ts).total_seconds() < hours * 3600:
+            return s
+    return None
+
+
+def log_suppressed(setup: dict, ticker: str, coingecko_id: str, asset_class: str,
+                   reason: str) -> None:
+    """Log a gate-dropped signal as evidence (status SUPPRESSED) — same levels,
+    same score, same reason text, same id rules as a real signal. Deduped per
+    asset+reason on the same window manual re-setups use."""
+    if _recent_suppressed(coingecko_id, reason, hours=SETUP_REUSE_HOURS):
+        return
+    log_setup(setup, ticker, coingecko_id, None, source="auto",
+              asset_class=asset_class, suppressed_by=reason)
 
 
 def _find_recent_open(coingecko_id: str, hours: float | None = None) -> dict | None:
@@ -2783,6 +2837,14 @@ def _v1_signal(row: dict) -> dict:
         "tp1": row.get("tp1"),
         "tp2": row.get("tp2"),
         "reason": row.get("reason") or None,
+        # v2 archive rows serve next to v3 rows — untagged they'd blend into
+        # one record. A filter change is a new version, never an edit.
+        "strategyVersion": (f"v{row['strategy_version']}"
+                            if row.get("strategy_version") is not None else None),
+        # Gate-dropped signals flow flagged instead of deleted. wouldTrade is
+        # never retroactively flipped; rows logged before the field default True.
+        "wouldTrade": bool(row.get("would_trade", True)),
+        "suppressedBy": row.get("suppressed_by"),
     }
 
 
