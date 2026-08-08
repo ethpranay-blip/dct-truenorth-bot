@@ -3128,7 +3128,8 @@ def test_suppressed_rows_invisible_everywhere(monkeypatch, tmp_path):
                                  _ta_strong_4h(), None)
     bot.log_suppressed(setup, "X", "x-token", "crypto", "long_only")
     stats = bot.compute_winrate(bot._SETUPS)
-    assert stats["total"] == 0 or (stats.get("open", 0) == 0 and stats["wins"] == 0
-                                   and stats["losses"] == 0)     # not in the record
+    assert stats["total"] == 0                                   # not even in "N tracked"
+    assert stats["open"] == 0 and stats["wins"] == 0 and stats["losses"] == 0
+    assert stats["auto_line"] is None                            # doesn't trigger the auto split
     assert bot._find_recent_open("x-token") is None              # never blocks a real signal
     assert [s for s in bot.build_live_payload()["open_setups"]] == []   # not on the dashboard

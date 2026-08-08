@@ -2007,7 +2007,12 @@ def _find_recent_open(coingecko_id: str, hours: float | None = None) -> dict | N
 
 
 def compute_winrate(setups: list[dict]) -> dict:
-    """Pure stats over the tracked setups for !winrate."""
+    """Pure stats over the tracked setups for !winrate.
+
+    SUPPRESSED rows are /api/v1 evidence, not trades — they must never inflate
+    the public record. One filter here covers every caller (!winrate command,
+    /api/track-record, the dashboard Record panel)."""
+    setups = [s for s in setups if s.get("status") != "SUPPRESSED"]
     wins = [s for s in setups if s.get("status") == "WIN"]
     losses = [s for s in setups if s.get("status") == "LOSS"]
     expired = [s for s in setups if s.get("status") == "EXPIRED"]
