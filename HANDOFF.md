@@ -1,3 +1,7 @@
+> **Historical document (v2 era, 2026-07-29).** The strategy it describes was replaced
+> by v3 (2026-08-06) and v4 (2026-10). Current truth: README.md, ARCHITECTURE.md, the
+> commit log, and the live `/api/v1` + `/api/live` payloads. The hard rules in §2 still stand.
+
 # Corgi Calls Market Desk — session handoff
 
 **Read this first, then `dct-truenorth-bot/ARCHITECTURE.md` and `README.md`.** Everything below

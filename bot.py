@@ -150,7 +150,13 @@ WATCHLIST_MAX = 25   # cap the user watchlist so the 4h scan can't balloon
 # v3 = long-only autos + 10d crypto expiry + funding-crowding veto, 2026-07-31
 # (backtest: quant-bot/backtest/corgi_v2/REPORT.md — shorts scored t≈0 over
 # 1,888 signals; 48h window was the bleed; veto removes −0.11%/trade of chase).
-STRATEGY_VERSION = 3
+# v4 = 2026-10-14 audit response: the Aug–Oct OOS run showed the funding veto
+# INVERTED out-of-sample (it removed +$27.88 of winners and kept −$38.70), so
+# it is demoted to an advisory annotation; and the crypto scan now covers the
+# full 12-name backtest universe (the old 5-name watchlist missed most of the
+# signals the rules actually produced). Long-only stands: blocked shorts
+# drifted −2.1R/week OOS (t=−4.0).
+STRATEGY_VERSION = 4
 ARCHIVE_PATH = os.path.join(CACHE_PATH, "setups_archive.json")
 # Shared secret for the dashboard's watchlist write API (POST /api/watchlist).
 # Unset ⇒ the write endpoint is disabled (read + Discord !watch still work).
@@ -918,10 +924,11 @@ def build_rule_setup(ticker: str, info: dict | None, ta: dict | None, derivs: di
     fund_note = f"funding {fund:+.4f}%" if fund is not None else None
 
     if price is None or atr is None or not atr > 0:
-        return {**NO_SETUP, "reasoning": "No clear setup — price/ATR data unavailable."}
+        return {**NO_SETUP, "score": score,
+                "reasoning": "No clear setup — price/ATR data unavailable."}
     if abs(score) < min_score:
         detail = ", ".join((bull + bear)[:3]) or "signals flat"
-        return {**NO_SETUP,
+        return {**NO_SETUP, "score": score,   # kept so the funnel log can show near-misses
                 "reasoning": f"No clear setup — ranging/choppy conditions (signal score {score:+.1f}: {detail})."}
 
     tp1_r, tp2_r = tp_rs
@@ -1009,10 +1016,32 @@ AUTO_LONG_ONLY = True
 # Crypto-only: the stock/commodity auto leg has never been backtested and its
 # 2.5R targets sit 17–19% away on daily ATRs. Manual !setup still covers them.
 AUTO_CRYPTO_ONLY = True
-# Skew crowding veto: never buy when longs are already crowded — funding in the
-# top of its trailing week is squeeze fuel against the trade. Removing those
-# entries took backtest expectancy from +0.14 to +0.48 per $100 signal.
+# Funding-crowding read (ADVISORY since v4): in-sample the ≥80th-pctile veto
+# looked strong, but the Aug–Oct 2026 OOS run inverted it — the blocked trades
+# were the profitable ones. It no longer blocks anything; it annotates the
+# signal and the funnel log so it can earn its way back with live data.
 FUNDING_VETO_PCTILE = 80.0
+
+# The crypto names the 4h scan always evaluates — the full backtest universe.
+# The 2026-10 audit found the live funnel caught 0 of the 17 signals the rules
+# produced Aug–Oct, half of that famine being coverage: the old watchlist held
+# 5 crypto names while NEAR/SOL/LINK produced most of the entries.
+AUTO_UNIVERSE = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE",
+                 "ADA", "AVAX", "LINK", "LTC", "NEAR", "FET"]
+
+# Last scan's per-candidate evaluations, served on /api/live as "funnel" —
+# score, bias and decision for every name looked at, so near-misses at the
+# 4.0 gate are visible instead of silently discarded. Replaced each scan.
+_FUNNEL: list[dict] = []
+
+
+def _funnel_note(sym: str, asset_class: str, score, bias: str | None,
+                 decision: str, funding_pctile=None) -> None:
+    _FUNNEL.append({"sym": sym, "asset_class": asset_class,
+                    "score": score, "rvwap_bias": bias, "decision": decision,
+                    "funding_pctile_7d": funding_pctile,
+                    "at": datetime.now(IST).isoformat()})
+    print(f"[FUNNEL] {sym} score={score} bias={bias} -> {decision}")
 # Circuit breaker: this many consecutive auto losses pauses the auto scan and
 # alerts ops — a bleeding engine should stop firing, not average down.
 AUTO_PAUSE_AFTER_LOSSES = 3
@@ -1127,6 +1156,7 @@ async def _eval_watchlist_symbol(sym: str, shadow: bool = False) -> bool:
     g = await gather_setup_inputs(sym)
     price = ((g.get("info") or {}).get("market_data") or {}).get("current_price")
     if price is None or g.get("ta") is None:
+        _funnel_note(sym, asset_class, None, None, "no_data")
         return False
     bars = g.get("bars")
     if bars is None:  # crypto: gather returns 4h TA but no bars — fetch daily for RVWAP
@@ -1138,34 +1168,41 @@ async def _eval_watchlist_symbol(sym: str, shadow: bool = False) -> bool:
     bias = rvwap_bias(price, compute_rvwaps(bars))
     setup = build_rule_setup(sym, g["info"], g["ta"], g.get("derivs"),
                              min_score=SETUP_SCORE_HIGH, tp_rs=AUTO_TP_RS)
+    pctile = _funding_pctile_7d(g.get("derivs"))
     if not setup.get("has_setup") or bias == "MIXED" or setup["direction"] != bias:
+        _funnel_note(sym, asset_class, setup.get("score"), bias,
+                     "below_gate" if not setup.get("has_setup") else "bias_disagrees", pctile)
         return False
-    # Gate order names the (single) suppression tag: the outermost v3 gate that
+    # Gate order names the (single) suppression tag: the outermost gate that
     # would have dropped the signal wins. "window" never appears — the 240h
-    # expiry shapes resolution, it never drops an entry.
+    # expiry shapes resolution, it never drops an entry. Funding crowding no
+    # longer suppresses (v4): it annotates instead.
     reason = None
     if AUTO_CRYPTO_ONLY and asset_class != "crypto":
         reason = "non_crypto"
     elif AUTO_LONG_ONLY and setup["direction"] != "LONG":
         reason = "long_only"
-    elif _veto_crowded_long(setup["direction"], g.get("derivs")):
-        reason = "funding_crowding"
     elif shadow:
         reason = "circuit_breaker"
     if reason:
+        _funnel_note(sym, asset_class, setup.get("score"), bias, f"suppressed:{reason}", pctile)
         log_suppressed(setup, sym, instrument, asset_class, reason)
         return False
+    crowd = (f"funding CROWDED ({pctile:.0f}th pctile — advisory)"
+             if _veto_crowded_long(setup["direction"], g.get("derivs")) else "funding uncrowded")
+    _funnel_note(sym, asset_class, setup.get("score"), bias, "posted", pctile)
     tf = "4h" if asset_class == "crypto" else "daily"
     return await _emit_auto_signal(sym, instrument, asset_class, float(price), setup,
                                    f"RVWAP bias {bias} · {asset_class} · {tf} score ≥ 4.0 · "
-                                   f"funding uncrowded · watchlist")
+                                   f"{crowd} · watchlist")
 
 
 async def _scan_watchlist(shadow: bool = False) -> int:
-    """Watchlist leg of the auto-signal scan: the env defaults + every user-added
-    !watch symbol, each gated by RVWAP bias + score ≥ 4.0. Returns count posted."""
+    """Watchlist leg of the auto-signal scan: the full crypto universe + the env
+    defaults + every user-added !watch symbol, each gated by RVWAP bias +
+    score ≥ 4.0. Returns count posted."""
     posted, seen = 0, set()
-    for sym in list(SIGNALS_WATCHLIST) + list(_WATCHLIST):
+    for sym in AUTO_UNIVERSE + list(SIGNALS_WATCHLIST) + list(_WATCHLIST):
         key = sym.strip().upper()
         if not key or key in seen:
             continue
@@ -1181,6 +1218,7 @@ async def auto_signal_scan() -> None:
     (stocks/commodities) via RVWAP + score. Silence is the normal outcome."""
     if CH_SIGNALS is None:
         return
+    _FUNNEL.clear()   # the funnel log describes exactly one scan
     streak = _auto_loss_streak(_SETUPS)
     shadow = streak >= AUTO_PAUSE_AFTER_LOSSES
     if shadow:
@@ -1235,21 +1273,27 @@ async def auto_signal_scan() -> None:
         bias = rvwap_bias(price, compute_rvwaps(candles))
         setup = build_rule_setup(ticker, info, ta4, asset_derivs,
                                  min_score=SETUP_SCORE_HIGH, tp_rs=AUTO_TP_RS)
+        pctile = _funding_pctile_7d(asset_derivs)
         if not setup.get("has_setup") or setup["direction"] != want or bias != want:
+            _funnel_note(ticker, "crypto", setup.get("score"), bias,
+                         "below_gate" if not setup.get("has_setup") else "bias_disagrees", pctile)
             continue
-        # Same gate-order rule as the watchlist leg: outermost gate names the tag.
+        # Same gate-order rule as the watchlist leg: outermost gate names the
+        # tag. Funding crowding no longer suppresses (v4): it annotates.
         reason = None
         if AUTO_LONG_ONLY and want != "LONG":
             reason = "long_only"
-        elif _veto_crowded_long(setup["direction"], asset_derivs):
-            reason = "funding_crowding"
         elif shadow:
             reason = "circuit_breaker"
         if reason:
+            _funnel_note(ticker, "crypto", setup.get("score"), bias, f"suppressed:{reason}", pctile)
             log_suppressed(setup, ticker, token_id, "crypto", reason)
             continue
+        crowd = (f"funding CROWDED ({pctile:.0f}th pctile — advisory)"
+                 if _veto_crowded_long(setup["direction"], asset_derivs) else "funding uncrowded")
+        _funnel_note(ticker, "crypto", setup.get("score"), bias, "posted", pctile)
         if await _emit_auto_signal(ticker, token_id, "crypto", float(price), setup,
-                                   f"Regime {regime} · RVWAP bias {bias} · funding uncrowded · "
+                                   f"Regime {regime} · RVWAP bias {bias} · {crowd} · "
                                    f"7d RS rotation"):
             posted += 1
     wl_posted = await _scan_watchlist(shadow)
@@ -2639,7 +2683,11 @@ async def build_tape_read() -> dict:
     return {
         "price": price,
         "ema50_4h": ema.get("value"),
-        "above_ema50_4h": None if not ema else ema.get("state") == "price_above",
+        # Compared against the SAME price the payload displays (the daily-series
+        # latest close), like the other two flags — the old 4H-close comparison
+        # let the panel show a price above the EMA with the flag saying "below".
+        "above_ema50_4h": (None if (not ema or price is None or ema.get("value") is None)
+                           else price > ema["value"]),
         "rvwap7d": rv.get(7),
         "above_rvwap7d": None if (price is None or rv.get(7) is None) else price > rv[7],
         "ema50_1d": ema50d,
@@ -2741,6 +2789,7 @@ def build_live_payload() -> dict:
         "tape": _DASH_CACHE.get("tape"),
         "crowd": _DASH_CACHE.get("crowd"),
         "flow": _flow_if_fresh(),
+        "funnel": list(_FUNNEL),   # last scan's per-candidate scores/decisions
     }
 
 

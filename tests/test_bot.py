@@ -2341,6 +2341,7 @@ def test_init_watchlist_missing_file_empty(tmp_path, monkeypatch):
 
 def test_scan_watchlist_merges_env_and_user_and_dedupes(monkeypatch):
     import asyncio
+    monkeypatch.setattr(bot, "AUTO_UNIVERSE", [])
     monkeypatch.setattr(bot, "CH_SIGNALS", 999)
     monkeypatch.setattr(bot, "SIGNALS_WATCHLIST", ["NVDA"])
     monkeypatch.setattr(bot, "_WATCHLIST", ["NVDA", "SUI"])  # NVDA dup, SUI new
@@ -2655,6 +2656,7 @@ def test_winrate_closed_accounting():
 
 def test_auto_signal_never_duplicates_open_asset(monkeypatch):
     import asyncio
+    monkeypatch.setattr(bot, "AUTO_UNIVERSE", [])
     monkeypatch.setattr(bot, "CH_SIGNALS", 999)
     # An OPEN TSLA short from 20 hours ago — well past the old 6h window.
     from datetime import timedelta
@@ -2807,11 +2809,16 @@ def test_funding_veto_crowded_long():
     assert not bot._veto_crowded_long("LONG", None)                    # outage never vetoes
 
 
-def test_auto_signal_scan_vetoes_crowded_funding(monkeypatch, tmp_path):
+def test_auto_signal_scan_crowded_funding_is_advisory(monkeypatch, tmp_path):
+    """v4: funding crowding no longer blocks — the Aug–Oct OOS run showed the
+    veto inverted. A crowded long posts WITH the advisory in its basis."""
     import asyncio
     monkeypatch.setattr(bot, "CH_SIGNALS", 999)
     monkeypatch.setattr(bot, "SETUPS_PATH", str(tmp_path / "setups.json"))
     monkeypatch.setattr(bot, "_SETUPS", [])
+    monkeypatch.setattr(bot, "SIGNALS_WATCHLIST", [])
+    monkeypatch.setattr(bot, "_WATCHLIST", [])
+    monkeypatch.setattr(bot, "AUTO_UNIVERSE", [])
     ch = _StubChannel()
     monkeypatch.setattr(bot.bot, "get_channel", lambda _id: ch)
     base = _auto_scan_fake_call([{"ticker": "SOLUSDT", "rsVsBenchmark": 12.0}])
@@ -2823,10 +2830,15 @@ def test_auto_signal_scan_vetoes_crowded_funding(monkeypatch, tmp_path):
 
     monkeypatch.setattr(bot, "tn_call_safe", fake_call)
     asyncio.run(bot.auto_signal_scan())
-    assert ch.sent == []                          # nothing posts…
-    (row,) = [s for s in bot._SETUPS if s["status"] == "SUPPRESSED"]
-    assert row["suppressed_by"] == "funding_crowding" and row["would_trade"] is False
-    assert not [s for s in bot._SETUPS if s["status"] == "OPEN"]   # …and nothing trades
+    assert len(ch.sent) == 1                      # it posts…
+    basis = next(f.value for f in ch.sent[0].fields if f.name == "Basis")
+    assert "CROWDED" in basis and "advisory" in basis    # …with the warning attached
+    (row,) = [s for s in bot._SETUPS if s["status"] == "OPEN"]
+    assert row["would_trade"] is True
+    assert not [s for s in bot._SETUPS if s["status"] == "SUPPRESSED"]
+    # and the funnel log recorded the decision with the crowding percentile
+    (note,) = [f for f in bot._FUNNEL if f["decision"] == "posted"]
+    assert note["funding_pctile_7d"] == 92.0
 
 
 def test_auto_signal_scan_breaker_shadow_logs_instead_of_posting(monkeypatch, tmp_path):
@@ -3049,6 +3061,7 @@ def test_main_scan_laggard_short_suppressed_long_only(monkeypatch, tmp_path):
     """A laggard passing the full v2 short gate (score ≤ −4, RVWAP SHORT, regime
     agrees) logs as SUPPRESSED(long_only) instead of posting."""
     import asyncio
+    monkeypatch.setattr(bot, "AUTO_UNIVERSE", [])
     monkeypatch.setattr(bot, "CH_SIGNALS", 999)
     monkeypatch.setattr(bot, "SETUPS_PATH", str(tmp_path / "setups.json"))
     monkeypatch.setattr(bot, "_SETUPS", [])
@@ -3114,10 +3127,10 @@ def test_v1_serves_suppression_and_version_fields(monkeypatch, tmp_path):
     got = _v1_json(asyncio.run(bot._handle_v1_signals(_V1Req(key="k"))))
     by_asset = {s["asset"]: s for s in got}
     assert by_asset["ETH"]["strategyVersion"] == "v2" and by_asset["ETH"]["wouldTrade"] is True
-    assert by_asset["SOL"]["strategyVersion"] == "v3" and by_asset["SOL"]["suppressedBy"] is None
+    assert by_asset["SOL"]["strategyVersion"] == f"v{bot.STRATEGY_VERSION}" and by_asset["SOL"]["suppressedBy"] is None
     b = by_asset["BTC"]
     assert b["wouldTrade"] is False and b["suppressedBy"] == "circuit_breaker"
-    assert b["strategyVersion"] == "v3" and b["score"] == 5.5   # same score/levels as a real row
+    assert b["strategyVersion"] == f"v{bot.STRATEGY_VERSION}" and b["score"] == 5.5   # same score/levels as a real row
     assert b["entry"] is not None and b["reason"].startswith("Bullish")
 
 
@@ -3133,3 +3146,76 @@ def test_suppressed_rows_invisible_everywhere(monkeypatch, tmp_path):
     assert stats["auto_line"] is None                            # doesn't trigger the auto split
     assert bot._find_recent_open("x-token") is None              # never blocks a real signal
     assert [s for s in bot.build_live_payload()["open_setups"]] == []   # not on the dashboard
+
+
+# =============================================================================
+# v4: funnel observability, full-universe scan, honest tape flag
+# =============================================================================
+
+def test_scan_watchlist_covers_full_universe(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(bot, "SIGNALS_WATCHLIST", ["NVDA"])
+    monkeypatch.setattr(bot, "_WATCHLIST", ["BTC"])   # duplicate of universe — deduped
+    evaluated = []
+
+    async def fake_eval(sym, shadow=False):
+        evaluated.append(sym.upper())
+        return False
+
+    monkeypatch.setattr(bot, "_eval_watchlist_symbol", fake_eval)
+    asyncio.run(bot._scan_watchlist())
+    for name in bot.AUTO_UNIVERSE:                    # all 12 universe names scanned
+        assert name in evaluated
+    assert "NVDA" in evaluated
+    assert evaluated.count("BTC") == 1                # dedupe held
+
+
+def test_funnel_records_near_misses(monkeypatch, tmp_path):
+    """A 3.5-score candidate used to vanish silently; now the funnel keeps it."""
+    import asyncio
+    monkeypatch.setattr(bot, "CH_SIGNALS", 999)
+    monkeypatch.setattr(bot, "_SETUPS", [])
+    monkeypatch.setattr(bot, "_FUNNEL", [])
+    ch = _StubChannel()
+    monkeypatch.setattr(bot.bot, "get_channel", lambda _id: ch)
+    ta = _ta_strong_4h()
+    ta["technical_indicators"]["rsi14"] = {"value": 50.0, "momentum": None}
+    ta["technical_indicators"]["macd_12_26_9"] = {"state": "bull", "momentum": None}
+    # 5.5 - RSI(1) - RSI momo(0.5) - MACD momo(0.5) = 3.5: a near-miss  # was: 5.5 → 4.0 − 0.5 = below? no: drops RSI ±1 and momo ±0.5 → 3.5
+
+    async def fake_gather(sym):
+        return {"info": {"market_data": {"current_price": 100.0}},
+                "ta": ta, "derivs": _derivs_full(), "bars": None}
+
+    async def fake_call(tool, args, **kw):
+        if tool == "historical_bars":
+            return {"data": {args["instruments"][0]: _daily_candles(close=90.0)}}
+        return None
+
+    monkeypatch.setattr(bot, "gather_setup_inputs", fake_gather)
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    assert asyncio.run(bot._eval_watchlist_symbol("BTC")) is False
+    (note,) = bot._FUNNEL
+    assert note["decision"] == "below_gate" and note["score"] == 3.5
+    assert note["funding_pctile_7d"] == 33.9
+    # and /api/live serves it
+    assert bot.build_live_payload()["funnel"] == [note]
+
+
+def test_tape_flag_uses_displayed_price(monkeypatch):
+    """Regression: price above the 4H EMA50 must read as above, even when the
+    last completed 4H close was below it (the Aug 2026 hero contradiction)."""
+    import asyncio
+    h4 = _daily_candles(n=60, close=64000.0)          # 4H closes at 64,000 → EMA ≈ 64,000
+    d1 = _daily_candles(n=400, close=64750.0)         # displayed price 64,750
+
+    async def fake_call(tool, args, **kw):
+        if tool == "historical_bars":
+            return {"data": {"bitcoin": h4 if args.get("timeframe") == "4h" else d1}}
+        return None
+
+    monkeypatch.setattr(bot, "tn_call_safe", fake_call)
+    tape = asyncio.run(bot.build_tape_read())
+    assert tape["price"] == 64750.0
+    assert tape["ema50_4h"] is not None and tape["price"] > tape["ema50_4h"]
+    assert tape["above_ema50_4h"] is True             # flag agrees with the shown numbers
